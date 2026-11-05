@@ -123,7 +123,15 @@ mybox-immich-sync/
   4. 전체 삭제 완료 시 `exit(0)`으로 종료 → **컨테이너 자동 종료**
 - **`status`**: 현재 DB 기준 스캔된 폴더 수, `PENDING` / `UPLOADED` (신규 vs 중복) / `DELETED` / `FAILED` 건수 및 총 용량 표 출력
 
-### 5.2 `docker-compose.yml` 구성 예시
+### 5.2 TrueNAS SCALE (ZFS & Docker Compose) 최적화 구성
+TrueNAS SCALE(Electric Eel 24.10+ 기본 Docker 엔진) 환경의 특성을 반영하여 다음 최적화를 적용한다:
+
+1. **ZFS 디스크 쓰기(CoW) 방지를 위한 `tmpfs`(RAM 디스크) 활용**:
+   - 수만 장의 사진을 임시 다운로드 후 삭제할 때 ZFS 풀(Pool)에 불필요한 쓰기/단편화나 스냅샷 용량 증가가 발생하지 않도록, 임시 다운로드 경로(`/tmp/mybox_sync`)는 호스트 디스크 대신 컨테이너 메모리(`tmpfs`)에 마운트한다. (동시 워커 3개 기준 수십 MB 메모리만 사용 후 즉시 해제됨)
+2. **TrueNAS Dataset 경로 및 권한(`568:568` `apps` 계정) 호환**:
+   - SQLite 체크포인트 DB(`sync_state.db`)만 영구 보존하면 되므로 `/mnt/<Pool이름>/mybox-sync/data:/data` 한 곳만 호스트 경로로 마운트한다.
+   - SSH/Dockge용 `docker-compose.yml`(`build: .` 방식)과 TrueNAS 웹 UI(`Apps -> Custom App -> Install via YAML`)에서 별도 이미지 빌드 없이 바로 붙여넣어 쓸 수 있는 설정 예시를 모두 제공한다.
+
 ```yaml
 services:
   mybox-sync:
@@ -131,8 +139,9 @@ services:
     container_name: mybox-immich-sync
     env_file: .env
     volumes:
-      - ./data:/data          # SQLite DB (sync_state.db) 영구 보관
-      - ./tmp:/tmp/mybox_sync # 스트리밍 다운로드 임시 공간 (처리 즉시 삭제됨)
+      - ./data:/data          # TrueNAS 예: /mnt/tank/apps/mybox-sync/data:/data
+    tmpfs:
+      - /tmp/mybox_sync:size=1G,mode=1777  # ZFS 쓰기 방지를 위한 RAM 디스크 활용
     command: ["auto"]
     restart: on-failure:3     # 에러 시에만 최대 3회 재시작, 완료(exit 0) 시 컨테이너 자동 종료
 ```
