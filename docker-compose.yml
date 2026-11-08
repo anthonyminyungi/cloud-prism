@@ -1,0 +1,31 @@
+services:
+  mybox-sync:
+    build: .
+    container_name: mybox-immich-sync
+    ports:
+      - "3080:3080"
+    environment:
+      - PORT=3080
+      - TZ=Asia/Seoul
+      - DB_PATH=/data/sync_state.db
+      - TMP_DIR=/tmp/mybox_sync
+      # 아래 환경변수는 선택사항 (비워두어도 웹 UI 접속 후 [설정] 화면에서 직접 입력 및 저장 가능)
+      - MYBOX_PAT=${MYBOX_PAT:-}
+      - GDRIVE_ACCESS_TOKEN=${GDRIVE_ACCESS_TOKEN:-}
+      - TAKEOUT_DIR=${TAKEOUT_DIR:-/data/takeout}
+      - IMMICH_URL=${IMMICH_URL:-}
+      - IMMICH_API_KEY=${IMMICH_API_KEY:-}
+      - ENABLE_NEXTCLOUD=${ENABLE_NEXTCLOUD:-true}
+      - NEXTCLOUD_URL=${NEXTCLOUD_URL:-}
+      - NEXTCLOUD_USER=${NEXTCLOUD_USER:-}
+      - NEXTCLOUD_APP_PASSWORD=${NEXTCLOUD_APP_PASSWORD:-}
+      - NEXTCLOUD_BASE_DIR=${NEXTCLOUD_BASE_DIR:-/Cloud-Backup}
+      - CONCURRENCY=${CONCURRENCY:-3}
+      - RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-5.0}
+    volumes:
+      # TrueNAS SCALE 예시: /mnt/<Pool이름>/apps/mybox-sync/data:/data
+      - ./data:/data
+    tmpfs:
+      # ZFS 디스크 쓰기(CoW) 및 스냅샷 부풀림 방지를 위해 임시 다운로드는 RAM(tmpfs)에서 처리 후 즉시 삭제
+      - /tmp/mybox_sync:size=1G,mode=1777
+    restart: unless-stopped

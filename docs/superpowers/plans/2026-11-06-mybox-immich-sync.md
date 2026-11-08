@@ -38,7 +38,7 @@
   - `TargetType` enum (`Immich`, `Nextcloud`) and `TargetRouter::classify(filename: &str, enable_nextcloud: bool) -> Option<TargetType>`
   - `RateLimiter` in `src/limiter.rs` with token-bucket pacing and exponential backoff on HTTP `429`/`5xx`
 
-- [ ] **Step 1: Create `Cargo.toml` (including `axum`, `tokio-stream`, `tower-http`) and failing test `tests/router_limiter_test.rs`**
+- [x] **Step 1: Create `Cargo.toml` (including `axum`, `tokio-stream`, `tower-http`) and failing test `tests/router_limiter_test.rs`**
 
 ```toml
 # Cargo.toml
@@ -80,10 +80,10 @@ tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
 ```
 
-- [ ] **Step 2: Run `cargo test --test router_limiter_test` to verify it fails**
-- [ ] **Step 3: Implement `src/config.rs`, `src/router.rs`, `src/limiter.rs`, and `src/lib.rs`**
-- [ ] **Step 4: Run `cargo test --test router_limiter_test` to verify it passes**
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run `cargo test --test router_limiter_test` to verify it fails**
+- [x] **Step 3: Implement `src/config.rs`, `src/router.rs`, `src/limiter.rs`, and `src/lib.rs`**
+- [x] **Step 4: Run `cargo test --test router_limiter_test` to verify it passes**
+- [x] **Step 5: Commit**
 
 ---
 
@@ -100,11 +100,11 @@ wiremock = "0.6"
   - Folder checkpoint methods (`upsert_folder`, `update_folder_cursor`, `mark_folder_scanned`, `get_pending_folders`)
   - File checkpoint methods (`upsert_files`, `get_pending_files`, `mark_file_uploaded`, `mark_file_failed`, `reset_failed_files`, `get_uploaded_files_for_delete`, `mark_file_deleted`, `get_stats`, `get_recent_failures`)
 
-- [ ] **Step 1: Write failing test `tests/db_test.rs` testing both `settings` persistence and `(source_type, resource_id)` file lifecycle**
-- [ ] **Step 2: Run `cargo test --test db_test` to verify it fails**
-- [ ] **Step 3: Implement `src/db.rs`**
-- [ ] **Step 4: Run `cargo test --test db_test` to verify it passes**
-- [ ] **Step 5: Commit**
+- [x] **Step 1: Write failing test `tests/db_test.rs` testing both `settings` persistence and `(source_type, resource_id)` file lifecycle**
+- [x] **Step 2: Run `cargo test --test db_test` to verify it fails**
+- [x] **Step 3: Implement `src/db.rs`**
+- [x] **Step 4: Run `cargo test --test db_test` to verify it passes**
+- [x] **Step 5: Commit**
 
 ---
 
@@ -125,9 +125,9 @@ wiremock = "0.6"
   - `ImmichTarget` including `async fn test_connection(&self) -> Result<String>` and `check_bulk_hashes` / `upload_asset`
   - `NextcloudTarget` including `async fn test_connection(&self) -> Result<String>`, `ensure_folder_tree`, `check_file_exists`, and `upload_file` (with `X-OC-MTime`)
 
-- [ ] **Step 1: Implement `src/sources/` and `src/targets/` with connection test methods and RAII `TempFileGuard`**
-- [ ] **Step 2: Verify compilation and unit tests**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Implement `src/sources/` and `src/targets/` with connection test methods and RAII `TempFileGuard`**
+- [x] **Step 2: Verify compilation and unit tests**
+- [x] **Step 3: Commit**
 
 ---
 
@@ -145,10 +145,10 @@ wiremock = "0.6"
   - `AppState` (`Arc<AppState>`) managing the active background `JoinHandle`, stop flag (`AtomicBool`), `CheckpointDB`, and SSE broadcast channel
   - `SyncPipeline` emitting real-time `ProgressEvent` updates during `run_scan()`, `run_sync()`, and `run_delete(dry_run)`
 
-- [ ] **Step 1: Write `tests/pipeline_integration_test.rs` verifying MYBOX/GDrive scan -> route to Immich/Nextcloud -> deferred delete with event emission**
-- [ ] **Step 2: Implement `src/state.rs` and `src/pipeline.rs`**
-- [ ] **Step 3: Run `cargo test --test pipeline_integration_test` to verify it passes**
-- [ ] **Step 4: Commit**
+- [x] **Step 1: Write `tests/pipeline_integration_test.rs` verifying MYBOX/GDrive scan -> route to Immich/Nextcloud -> deferred delete with event emission**
+- [x] **Step 2: Implement `src/state.rs` and `src/pipeline.rs`**
+- [x] **Step 3: Run `cargo test --test pipeline_integration_test` to verify it passes**
+- [x] **Step 4: Commit**
 
 ---
 
@@ -171,10 +171,10 @@ wiremock = "0.6"
     - `GET /api/events` (SSE stream)
   - Responsive Korean Web Dashboard (`src/ui.html`) with live progress bars, Immich/Nextcloud cards, connection tester, settings drawer, delete confirmation modal (with Dry-Run option), and live SSE console.
 
-- [ ] **Step 1: Write `tests/web_api_test.rs` testing `/api/settings`, `/api/connections/test`, `/api/status`, and `/api/jobs/start`**
-- [ ] **Step 2: Implement `src/ui.html`, `src/web.rs`, and `src/main.rs`**
-- [ ] **Step 3: Run `cargo test --test web_api_test` to verify all endpoints pass**
-- [ ] **Step 4: Commit**
+- [x] **Step 1: Write `tests/web_api_test.rs` testing `/api/settings`, `/api/connections/test`, `/api/status`, and `/api/jobs/start`**
+- [x] **Step 2: Implement `src/ui.html`, `src/web.rs`, and `src/main.rs`**
+- [x] **Step 3: Run `cargo test --test web_api_test` to verify all endpoints pass**
+- [x] **Step 4: Commit**
 
 ---
 
@@ -186,6 +186,6 @@ wiremock = "0.6"
 - Create: `.env.example`
 - Create: `README.md`
 
-- [ ] **Step 1: Create `Dockerfile` (exposing port `3080`, default command `serve`), TrueNAS SCALE `docker-compose.yml`, `.env.example`, and `README.md`**
-- [ ] **Step 2: Run full `cargo test` suite**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Create `Dockerfile` (exposing port `3080`, default command `serve`), TrueNAS SCALE `docker-compose.yml`, `.env.example`, and `README.md`**
+- [x] **Step 2: Run full `cargo test` suite**
+- [x] **Step 3: Commit**

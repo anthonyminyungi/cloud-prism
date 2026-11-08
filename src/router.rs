@@ -27,9 +27,8 @@ impl TargetType {
 
 const MEDIA_EXTENSIONS: &[&str] = &[
     // Photos & RAW
-    "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tiff", "tif", "avif", "dng",
-    "cr2", "cr3", "nef", "arw", "orf", "rw2", "pef", "raf",
-    // Videos
+    "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp", "tiff", "tif", "avif", "dng", "cr2",
+    "cr3", "nef", "arw", "orf", "rw2", "pef", "raf", // Videos
     "mp4", "mov", "avi", "mkv", "webm", "3gp", "m4v", "mts", "m2ts", "mpg", "mpeg", "wmv", "flv",
 ];
 
