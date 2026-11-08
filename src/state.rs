@@ -1,6 +1,5 @@
 use crate::config::AppConfig;
 use crate::db::CheckpointDB;
-use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -48,7 +47,7 @@ pub struct ProgressEvent {
 
 pub struct AppState {
     pub db: CheckpointDB,
-    pub base_config: AppConfig,
+    pub config: AppConfig,
     pub job_state: RwLock<JobState>,
     pub active_source: RwLock<Option<String>>,
     pub current_file: RwLock<Option<String>>,
@@ -62,11 +61,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: CheckpointDB, base_config: AppConfig) -> Arc<Self> {
+    pub fn new(db: CheckpointDB, config: AppConfig) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(256);
         Arc::new(Self {
             db,
-            base_config,
+            config,
             job_state: RwLock::new(JobState::Idle),
             active_source: RwLock::new(None),
             current_file: RwLock::new(None),
@@ -78,13 +77,6 @@ impl AppState {
             event_tx,
             job_handle: Mutex::new(None),
         })
-    }
-
-    pub async fn effective_config(&self) -> Result<AppConfig> {
-        let mut cfg = self.base_config.clone();
-        let overrides = self.db.get_all_settings().await?;
-        cfg.apply_db_overrides(&overrides);
-        Ok(cfg)
     }
 
     pub fn is_stopping(&self) -> bool {

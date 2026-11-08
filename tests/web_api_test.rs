@@ -1,6 +1,6 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use mybox_immich_sync::config::{AppConfig, SECRET_MASK};
+use mybox_immich_sync::config::AppConfig;
 use mybox_immich_sync::db::CheckpointDB;
 use mybox_immich_sync::state::{AppState, JobState};
 use mybox_immich_sync::web::build_router;
@@ -11,7 +11,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
-async fn test_web_dashboard_settings_connection_and_job_lifecycle() {
+async fn test_web_dashboard_connection_and_job_lifecycle() {
     let mock_server = MockServer::start().await;
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("web_test.db");
@@ -54,7 +54,12 @@ async fn test_web_dashboard_settings_connection_and_job_lifecycle() {
     let cfg = AppConfig {
         db_path: db_path.to_str().unwrap().to_string(),
         tmp_dir: temp_dir.path().join("tmp").to_str().unwrap().to_string(),
+        mybox_pat: "my_secret_pat_token".to_string(),
         mybox_api_base: mock_server.uri(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "immich_secret_key".to_string(),
+        enable_nextcloud: false,
+        concurrency: 4,
         rate_limit_rps: 100.0,
         ..AppConfig::default()
     };
@@ -75,54 +80,14 @@ async fn test_web_dashboard_settings_connection_and_job_lifecycle() {
     assert!(html.contains("네이버 MYBOX"));
     assert!(html.contains("Immich"));
 
-    // 2. PUT /api/settings persists settings and GET /api/settings masks secrets
-    let put_body = json!({
-        "mybox_pat": "my_secret_pat_token",
-        "immich_url": mock_server.uri(),
-        "immich_api_key": "immich_secret_key",
-        "enable_nextcloud": "false",
-        "concurrency": "4"
-    });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/settings")
-                .header("content-type", "application/json")
-                .body(Body::from(put_body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/settings")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let settings_json: Value =
-        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(settings_json["mybox_pat"], SECRET_MASK);
-    assert_eq!(settings_json["immich_api_key"], SECRET_MASK);
-    assert_eq!(settings_json["concurrency"], 4);
-
-    // 3. POST /api/connections/test verifies MYBOX and Immich connectivity
+    // 2. POST /api/connections/test verifies MYBOX and Immich connectivity from environment config
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/connections/test")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({}).to_string()))
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
@@ -133,7 +98,7 @@ async fn test_web_dashboard_settings_connection_and_job_lifecycle() {
     assert_eq!(conn_json["results"]["mybox"]["ok"], true);
     assert_eq!(conn_json["results"]["immich"]["ok"], true);
 
-    // 4. Conflict check: if job_state is not Idle, POST /api/jobs/start returns 409 Conflict
+    // 3. Conflict check: if job_state is not Idle, POST /api/jobs/start returns 409 Conflict
     *state.job_state.write().await = JobState::Scanning;
     let conflict_resp = app
         .clone()
@@ -152,7 +117,7 @@ async fn test_web_dashboard_settings_connection_and_job_lifecycle() {
     assert_eq!(conflict_resp.status(), StatusCode::CONFLICT);
     *state.job_state.write().await = JobState::Idle;
 
-    // 5. Start scan job via POST /api/jobs/start and verify status via GET /api/status
+    // 4. Start scan job via POST /api/jobs/start and verify status + config_summary via GET /api/status
     let start_resp = app
         .clone()
         .oneshot(
@@ -194,4 +159,7 @@ async fn test_web_dashboard_settings_connection_and_job_lifecycle() {
         serde_json::from_slice(&to_bytes(status_resp.into_body(), usize::MAX).await.unwrap())
             .unwrap();
     assert_eq!(status_json["stats"]["pending_files"], 1);
+    assert_eq!(status_json["config_summary"]["mybox_configured"], true);
+    assert_eq!(status_json["config_summary"]["immich_configured"], true);
+    assert_eq!(status_json["config_summary"]["concurrency"], 4);
 }

@@ -1,4 +1,3 @@
-use crate::config::SECRET_MASK;
 use crate::limiter::RateLimiter;
 use crate::pipeline::{build_source_provider, build_target_providers, SyncPipeline};
 use crate::router::{SourceType, TargetType};
@@ -11,7 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
@@ -44,7 +43,6 @@ impl JobMode {
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(serve_ui))
-        .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/connections/test", post(test_connections))
         .route("/api/status", get(get_status))
         .route("/api/jobs/start", post(start_job))
@@ -56,45 +54,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 async fn serve_ui() -> Html<&'static str> {
     Html(UI_HTML)
-}
-
-async fn get_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match state.effective_config().await {
-        Ok(cfg) => (StatusCode::OK, Json(json!(cfg.masked()))).into_response(),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-    }
-}
-
-async fn put_settings(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<HashMap<String, Value>>,
-) -> impl IntoResponse {
-    let to_save: HashMap<String, String> = payload
-        .into_iter()
-        .filter_map(|(k, v)| {
-            let s = match v {
-                Value::String(s) => s,
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                _ => return None,
-            };
-            let trimmed = s.trim();
-            if trimmed.is_empty() || trimmed == SECRET_MASK {
-                None
-            } else {
-                Some((k, trimmed.to_string()))
-            }
-        })
-        .collect();
-
-    if let Err(e) = state.db.save_settings(&to_save).await {
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-
-    match state.effective_config().await {
-        Ok(cfg) => (StatusCode::OK, Json(json!(cfg.masked()))).into_response(),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -115,16 +74,8 @@ impl ServiceTestResult {
     }
 }
 
-async fn test_connections(
-    State(state): State<Arc<AppState>>,
-    Json(overrides): Json<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let mut cfg = match state.effective_config().await {
-        Ok(c) => c,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-    };
-    cfg.apply_db_overrides(&overrides);
-
+async fn test_connections(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = &state.config;
     let limiter = RateLimiter::new(cfg.rate_limit_rps, 1);
     let mut results: HashMap<String, ServiceTestResult> = HashMap::new();
 
@@ -139,7 +90,7 @@ async fn test_connections(
 
     for (src_type, should_test) in configured_sources {
         if should_test {
-            let provider = build_source_provider(&cfg, src_type, limiter.clone());
+            let provider = build_source_provider(cfg, src_type, limiter.clone());
             results.insert(
                 src_type.as_str().to_string(),
                 ServiceTestResult::from_result(provider.test_connection().await),
@@ -147,7 +98,7 @@ async fn test_connections(
         }
     }
 
-    let targets = build_target_providers(&cfg, limiter);
+    let targets = build_target_providers(cfg, limiter);
     let configured_targets: Vec<(TargetType, bool)> = vec![
         (TargetType::Immich, !cfg.immich_url.is_empty()),
         (
@@ -208,6 +159,7 @@ async fn get_status(
             "processed_files": processed_files,
             "total_files": total_files,
             "speed_fps": speed_fps,
+            "config_summary": state.config.summary(),
             "stats": stats,
             "recent_failures": recent_failures,
             "recent_logs": recent_logs
@@ -243,15 +195,8 @@ async fn start_job(
         *js = req.mode.initial_state();
     }
 
-    let cfg = match state.effective_config().await {
-        Ok(c) => c,
-        Err(e) => {
-            *state.job_state.write().await = JobState::Idle;
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
-        }
-    };
-
-    let pipeline = match SyncPipeline::from_config(state.clone(), cfg, &req.source) {
+    let pipeline = match SyncPipeline::from_config(state.clone(), state.config.clone(), &req.source)
+    {
         Ok(p) => p,
         Err(e) => {
             *state.job_state.write().await = JobState::Idle;

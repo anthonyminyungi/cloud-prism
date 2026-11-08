@@ -5,7 +5,6 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
 use sqlx::Row;
-use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -119,18 +118,6 @@ impl CheckpointDB {
 
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
             CREATE TABLE IF NOT EXISTS folders (
                 source_type TEXT NOT NULL,
                 folder_id TEXT NOT NULL,
@@ -184,42 +171,6 @@ impl CheckpointDB {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<String, _>(0))
-    }
-
-    pub async fn get_all_settings(&self) -> Result<HashMap<String, String>> {
-        let rows = sqlx::query("SELECT key, value FROM settings")
-            .fetch_all(&self.pool)
-            .await?;
-        let mut map = HashMap::new();
-        for row in rows {
-            let k: String = row.get("key");
-            let v: String = row.get("value");
-            map.insert(k, v);
-        }
-        Ok(map)
-    }
-
-    pub async fn save_settings(&self, entries: &HashMap<String, String>) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
-        for (k, v) in entries {
-            sqlx::query(
-                r#"
-                INSERT INTO settings (key, value, updated_at)
-                VALUES (?1, ?2, ?3)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
-                    updated_at = excluded.updated_at
-                "#,
-            )
-            .bind(k)
-            .bind(v)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
     }
 
     pub async fn upsert_folder(

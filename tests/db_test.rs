@@ -1,9 +1,8 @@
 use mybox_immich_sync::db::{CheckpointDB, FileUpsert};
-use std::collections::HashMap;
 use tempfile::TempDir;
 
 #[tokio::test]
-async fn test_sqlite_wal_settings_and_file_lifecycle() {
+async fn test_sqlite_wal_checkpoint_and_file_lifecycle() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("sync_state.db");
     let db = CheckpointDB::connect(db_path.to_str().unwrap())
@@ -14,26 +13,7 @@ async fn test_sqlite_wal_settings_and_file_lifecycle() {
     let mode = db.get_journal_mode().await.unwrap();
     assert_eq!(mode.to_lowercase(), "wal");
 
-    // 2. Verify settings persistence
-    let mut settings = HashMap::new();
-    settings.insert("mybox_pat".to_string(), "pat_secret_123".to_string());
-    settings.insert(
-        "immich_url".to_string(),
-        "http://192.168.0.10:2283".to_string(),
-    );
-    db.save_settings(&settings).await.unwrap();
-
-    let loaded = db.get_all_settings().await.unwrap();
-    assert_eq!(
-        loaded.get("mybox_pat").map(|s| s.as_str()),
-        Some("pat_secret_123")
-    );
-    assert_eq!(
-        loaded.get("immich_url").map(|s| s.as_str()),
-        Some("http://192.168.0.10:2283")
-    );
-
-    // 3. Verify folder checkpoint lifecycle with composite key (source_type, folder_id)
+    // 2. Verify folder checkpoint lifecycle with composite key (source_type, folder_id)
     db.upsert_folder("mybox", "root", "/").await.unwrap();
     db.upsert_folder("gdrive", "root", "/").await.unwrap();
     db.update_folder_cursor("mybox", "root", Some("cursor_page_2"))

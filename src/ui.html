@@ -16,7 +16,6 @@
       --green: #22c55e;
       --amber: #f59e0b;
       --red: #ef4444;
-      --purple: #a855f7;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -86,7 +85,7 @@
     .card-title { font-size: 0.85rem; color: var(--muted); margin-bottom: 8px; }
     .card-value { font-size: 1.65rem; font-weight: 700; margin-bottom: 4px; }
     .card-sub { font-size: 0.8rem; color: var(--muted); }
-    .progress-box {
+    .progress-box, .env-panel {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 14px;
@@ -132,37 +131,25 @@
     button.btn-primary { background: var(--green); color: #052e16; border-color: var(--green); }
     button.btn-amber { background: var(--amber); color: #451a03; border-color: var(--amber); }
     button.btn-danger { background: var(--red); color: #fff; border-color: var(--red); }
-    details.settings-panel {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 18px;
-      margin-bottom: 20px;
+    .env-summary-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
     }
-    details.settings-panel summary {
-      font-weight: 700;
-      cursor: pointer;
-      font-size: 1rem;
-    }
-    .form-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 14px;
-      margin-top: 16px;
-    }
-    .form-group label {
-      display: block;
+    .env-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
       font-size: 0.82rem;
       color: var(--muted);
-      margin-bottom: 4px;
     }
-    .form-group input, .form-group select {
-      width: 100%;
-      padding: 9px 12px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
+    .env-pill {
+      padding: 4px 10px;
+      border-radius: 999px;
       background: #0f172a;
-      color: var(--text);
+      border: 1px solid var(--border);
     }
     .console-box {
       background: #020617;
@@ -213,6 +200,21 @@
       <button class="tab-btn" onclick="selectSource('takeout', this)">🗂️ Google Takeout</button>
     </div>
 
+    <div class="env-panel">
+      <div class="env-summary-row">
+        <div>
+          <strong style="font-size:0.95rem;">🔧 TrueNAS SCALE 앱 환경변수 구성 상태</strong>
+          <div id="envPills" class="env-pills" style="margin-top:8px;">
+            <span class="env-pill">환경변수 상태 불러오는 중...</span>
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+          <button class="btn" onclick="testConnections()">🔌 전체 연결 테스트</button>
+          <span id="connTestOutput" style="font-size:0.85rem;color:var(--muted);"></span>
+        </div>
+      </div>
+    </div>
+
     <div class="progress-box">
       <div class="progress-header">
         <span id="currentFileLabel">대기 중 — 실행할 작업을 선택하세요</span>
@@ -257,68 +259,6 @@
       <button class="btn btn-danger" onclick="openDeleteModal()">🗑️ 완료 항목 원격 삭제 (휴지통 이동)</button>
     </div>
 
-    <details class="settings-panel">
-      <summary>⚙️ 연결 및 성능 설정 (환경변수 또는 SQLite 영구 저장)</summary>
-      <div class="form-grid">
-        <div class="form-group">
-          <label>네이버 MYBOX 개인 액세스 토큰 (PAT)</label>
-          <input type="password" id="cfg_mybox_pat" placeholder="MYBOX_PAT" />
-        </div>
-        <div class="form-group">
-          <label>Google Drive OAuth 액세스 토큰</label>
-          <input type="password" id="cfg_gdrive_access_token" placeholder="GDRIVE_ACCESS_TOKEN" />
-        </div>
-        <div class="form-group">
-          <label>Google Takeout 로컬 ZIP 폴더 경로</label>
-          <input type="text" id="cfg_takeout_dir" placeholder="/data/takeout" />
-        </div>
-        <div class="form-group">
-          <label>Immich 서버 URL</label>
-          <input type="text" id="cfg_immich_url" placeholder="http://192.168.0.10:2283" />
-        </div>
-        <div class="form-group">
-          <label>Immich API Key</label>
-          <input type="password" id="cfg_immich_api_key" placeholder="Immich x-api-key" />
-        </div>
-        <div class="form-group">
-          <label>Nextcloud 라우팅 활성화</label>
-          <select id="cfg_enable_nextcloud">
-            <option value="true">활성화 (일반 문서/파일 Nextcloud 백업)</option>
-            <option value="false">비활성화 (사진/영상만 Immich 백업)</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Nextcloud 서버 URL</label>
-          <input type="text" id="cfg_nextcloud_url" placeholder="http://192.168.0.10:8080" />
-        </div>
-        <div class="form-group">
-          <label>Nextcloud 사용자 ID</label>
-          <input type="text" id="cfg_nextcloud_user" placeholder="admin" />
-        </div>
-        <div class="form-group">
-          <label>Nextcloud 앱 비밀번호 (App Password)</label>
-          <input type="password" id="cfg_nextcloud_app_password" placeholder="xxxx-xxxx-xxxx-xxxx" />
-        </div>
-        <div class="form-group">
-          <label>Nextcloud 백업 루트 폴더</label>
-          <input type="text" id="cfg_nextcloud_base_dir" placeholder="/Cloud-Backup" />
-        </div>
-        <div class="form-group">
-          <label>동시 워커 수 (CONCURRENCY)</label>
-          <input type="number" id="cfg_concurrency" min="1" max="16" value="3" />
-        </div>
-        <div class="form-group">
-          <label>초당 요청 제한 (RATE_LIMIT_RPS)</label>
-          <input type="number" id="cfg_rate_limit_rps" step="0.5" min="0.5" max="50" value="5.0" />
-        </div>
-      </div>
-      <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-        <button class="btn btn-primary" onclick="saveSettings()">💾 설정 저장</button>
-        <button class="btn" onclick="testConnections()">🔌 전체 연결 테스트</button>
-        <span id="connTestOutput" style="font-size:0.85rem;color:var(--muted);"></span>
-      </div>
-    </details>
-
     <div class="console-box" id="logConsole">
       <div class="log-line"><span class="log-time">[시스템]</span>대시보드가 준비되었습니다. 실시간 SSE 스트림에 연결 중...</div>
     </div>
@@ -354,64 +294,18 @@
       box.scrollTop = box.scrollHeight;
     }
 
-    async function loadSettings() {
-      const res = await fetch('/api/settings');
-      if (!res.ok) return;
-      const d = await res.json();
-      document.getElementById('cfg_mybox_pat').value = d.mybox_pat || '';
-      document.getElementById('cfg_gdrive_access_token').value = d.gdrive_access_token || '';
-      document.getElementById('cfg_takeout_dir').value = d.takeout_dir || '/data/takeout';
-      document.getElementById('cfg_immich_url').value = d.immich_url || '';
-      document.getElementById('cfg_immich_api_key').value = d.immich_api_key || '';
-      document.getElementById('cfg_enable_nextcloud').value = String(d.enable_nextcloud);
-      document.getElementById('cfg_nextcloud_url').value = d.nextcloud_url || '';
-      document.getElementById('cfg_nextcloud_user').value = d.nextcloud_user || '';
-      document.getElementById('cfg_nextcloud_app_password').value = d.nextcloud_app_password || '';
-      document.getElementById('cfg_nextcloud_base_dir').value = d.nextcloud_base_dir || '/Cloud-Backup';
-      document.getElementById('cfg_concurrency').value = d.concurrency || 3;
-      document.getElementById('cfg_rate_limit_rps').value = d.rate_limit_rps || 5.0;
-    }
-
-    async function saveSettings() {
-      const payload = {
-        mybox_pat: document.getElementById('cfg_mybox_pat').value,
-        gdrive_access_token: document.getElementById('cfg_gdrive_access_token').value,
-        takeout_dir: document.getElementById('cfg_takeout_dir').value,
-        immich_url: document.getElementById('cfg_immich_url').value,
-        immich_api_key: document.getElementById('cfg_immich_api_key').value,
-        enable_nextcloud: document.getElementById('cfg_enable_nextcloud').value,
-        nextcloud_url: document.getElementById('cfg_nextcloud_url').value,
-        nextcloud_user: document.getElementById('cfg_nextcloud_user').value,
-        nextcloud_app_password: document.getElementById('cfg_nextcloud_app_password').value,
-        nextcloud_base_dir: document.getElementById('cfg_nextcloud_base_dir').value,
-        concurrency: document.getElementById('cfg_concurrency').value,
-        rate_limit_rps: document.getElementById('cfg_rate_limit_rps').value
-      };
-      const res = await fetch('/api/settings', {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(payload)
-      });
-      if (res.ok) {
-        appendLog(new Date().toLocaleTimeString(), '✅ 설정이 SQLite settings 테이블에 저장되었습니다.');
-        loadSettings();
-      }
-    }
-
     async function testConnections() {
       const out = document.getElementById('connTestOutput');
       out.textContent = '연결 테스트 중...';
       const res = await fetch('/api/connections/test', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({})
+        method: 'POST'
       });
       const data = await res.json();
       const parts = [];
       for (const [k, v] of Object.entries(data.results || {})) {
         parts.push(`${v.ok ? '✅' : '❌'} ${k}: ${v.message}`);
       }
-      out.textContent = parts.join(' | ');
+      out.textContent = parts.length > 0 ? parts.join(' | ') : '설정된 소스/타겟 환경변수가 없습니다.';
       appendLog(new Date().toLocaleTimeString(), '🔌 연결 테스트 결과: ' + out.textContent);
     }
 
@@ -430,6 +324,19 @@
       else if (st === 'syncing') badge.textContent = `🟢 [${d.active_source || currentSource}] 동기화 진행 중...`;
       else if (st === 'deleting') badge.textContent = `🟠 [${d.active_source || currentSource}] 원격 삭제 진행 중...`;
       else if (st === 'stopping') badge.textContent = '🟠 안전 정지 중...';
+
+      if (d.config_summary) {
+        const c = d.config_summary;
+        const pills = [
+          `MYBOX: ${c.mybox_configured ? '✅ 설정됨' : '⚪ 미설정'}`,
+          `GDrive: ${c.gdrive_configured ? '✅ 설정됨' : '⚪ 미설정'}`,
+          `Takeout: ${c.takeout_dir}`,
+          `Immich: ${c.immich_configured ? '✅ 설정됨' : '⚪ 미설정'}`,
+          `Nextcloud: ${c.enable_nextcloud ? (c.nextcloud_configured ? `✅ 설정됨 (${c.nextcloud_base_dir})` : '⚠️ 인증정보 누락') : '⚪ 비활성화'}`,
+          `워커: ${c.concurrency}개 / ${c.rate_limit_rps} RPS`
+        ];
+        document.getElementById('envPills').innerHTML = pills.map(p => `<span class="env-pill">${p}</span>`).join('');
+      }
 
       const s = d.stats || {};
       document.getElementById('statPending').textContent = `${s.pending_files || 0}건`;
@@ -487,7 +394,6 @@
       };
     }
 
-    loadSettings();
     fetchStatus();
     connectSSE();
     setInterval(fetchStatus, 3000);

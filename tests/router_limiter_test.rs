@@ -35,25 +35,27 @@ fn test_target_router_classification() {
 }
 
 #[test]
-fn test_config_db_overrides_precedence() {
-    let mut cfg = AppConfig {
-        mybox_pat: "env_pat_token".to_string(),
-        immich_url: "http://env-immich:2283".to_string(),
-        concurrency: 3,
-        ..AppConfig::default()
-    };
+fn test_config_env_map_parsing_and_url_normalization() {
+    let mut cfg = AppConfig::default();
 
-    let mut overrides = HashMap::new();
-    overrides.insert("mybox_pat".to_string(), "db_override_pat".to_string());
-    // Empty value in DB should NOT overwrite existing non-empty env config
-    overrides.insert("immich_url".to_string(), "".to_string());
-    overrides.insert("concurrency".to_string(), "8".to_string());
+    let mut env_map = HashMap::new();
+    env_map.insert("mybox_pat".to_string(), "env_pat_token".to_string());
+    // Trailing slash on URL should be stripped automatically
+    env_map.insert(
+        "immich_url".to_string(),
+        "http://env-immich:2283/".to_string(),
+    );
+    // Empty value in env map should NOT overwrite default values
+    env_map.insert("takeout_dir".to_string(), "".to_string());
+    env_map.insert("concurrency".to_string(), "8".to_string());
 
-    cfg.apply_db_overrides(&overrides);
+    cfg.apply_env_map(&env_map);
 
-    assert_eq!(cfg.mybox_pat, "db_override_pat");
+    assert_eq!(cfg.mybox_pat, "env_pat_token");
     assert_eq!(cfg.immich_url, "http://env-immich:2283");
+    assert_eq!(cfg.takeout_dir, "/data/takeout");
     assert_eq!(cfg.concurrency, 8);
+    assert!(cfg.summary().mybox_configured);
 }
 
 #[tokio::test]

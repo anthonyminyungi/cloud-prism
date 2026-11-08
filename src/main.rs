@@ -70,26 +70,22 @@ async fn main() -> Result<()> {
             axum::serve(listener, app).await?;
         }
         Commands::Auto { source } => {
-            let eff = state.effective_config().await?;
-            let pipeline = SyncPipeline::from_config(state, eff, &source)?;
+            let pipeline = SyncPipeline::from_config(state, cfg, &source)?;
             let stats = pipeline.run_auto().await?;
             println!("Auto completed: {:?}", stats);
         }
         Commands::Scan { source } => {
-            let eff = state.effective_config().await?;
-            let pipeline = SyncPipeline::from_config(state, eff, &source)?;
+            let pipeline = SyncPipeline::from_config(state, cfg, &source)?;
             let stats = pipeline.run_scan().await?;
             println!("Scan completed: {:?}", stats);
         }
         Commands::Sync { source } => {
-            let eff = state.effective_config().await?;
-            let pipeline = SyncPipeline::from_config(state, eff, &source)?;
+            let pipeline = SyncPipeline::from_config(state, cfg, &source)?;
             let stats = pipeline.run_sync().await?;
             println!("Sync completed: {:?}", stats);
         }
         Commands::Delete { source, dry_run } => {
-            let eff = state.effective_config().await?;
-            let pipeline = SyncPipeline::from_config(state, eff, &source)?;
+            let pipeline = SyncPipeline::from_config(state, cfg, &source)?;
             let stats = pipeline.run_delete(dry_run).await?;
             println!("Delete (dry_run={}) completed: {:?}", dry_run, stats);
         }
