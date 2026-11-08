@@ -1,27 +1,33 @@
-# Naver MYBOX to Immich 비동기 동기화 및 사후 일괄 삭제 도구 설계 명세서 (Design Spec)
+# 멀티 클라우드(MYBOX · Google · iCloud) to NAS(Immich · Nextcloud) 비동기 이주 및 사후 삭제 엔진 설계 명세서 (Design Spec)
 
-- **작성일**: 2026-11-06
+- **최종 업데이트**: 2026-11-09
 - **프로젝트 경로**: `C:\Users\dbstn\.gemini\antigravity\scratch\mybox-immich-sync`
-- **목적**: 네이버 MYBOX에 남아있는 대량의 사진/동영상을 Open API(`https://open-api.mybox.naver.com/v1`)를 통해 자작 NAS의 셀프호스팅 Immich 서버로 비동기 동기화(중복 제거 포함)하고, SQLite 체크포인트 및 SHA-1 해시 검증을 거쳐 안전하게 사후 일괄 원격 삭제(휴지통 이동)를 수행하는 Docker Compose 기반 백그라운드 자동화 도구 구축.
+- **목적**: 네이버 MYBOX, Google Drive, Google Photos(Takeout), iCloud 등 외부 클라우드에 남아있는 데이터를 플러그인 방식으로 스캔하여 **사진·동영상은 셀프호스팅 Immich**로, **일반 문서·파일은 폴더 구조를 유지한 채 셀프호스팅 Nextcloud**로 비동기 스트리밍 이주시키고, SQLite(`WAL` 모드) 체크포인트 및 해시/크기 이중 검증을 거쳐 안전하게 사후 일괄 원격 삭제(Offload & Purge)를 수행하는 TrueNAS SCALE 최적화 오픈소스 도구 구축.
 
 ---
 
-## 1. 핵심 요구사항 및 설계 원칙
+## 1. 핵심 요구사항 및 아키텍처 원칙
 
-1. **Docker Compose 기반 백그라운드 실행 및 완료 시 자동 종료**:
-   - `docker compose up -d`로 실행 시 터미널을 블로킹하지 않고 백그라운드에서 `scan` → `sync` 파이프라인을 자동 수행한다.
-   - `restart: on-failure:3` 정책을 사용하여 일시적인 네트워크 장애로 비정상 종료된 경우에는 컨테이너가 자동으로 재기동하여 SQLite 체크포인트부터 이어서 작업하고, **전체 동기화 작업이 100% 완료되어 정상 종료(`exit code 0`)되면 컨테이너가 자동으로 내려간다(Stopped).**
-2. **비동기(`asyncio`) 멀티 워커 파이프라인 & Rate Limit 제어**:
-   - `httpx.AsyncClient`와 `asyncio.Queue`를 활용해 다수의 워커(기본 3개, 설정 가능)가 병렬로 다운로드·해시 계산·Immich 업로드를 수행한다.
-   - 토큰 버킷(Token Bucket) 방식의 Rate Limiter와 지수 백오프(Exponential Backoff, `429 Too Many Requests` / `5xx` 대응)를 적용해 네이버 MYBOX API 차단을 방지한다.
-3. **스트리밍 SHA-1 해시 계산 및 중복 업로드 생략 최적화**:
-   - 이미 아이폰에서 Immich로 동기화된 사진이 많으므로, MYBOX에서 임시 파일로 스트리밍 다운로드하면서 동시에 메모리에서 `SHA-1` 해시를 계산한다.
-   - 파일 본문을 Immich에 업로드하기 전에 `POST /api/assets/bulk-upload-check`로 해시 중복 여부를 먼저 질의하여, 이미 존재하는 사진(`duplicate`)은 파일 업로드 과정을 생략하고 즉시 완료(`UPLOADED`) 처리한다.
-4. **SQLite(`WAL` 모드) 체크포인트 및 사후 일괄 삭제 분리**:
-   - 동기화(`sync`) 단계에서는 MYBOX 원본을 절대 삭제하지 않고 SQLite DB(`/data/sync_state.db`)에 파일별 `resource_id`, `sha1_hash`, `immich_asset_id`, `status = 'UPLOADED'`만 기록한다.
-   - 사용자가 원하는 시점에 삭제 명령(`delete`)을 실행하면, SQLite의 `UPLOADED` 항목들을 대상으로 Immich 서버에 해당 `sha1_hash`가 실제로 존재하는지 재검증(`bulk-upload-check`)한 뒤에만 MYBOX 삭제 API(`DELETE /v1/drive/resources/{resourceId}`)를 호출해 휴지통으로 이동시키고 컨테이너를 자동 종료한다.
-5. **앨범 미생성(타임라인 통합) 기본 정책**:
-   - MYBOX 사진 대다수가 `자동업로드` 폴더에 위치하므로 기본적으로 별도 앨범을 생성하지 않고 파일의 EXIF 및 원본 수정 시각(`modified_time`)을 보존하여 Immich 타임라인에 통합한다.
+1. **양방향 플러그인 추상화 (`SourceProvider` → `TargetRouter` → `TargetProvider`)**:
+   - **입력부(`SourceProvider`)**:
+     - `MyboxProvider`: 네이버 MYBOX Open API (`PAT` 기반 스캔·다운로드·휴지통 이동)
+     - `GoogleDriveProvider`: Google Drive API v3 (서버 측 `sha1Checksum`을 활용한 무다운로드 중복 스킵, Google Docs/Sheets 자동 변환 다운로드, 휴지통 이동)
+     - `GoogleTakeoutProvider`: Google Photos Takeout `.zip` 아카이브 무압축해제 스트리밍 + JSON Sidecar 메타데이터(원본 촬영일·설명) 결합 복원
+     - `ICloudProvider` (확장 인터페이스): `pyicloud` 기반 조회·다운로드·원격 삭제 연동 규격
+   - **자동 분류 라우터(`TargetRouter`)**:
+     - 파일 확장자 및 MIME 타입을 판별하여 사진/영상(`MEDIA_EXTENSIONS`)은 `immich` 타겟으로, 일반 파일/문서는 `nextcloud` 타겟으로 자동 라우팅한다.
+   - **출력부(`TargetProvider`)**:
+     - `ImmichTarget`: SHA-1 해시 기반 사전 중복 검사(`POST /api/assets/bulk-upload-check`) 및 신규 에셋 업로드(`POST /api/assets`)
+     - `NextcloudTarget`: 표준 WebDAV API(`MKCOL`, `PUT`, `HEAD`)를 통해 MYBOX/Google Drive의 원본 폴더 구조를 재현하고, `X-OC-MTime` 헤더로 원본 수정 시각을 보존하며 업로드한다.
+2. **TrueNAS SCALE (ZFS) 최적화 및 완료 시 컨테이너 자동 종료**:
+   - 스트리밍 임시 파일(`/tmp/mybox_sync`)은 호스트 ZFS 디스크가 아닌 컨테이너 RAM 디스크(`tmpfs`)에 마운트하여 ZFS Copy-on-Write(CoW) 디스크 마모 및 스냅샷 용량 증가를 원천 차단한다.
+   - `restart: on-failure:3` 정책을 통해 네트워크 오류(`exit 1`) 시에만 자동 재기동하여 체크포인트부터 이어하고, **동기화 또는 삭제 작업이 100% 완료(`exit 0`)되면 컨테이너가 자동으로 내려간다(Stopped).**
+3. **SQLite(`WAL` 모드) 체크포인트 및 사후 이중 검증 일괄 삭제**:
+   - `sync` 단계에서는 원본 클라우드 파일을 절대 삭제하지 않으며, `(source_type, resource_id)` 복합키 기준으로 `target_type`, `sha1_hash`, `remote_target_id`, `status = 'UPLOADED'`만 기록한다.
+   - 나중에 사용자가 `delete` 명령을 실행하면:
+     - `target_type == 'immich'` 항목은 Immich `bulk-upload-check`로 해당 `sha1_hash`가 실제 존재하는지 재검증
+     - `target_type == 'nextcloud'` 항목은 Nextcloud WebDAV `HEAD` 요청으로 해당 경로에 파일이 동일한 바이트 크기(`Content-Length`)로 존재하는지 재검증
+     - 재검증을 통과한 파일만 원본 클라우드(`MyboxProvider`, `GoogleDriveProvider` 등)의 휴지통 이동 API를 호출하고 `status = 'DELETED'`로 갱신한다.
 
 ---
 
@@ -37,17 +43,27 @@ mybox-immich-sync/
 ├── src/
 │   └── mybox_sync/
 │       ├── __init__.py
-│       ├── config.py          # 환경변수 및 런타임 설정 로드/검증
-│       ├── db.py              # aiosqlite 기반 WAL 모드 체크포인트 DB 관리
-│       ├── limiter.py         # 비동기 Token Bucket Rate Limiter & Backoff 재시도 래퍼
-│       ├── mybox_client.py    # 네이버 MYBOX Open API 비동기 클라이언트
-│       ├── immich_client.py   # 셀프호스팅 Immich REST API 비동기 클라이언트
-│       ├── pipeline.py        # scan / sync / delete 비동기 멀티 워커 파이프라인
-│       └── cli.py             # CLI 엔트리포인트 (auto, scan, sync, delete, status)
+│       ├── config.py                  # 멀티 소스(MYBOX/GDrive/Takeout) 및 멀티 타겟(Immich/Nextcloud) 설정
+│       ├── db.py                      # aiosqlite WAL 모드 체크포인트 DB ((source_type, resource_id) 복합키)
+│       ├── limiter.py                 # 비동기 Token Bucket Rate Limiter & 지수 백오프 재시도
+│       ├── router.py                  # 파일 확장자/타입 기반 TargetRouter ('immich' vs 'nextcloud')
+│       ├── sources/
+│       │   ├── __init__.py
+│       │   ├── base.py                # SourceProvider Protocol & RemoteItem 데이터 모델
+│       │   ├── mybox.py               # 네이버 MYBOX Open API 플러그인
+│       │   ├── gdrive.py              # Google Drive API v3 플러그인 (서버 SHA-1 사전 체크 포함)
+│       │   └── takeout.py             # Google Takeout ZIP 스트리밍 + JSON 메타데이터 복원 플러그인
+│       ├── targets/
+│       │   ├── __init__.py
+│       │   ├── base.py                # TargetProvider Protocol
+│       │   ├── immich.py              # 셀프호스팅 Immich REST API 타겟 플러그인
+│       │   └── nextcloud.py           # 셀프호스팅 Nextcloud WebDAV 타겟 플러그인
+│       ├── pipeline.py                # scan / sync / delete 비동기 멀티 워커 파이프라인
+│       └── cli.py                     # CLI 엔트리포인트 (--source 선택 및 auto, scan, sync, delete, status)
 └── tests/
     ├── test_db.py
     ├── test_limiter.py
-    ├── test_clients.py
+    ├── test_sources_and_targets.py
     └── test_pipeline.py
 ```
 
@@ -55,108 +71,59 @@ mybox-immich-sync/
 
 ## 3. SQLite 데이터베이스 스키마 (`/data/sync_state.db`)
 
-멀티 워커 동시성 보장과 실행 중 외부에서 `status` 조회가 가능하도록 연결 시 `PRAGMA journal_mode=WAL;` 및 `PRAGMA synchronous=NORMAL;`을 활성화한다.
-
-### 3.1 `folders` 테이블 (폴더 트리 탐색 체크포인트)
+### 3.1 `folders` 테이블 (소스별 폴더 트리 탐색 체크포인트)
 | 컬럼명 | 타입 | 설명 |
 |---|---|---|
-| `folder_id` | `TEXT PRIMARY KEY` | MYBOX 폴더 ID (루트는 `'ROOT'`) |
-| `path` | `TEXT NOT NULL` | 전체 폴더 경로 (예: `'/자동업로드/2023'`) |
-| `last_cursor` | `TEXT` | 페이지네이션 중단 시 재개할 커서 토큰 |
+| `source_type` | `TEXT NOT NULL` | `'mybox'` \| `'gdrive'` \| `'takeout'` \| `'icloud'` |
+| `folder_id` | `TEXT NOT NULL` | 클라우드 폴더 ID (루트는 `'ROOT'`) |
+| `path` | `TEXT NOT NULL` | 전체 폴더 경로 (예: `'/문서/2025'`) |
+| `last_cursor` | `TEXT` | 페이지네이션 중단 시 재개할 커서(`cursor` / `nextPageToken`) |
 | `scan_status` | `TEXT NOT NULL` | `'PENDING'` \| `'SCANNED'` \| `'FAILED'` |
 | `updated_at` | `TEXT NOT NULL` | ISO-8601 갱신 시각 |
+| **PK** | `PRIMARY KEY (source_type, folder_id)` | 소스별 폴더 고유 식별 |
 
-### 3.2 `files` 테이블 (사진/영상 파일 동기화 및 삭제 체크포인트)
+### 3.2 `files` 테이블 (파일별 라우팅, 동기화 및 삭제 체크포인트)
 | 컬럼명 | 타입 | 설명 |
 |---|---|---|
-| `resource_id` | `TEXT PRIMARY KEY` | MYBOX 파일 고유 ID (원격 삭제 시 사용) |
-| `name` | `TEXT NOT NULL` | 파일명 (예: `'IMG_1234.HEIC'`) |
-| `parent_path` | `TEXT NOT NULL` | 상위 폴더 경로 |
-| `size` | `INTEGER NOT NULL` | MYBOX상 파일 크기 (Bytes, 다운로드 무결성 검증용) |
-| `created_time` | `TEXT` | MYBOX 파일 생성 시각 |
-| `modified_time` | `TEXT NOT NULL` | MYBOX 파일 수정/촬영 시각 |
-| `sha1_hash` | `TEXT` | 스트리밍 다운로드 중 계산된 SHA-1 해시 (Hex) |
-| `immich_asset_id` | `TEXT` | Immich 서버 내 에셋 ID |
-| `immich_status` | `TEXT` | `'created'` (신규 업로드) \| `'duplicate'` (기존 존재) |
+| `source_type` | `TEXT NOT NULL` | `'mybox'` \| `'gdrive'` \| `'takeout'` \| `'icloud'` |
+| `resource_id` | `TEXT NOT NULL` | 원본 클라우드 파일 고유 ID (삭제 시 사용) |
+| `name` | `TEXT NOT NULL` | 파일명 (예: `'IMG_1234.HEIC'`, `'계약서.pdf'`) |
+| `parent_path` | `TEXT NOT NULL` | 원본 상위 폴더 경로 (Nextcloud 업로드 시 경로 보존에 사용) |
+| `size` | `INTEGER NOT NULL` | 원본 파일 크기 (Bytes) |
+| `created_time` | `TEXT` | 원본 생성/촬영 시각 |
+| `modified_time` | `TEXT NOT NULL` | 원본 수정/촬영 시각 |
+| `target_type` | `TEXT NOT NULL` | `'immich'` (사진·영상) \| `'nextcloud'` (일반 파일·문서) |
+| `sha1_hash` | `TEXT` | 서버 제공 또는 스트리밍 다운로드 중 계산된 SHA-1 해시 (Hex) |
+| `remote_target_id` | `TEXT` | Immich 에셋 ID 또는 Nextcloud 원격 경로 |
+| `sync_result` | `TEXT` | `'created'` (신규 업로드) \| `'duplicate'` (기존 존재로 업로드 생략) |
 | `status` | `TEXT NOT NULL` | `'PENDING'` → `'UPLOADED'` → `'DELETED'` (오류 시 `'FAILED'`) |
 | `retry_count` | `INTEGER DEFAULT 0` | 실패 재시도 횟수 |
 | `error_msg` | `TEXT` | 마지막 오류 메시지 |
 | `updated_at` | `TEXT NOT NULL` | ISO-8601 갱신 시각 |
+| **PK** | `PRIMARY KEY (source_type, resource_id)` | 소스별 파일 고유 식별 |
 
 ---
 
-## 4. 외부 API 연동 규격
+## 4. 플러그인별 핵심 동작 규격
 
-### 4.1 Naver MYBOX Open API (`https://open-api.mybox.naver.com/v1`)
-- 공통 헤더: `Authorization: Bearer {MYBOX_PAT}`
-1. **루트 목록 조회**: `GET /v1/drive/resources?count=1000&cursor={cursor}`
-2. **하위 폴더 목록 조회**: `GET /v1/drive/folders/{folderId}/resources?count=1000&cursor={cursor}`
-3. **다운로드 URL 발급**: `GET /v1/drive/files/{fileId}/download` → 반환된 임시 다운로드 URL로 스트리밍 다운로드 수행
-4. **파일 삭제 (휴지통 이동)**: `DELETE /v1/drive/resources/{resourceId}` → `204 No Content` 확인
+### 4.1 입력 플러그인 (`SourceProvider`)
+1. **`MyboxProvider` (`source_type='mybox'`)**:
+   - `GET /v1/drive/resources` 및 `/v1/drive/folders/{folderId}/resources`로 트리 탐색
+   - `GET /v1/drive/files/{fileId}/download`로 `tmpfs`에 스트리밍 다운로드하며 `SHA-1` 계산
+   - `DELETE /v1/drive/resources/{resourceId}`로 휴지통 이동
+2. **`GoogleDriveProvider` (`source_type='gdrive'`)**:
+   - `GET https://www.googleapis.com/drive/v3/files` (`fields="nextPageToken,files(id,name,mimeType,size,sha1Checksum,createdTime,modifiedTime,parents)"`, `q="trashed = false"`)
+   - **사전 해시 기록**: 스캔 단계에서 이미 `sha1Checksum`을 받아 DB에 저장하므로, `sync` 단계에서 다운로드 전에 Immich `bulk-upload-check`를 먼저 호출하여 중복 사진은 다운로드조차 생략!
+   - 다운로드: 일반 파일은 `?alt=media`, Google Docs/Sheets/Slides는 `/export` 엔드포인트로 `.docx`/`.xlsx`/`.pptx` 변환 다운로드
+   - 삭제: `PATCH https://www.googleapis.com/drive/v3/files/{fileId}` (`{"trashed": true}`)로 안전하게 구글 드라이브 휴지통 이동
+3. **`GoogleTakeoutProvider` (`source_type='takeout'`)**:
+   - 지정된 디렉터리의 `Takeout-*.zip` 파일들을 압축 해제 없이 순회하며 내부 `.json` 메타데이터(`photoTakenTime.timestamp`)를 파싱해 원본 촬영 시각을 복원하고, 파일 스트림과 SHA-1 해시를 추출해 Immich/Nextcloud로 전달한다.
 
-### 4.2 Self-Hosted Immich API (`{IMMICH_URL}/api`)
-- 공통 헤더: `x-api-key: {IMMICH_API_KEY}`
-1. **해시 기반 중복 사전/사후 일괄 확인**:
-   - `POST /api/assets/bulk-upload-check`
-   - Body: `{"assets": [{"id": "<resource_id>", "checksum": "<sha1_hex_or_base64>"}]}`
-   - 응답 결과가 `action: "reject", reason: "duplicate"`이면 반환된 `assetId`를 기록하고 업로드 생략.
-2. **신규 미디어 업로드**:
-   - `POST /api/assets` (`multipart/form-data`)
-   - 필드: `assetData`(파일 바이너리), `deviceAssetId`(`mybox-{resource_id}`), `deviceId`(`"MYBOX-SYNC"`), `fileCreatedAt`, `fileModifiedAt`
-   - 헤더: `x-immich-checksum: {sha1_hex}`
-
----
-
-## 5. 실행 모드 및 Docker Compose 생명주기
-
-### 5.1 CLI 실행 모드 (`python -m mybox_sync.cli <command>`)
-- **`auto` (Docker 기본 커맨드)**:
-  1. 미완료 폴더가 있으면 `scan` 수행
-  2. `PENDING` (및 재시도 가능한 `FAILED`) 파일에 대해 `sync` 수행
-  3. 모든 파일이 `UPLOADED` 상태가 되면 최종 통계 로그를 출력하고 `exit(0)`으로 종료 → **컨테이너 자동 종료**
-- **`scan`**: MYBOX 전체 폴더를 순회하며 미디어 파일만 SQLite에 `PENDING` 등록 후 종료
-- **`sync`**: `PENDING` 파일들을 다운로드·해시 계산·Immich 업로드 후 `UPLOADED` 기록 및 임시 파일 삭제 후 종료
-- **`delete` (`--dry-run` 지원)**:
-  1. SQLite에서 `status = 'UPLOADED'`이고 `sha1_hash`가 존재하는 항목 조회
-  2. 200개 단위 배치로 Immich `/api/assets/bulk-upload-check`를 호출하여 현재 Immich에 해당 해시가 존재하는지 재검증
-  3. 검증 통과한 파일만 MYBOX `DELETE /v1/drive/resources/{resourceId}` 호출 후 `status = 'DELETED'`로 갱신
-  4. 전체 삭제 완료 시 `exit(0)`으로 종료 → **컨테이너 자동 종료**
-- **`status`**: 현재 DB 기준 스캔된 폴더 수, `PENDING` / `UPLOADED` (신규 vs 중복) / `DELETED` / `FAILED` 건수 및 총 용량 표 출력
-
-### 5.2 TrueNAS SCALE (ZFS & Docker Compose) 최적화 구성
-TrueNAS SCALE(Electric Eel 24.10+ 기본 Docker 엔진) 환경의 특성을 반영하여 다음 최적화를 적용한다:
-
-1. **ZFS 디스크 쓰기(CoW) 방지를 위한 `tmpfs`(RAM 디스크) 활용**:
-   - 수만 장의 사진을 임시 다운로드 후 삭제할 때 ZFS 풀(Pool)에 불필요한 쓰기/단편화나 스냅샷 용량 증가가 발생하지 않도록, 임시 다운로드 경로(`/tmp/mybox_sync`)는 호스트 디스크 대신 컨테이너 메모리(`tmpfs`)에 마운트한다. (동시 워커 3개 기준 수십 MB 메모리만 사용 후 즉시 해제됨)
-2. **TrueNAS Dataset 경로 및 권한(`568:568` `apps` 계정) 호환**:
-   - SQLite 체크포인트 DB(`sync_state.db`)만 영구 보존하면 되므로 `/mnt/<Pool이름>/mybox-sync/data:/data` 한 곳만 호스트 경로로 마운트한다.
-   - SSH/Dockge용 `docker-compose.yml`(`build: .` 방식)과 TrueNAS 웹 UI(`Apps -> Custom App -> Install via YAML`)에서 별도 이미지 빌드 없이 바로 붙여넣어 쓸 수 있는 설정 예시를 모두 제공한다.
-
-```yaml
-services:
-  mybox-sync:
-    build: .
-    container_name: mybox-immich-sync
-    env_file: .env
-    volumes:
-      - ./data:/data          # TrueNAS 예: /mnt/tank/apps/mybox-sync/data:/data
-    tmpfs:
-      - /tmp/mybox_sync:size=1G,mode=1777  # ZFS 쓰기 방지를 위한 RAM 디스크 활용
-    command: ["auto"]
-    restart: on-failure:3     # 에러 시에만 최대 3회 재시작, 완료(exit 0) 시 컨테이너 자동 종료
-```
-
----
-
-## 6. 에러 처리 및 테스트 전략
-
-1. **원자적 임시 파일 관리**:
-   - 다운로드 중에는 `/tmp/mybox_sync/{resource_id}.part`에 기록하며, `try ... finally` 블록을 통해 업로드 성공/실패/컨테이너 종료(`SIGTERM`) 시에도 디스크에 임시 파일이 남지 않도록 즉시 삭제한다.
-2. **다운로드 크기 검증**:
-   - 스트리밍 다운로드 완료 후 실제 바이트 수가 MYBOX 메타데이터의 `size`(0보다 큰 경우)와 다르면 손상된 다운로드로 간주하고 업로드하지 않으며 재시도 큐로 넘긴다.
-3. **안전한 종료 (Graceful Shutdown)**:
-   - `SIGINT` / `SIGTERM` 수신 시 새로운 파일 작업을 중단하고, 현재 진행 중인 워커의 파일 처리가 끝나면 SQLite 커밋 후 안전하게 종료한다.
-4. **단위 및 통합 테스트 (`pytest` + `pytest-asyncio` + `respx`)**:
-   - SQLite 상태 전이 및 중단 후 재개(`Resume`) 테스트
-   - Rate Limiter 및 `429` 응답 시 지수 백오프 동작 테스트
-   - MYBOX / Immich Mock API를 활용한 `scan` → `sync`(신규 및 중복 케이스) → `delete`(해시 검증 성공 및 실패 케이스) 전체 파이프라인 검증
+### 4.2 출력 플러그인 (`TargetProvider`)
+1. **`ImmichTarget` (`target_type='immich'`)**:
+   - `check_exists(items)`: `POST /api/assets/bulk-upload-check`로 SHA-1 해시 중복 여부 일괄 확인
+   - `upload(...)`: `POST /api/assets`로 멀티파트 업로드 (`fileCreatedAt`, `fileModifiedAt` 보존)
+2. **`NextcloudTarget` (`target_type='nextcloud'`)**:
+   - 기본 경로: `{NEXTCLOUD_URL}/remote.php/dav/files/{NEXTCLOUD_USER}/{NEXTCLOUD_BASE_DIR}/{parent_path}/{name}`
+   - `check_exists(item)`: `HEAD` 요청으로 파일 존재 여부 및 `Content-Length == size` 일치 여부 확인
+   - `upload(...)`: 상위 폴더가 없으면 `MKCOL`로 재귀 생성(캐시 적용) 후, `PUT` 요청과 `X-OC-MTime` 헤더로 원본 수정일을 유지하여 스트리밍 업로드
