@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud-Prism · 멀티 클라우드(MYBOX · Google) → NAS(Immich · Nextcloud) 이주 대시보드</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --panel-hover: #334155;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --amber: #f59e0b;
+      --red: #ef4444;
+      --purple: #a855f7;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 24px;
+    }
+    .container { max-width: 1180px; margin: 0 auto; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 20px;
+    }
+    header h1 { font-size: 1.35rem; font-weight: 700; }
+    header p { color: var(--muted); font-size: 0.88rem; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+    .tabs {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      padding: 10px 18px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
+      font-weight: 600;
+      transition: all 0.15s;
+    }
+    .tab-btn.active {
+      background: var(--accent);
+      color: #0f172a;
+      border-color: var(--accent);
+    }
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+    }
+    .card-title { font-size: 0.85rem; color: var(--muted); margin-bottom: 8px; }
+    .card-value { font-size: 1.65rem; font-weight: 700; margin-bottom: 4px; }
+    .card-sub { font-size: 0.8rem; color: var(--muted); }
+    .progress-box {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      margin-bottom: 20px;
+    }
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.9rem;
+      margin-bottom: 8px;
+    }
+    .progress-bar-bg {
+      width: 100%;
+      height: 12px;
+      background: #0f172a;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--green));
+      transition: width 0.25s ease;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    button.btn {
+      padding: 10px 16px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button.btn:hover { background: var(--panel-hover); }
+    button.btn-primary { background: var(--green); color: #052e16; border-color: var(--green); }
+    button.btn-amber { background: var(--amber); color: #451a03; border-color: var(--amber); }
+    button.btn-danger { background: var(--red); color: #fff; border-color: var(--red); }
+    details.settings-panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      margin-bottom: 20px;
+    }
+    details.settings-panel summary {
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 1rem;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+      margin-top: 16px;
+    }
+    .form-group label {
+      display: block;
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .form-group input, .form-group select {
+      width: 100%;
+      padding: 9px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #0f172a;
+      color: var(--text);
+    }
+    .console-box {
+      background: #020617;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.82rem;
+      height: 280px;
+      overflow-y: auto;
+    }
+    .log-line { margin-bottom: 4px; color: #cbd5e1; }
+    .log-time { color: #64748b; margin-right: 8px; }
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.78);
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+    }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      max-width: 480px;
+      width: 92%;
+      padding: 22px;
+    }
+    .modal h3 { margin-bottom: 10px; }
+    .modal p { color: var(--muted); font-size: 0.9rem; margin-bottom: 18px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>TrueNAS SCALE 멀티 클라우드 → NAS 이주 엔진</h1>
+        <p>네이버 MYBOX · Google Drive · Google Takeout → Immich(사진/영상) & Nextcloud(문서/일반파일)</p>
+      </div>
+      <div id="jobStatusBadge" class="badge">⚪ 대기 중 (Idle)</div>
+    </header>
+
+    <div class="tabs">
+      <button class="tab-btn active" onclick="selectSource('mybox', this)">📦 네이버 MYBOX</button>
+      <button class="tab-btn" onclick="selectSource('gdrive', this)">☁️ Google Drive</button>
+      <button class="tab-btn" onclick="selectSource('takeout', this)">🗂️ Google Takeout</button>
+    </div>
+
+    <div class="progress-box">
+      <div class="progress-header">
+        <span id="currentFileLabel">대기 중 — 실행할 작업을 선택하세요</span>
+        <span id="progressMeta">0% (0.0 파일/초)</span>
+      </div>
+      <div class="progress-bar-bg">
+        <div id="progressBar" class="progress-bar-fill"></div>
+      </div>
+    </div>
+
+    <div class="card-grid">
+      <div class="card">
+        <div class="card-title">스캔 / 대기 중 (PENDING)</div>
+        <div id="statPending" class="card-value">0건</div>
+        <div id="statFolders" class="card-sub">스캔 완료 폴더: 0개</div>
+      </div>
+      <div class="card">
+        <div class="card-title">📸 Immich 이주 완료 (UPLOADED)</div>
+        <div id="statImmich" class="card-value">0건</div>
+        <div id="statImmichSub" class="card-sub">신규: 0 / 중복 스킵: 0</div>
+      </div>
+      <div class="card">
+        <div class="card-title">📁 Nextcloud 이주 완료 (UPLOADED)</div>
+        <div id="statNextcloud" class="card-value">0건</div>
+        <div class="card-sub">원본 폴더 트리 및 수정일 보존</div>
+      </div>
+      <div class="card">
+        <div class="card-title">🗑️ 원격 삭제 완료 & ⚠️ 실패</div>
+        <div id="statDeletedFailed" class="card-value">0 / 0</div>
+        <div class="card-sub">
+          <button class="btn" style="padding:3px 8px;font-size:0.75rem;margin-top:4px;" onclick="retryFailed()">🔄 실패 항목 재시도</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button class="btn btn-primary" onclick="startJob('auto', false)">▶️ 원클릭 스캔 & 동기화 시작</button>
+      <button class="btn" onclick="startJob('scan', false)">🔍 스캔만 실행</button>
+      <button class="btn" onclick="startJob('sync', false)">🚀 동기화만 실행</button>
+      <button class="btn btn-amber" onclick="stopJob()">⏸️ 일시정지 (안전 중단)</button>
+      <button class="btn" onclick="startJob('delete', true)">🧪 원격 삭제 시뮬레이션 (Dry-Run)</button>
+      <button class="btn btn-danger" onclick="openDeleteModal()">🗑️ 완료 항목 원격 삭제 (휴지통 이동)</button>
+    </div>
+
+    <details class="settings-panel">
+      <summary>⚙️ 연결 및 성능 설정 (환경변수 또는 SQLite 영구 저장)</summary>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>네이버 MYBOX 개인 액세스 토큰 (PAT)</label>
+          <input type="password" id="cfg_mybox_pat" placeholder="MYBOX_PAT" />
+        </div>
+        <div class="form-group">
+          <label>Google Drive OAuth 액세스 토큰</label>
+          <input type="password" id="cfg_gdrive_access_token" placeholder="GDRIVE_ACCESS_TOKEN" />
+        </div>
+        <div class="form-group">
+          <label>Google Takeout 로컬 ZIP 폴더 경로</label>
+          <input type="text" id="cfg_takeout_dir" placeholder="/data/takeout" />
+        </div>
+        <div class="form-group">
+          <label>Immich 서버 URL</label>
+          <input type="text" id="cfg_immich_url" placeholder="http://192.168.0.10:2283" />
+        </div>
+        <div class="form-group">
+          <label>Immich API Key</label>
+          <input type="password" id="cfg_immich_api_key" placeholder="Immich x-api-key" />
+        </div>
+        <div class="form-group">
+          <label>Nextcloud 라우팅 활성화</label>
+          <select id="cfg_enable_nextcloud">
+            <option value="true">활성화 (일반 문서/파일 Nextcloud 백업)</option>
+            <option value="false">비활성화 (사진/영상만 Immich 백업)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Nextcloud 서버 URL</label>
+          <input type="text" id="cfg_nextcloud_url" placeholder="http://192.168.0.10:8080" />
+        </div>
+        <div class="form-group">
+          <label>Nextcloud 사용자 ID</label>
+          <input type="text" id="cfg_nextcloud_user" placeholder="admin" />
+        </div>
+        <div class="form-group">
+          <label>Nextcloud 앱 비밀번호 (App Password)</label>
+          <input type="password" id="cfg_nextcloud_app_password" placeholder="xxxx-xxxx-xxxx-xxxx" />
+        </div>
+        <div class="form-group">
+          <label>Nextcloud 백업 루트 폴더</label>
+          <input type="text" id="cfg_nextcloud_base_dir" placeholder="/Cloud-Backup" />
+        </div>
+        <div class="form-group">
+          <label>동시 워커 수 (CONCURRENCY)</label>
+          <input type="number" id="cfg_concurrency" min="1" max="16" value="3" />
+        </div>
+        <div class="form-group">
+          <label>초당 요청 제한 (RATE_LIMIT_RPS)</label>
+          <input type="number" id="cfg_rate_limit_rps" step="0.5" min="0.5" max="50" value="5.0" />
+        </div>
+      </div>
+      <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        <button class="btn btn-primary" onclick="saveSettings()">💾 설정 저장</button>
+        <button class="btn" onclick="testConnections()">🔌 전체 연결 테스트</button>
+        <span id="connTestOutput" style="font-size:0.85rem;color:var(--muted);"></span>
+      </div>
+    </details>
+
+    <div class="console-box" id="logConsole">
+      <div class="log-line"><span class="log-time">[시스템]</span>대시보드가 준비되었습니다. 실시간 SSE 스트림에 연결 중...</div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="deleteModal">
+    <div class="modal">
+      <h3>🗑️ 완료 항목 원격 삭제 (휴지통 이동)</h3>
+      <p>이미 Immich 또는 Nextcloud로 이주가 완료(`UPLOADED`)된 파일만 대상이 되며, 삭제 직전 타겟 서버에 해시/크기가 존재하는지 100% 재검증한 뒤 원격 클라우드 휴지통으로 이동합니다. 계속하시겠습니까?</p>
+      <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <button class="btn" onclick="closeDeleteModal()">취소</button>
+        <button class="btn btn-danger" onclick="confirmDelete()">재검증 후 휴지통 이동 실행</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentSource = 'mybox';
+
+    function selectSource(src, btn) {
+      currentSource = src;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      fetchStatus();
+    }
+
+    function appendLog(time, msg) {
+      const box = document.getElementById('logConsole');
+      const div = document.createElement('div');
+      div.className = 'log-line';
+      div.innerHTML = `<span class="log-time">[${time}]</span>${msg}`;
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    async function loadSettings() {
+      const res = await fetch('/api/settings');
+      if (!res.ok) return;
+      const d = await res.json();
+      document.getElementById('cfg_mybox_pat').value = d.mybox_pat || '';
+      document.getElementById('cfg_gdrive_access_token').value = d.gdrive_access_token || '';
+      document.getElementById('cfg_takeout_dir').value = d.takeout_dir || '/data/takeout';
+      document.getElementById('cfg_immich_url').value = d.immich_url || '';
+      document.getElementById('cfg_immich_api_key').value = d.immich_api_key || '';
+      document.getElementById('cfg_enable_nextcloud').value = String(d.enable_nextcloud);
+      document.getElementById('cfg_nextcloud_url').value = d.nextcloud_url || '';
+      document.getElementById('cfg_nextcloud_user').value = d.nextcloud_user || '';
+      document.getElementById('cfg_nextcloud_app_password').value = d.nextcloud_app_password || '';
+      document.getElementById('cfg_nextcloud_base_dir').value = d.nextcloud_base_dir || '/Cloud-Backup';
+      document.getElementById('cfg_concurrency').value = d.concurrency || 3;
+      document.getElementById('cfg_rate_limit_rps').value = d.rate_limit_rps || 5.0;
+    }
+
+    async function saveSettings() {
+      const payload = {
+        mybox_pat: document.getElementById('cfg_mybox_pat').value,
+        gdrive_access_token: document.getElementById('cfg_gdrive_access_token').value,
+        takeout_dir: document.getElementById('cfg_takeout_dir').value,
+        immich_url: document.getElementById('cfg_immich_url').value,
+        immich_api_key: document.getElementById('cfg_immich_api_key').value,
+        enable_nextcloud: document.getElementById('cfg_enable_nextcloud').value,
+        nextcloud_url: document.getElementById('cfg_nextcloud_url').value,
+        nextcloud_user: document.getElementById('cfg_nextcloud_user').value,
+        nextcloud_app_password: document.getElementById('cfg_nextcloud_app_password').value,
+        nextcloud_base_dir: document.getElementById('cfg_nextcloud_base_dir').value,
+        concurrency: document.getElementById('cfg_concurrency').value,
+        rate_limit_rps: document.getElementById('cfg_rate_limit_rps').value
+      };
+      const res = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      if (res.ok) {
+        appendLog(new Date().toLocaleTimeString(), '✅ 설정이 SQLite settings 테이블에 저장되었습니다.');
+        loadSettings();
+      }
+    }
+
+    async function testConnections() {
+      const out = document.getElementById('connTestOutput');
+      out.textContent = '연결 테스트 중...';
+      const res = await fetch('/api/connections/test', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      const parts = [];
+      for (const [k, v] of Object.entries(data.results || {})) {
+        parts.push(`${v.ok ? '✅' : '❌'} ${k}: ${v.message}`);
+      }
+      out.textContent = parts.join(' | ');
+      appendLog(new Date().toLocaleTimeString(), '🔌 연결 테스트 결과: ' + out.textContent);
+    }
+
+    async function fetchStatus() {
+      const res = await fetch(`/api/status?source=${currentSource}`);
+      if (!res.ok) return;
+      const d = await res.json();
+      renderStatus(d);
+    }
+
+    function renderStatus(d) {
+      const badge = document.getElementById('jobStatusBadge');
+      const st = d.state || 'idle';
+      if (st === 'idle') badge.textContent = '⚪ 대기 중 (Idle)';
+      else if (st === 'scanning') badge.textContent = `🟢 [${d.active_source || currentSource}] 스캔 진행 중...`;
+      else if (st === 'syncing') badge.textContent = `🟢 [${d.active_source || currentSource}] 동기화 진행 중...`;
+      else if (st === 'deleting') badge.textContent = `🟠 [${d.active_source || currentSource}] 원격 삭제 진행 중...`;
+      else if (st === 'stopping') badge.textContent = '🟠 안전 정지 중...';
+
+      const s = d.stats || {};
+      document.getElementById('statPending').textContent = `${s.pending_files || 0}건`;
+      document.getElementById('statFolders').textContent = `스캔 완료 폴더: ${s.scanned_folders || 0}개 (대기: ${s.pending_folders || 0})`;
+      const immichTotal = (s.uploaded_immich_created || 0) + (s.uploaded_immich_duplicate || 0);
+      document.getElementById('statImmich').textContent = `${immichTotal}건`;
+      document.getElementById('statImmichSub').textContent = `신규: ${s.uploaded_immich_created || 0} / 중복 스킵: ${s.uploaded_immich_duplicate || 0}`;
+      document.getElementById('statNextcloud').textContent = `${s.uploaded_nextcloud || 0}건`;
+      document.getElementById('statDeletedFailed').textContent = `${s.deleted_files || 0} / ${s.failed_files || 0}`;
+    }
+
+    async function startJob(mode, dryRun) {
+      const res = await fetch('/api/jobs/start', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ source: currentSource, mode, dry_run: dryRun })
+      });
+      if (res.status === 409) {
+        alert('이미 실행 중인 백그라운드 작업이 있습니다.');
+        return;
+      }
+      fetchStatus();
+    }
+
+    async function stopJob() {
+      await fetch('/api/jobs/stop', { method: 'POST' });
+      fetchStatus();
+    }
+
+    async function retryFailed() {
+      await fetch('/api/jobs/retry-failed', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ source: currentSource })
+      });
+      fetchStatus();
+    }
+
+    function openDeleteModal() { document.getElementById('deleteModal').style.display = 'flex'; }
+    function closeDeleteModal() { document.getElementById('deleteModal').style.display = 'none'; }
+    function confirmDelete() { closeDeleteModal(); startJob('delete', false); }
+
+    function connectSSE() {
+      const es = new EventSource('/api/events');
+      es.onmessage = (e) => {
+        try {
+          const ev = JSON.parse(e.data);
+          appendLog(ev.timestamp.slice(11, 19), ev.message);
+          document.getElementById('currentFileLabel').textContent = ev.current_file ? `처리 중: ${ev.current_file}` : ev.message;
+          const pct = ev.total_files > 0 ? Math.min(100, Math.round((ev.processed_files / ev.total_files) * 100)) : 0;
+          document.getElementById('progressBar').style.width = `${pct}%`;
+          document.getElementById('progressMeta').textContent = `${pct}% (${(ev.speed_fps || 0).toFixed(1)} 파일/초)`;
+          fetchStatus();
+        } catch (_) {}
+      };
+    }
+
+    loadSettings();
+    fetchStatus();
+    connectSSE();
+    setInterval(fetchStatus, 3000);
+  </script>
+</body>
+</html>
