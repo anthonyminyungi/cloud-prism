@@ -1,0 +1,4 @@
+{
+  "rust-analyzer.server.path": "C:/Users/dbstn/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/rust-analyzer.exe",
+  "rust-analyzer.check.command": "clippy"
+}
