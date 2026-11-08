@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use crate::db::{FileRecord, FileUpsert, SyncStats};
 use crate::limiter::RateLimiter;
-use crate::router::TargetRouter;
+use crate::router::{SourceType, SyncResultKind, TargetRouter, TargetType};
 use crate::sources::gdrive::GoogleDriveProvider;
 use crate::sources::mybox::MyboxProvider;
 use crate::sources::takeout::GoogleTakeoutProvider;
@@ -9,75 +9,98 @@ use crate::sources::SourceProvider;
 use crate::state::{AppState, JobState};
 use crate::targets::immich::ImmichTarget;
 use crate::targets::nextcloud::NextcloudTarget;
+use crate::targets::{TargetProvider, UploadContext, UploadOutcome};
 use anyhow::{anyhow, Result};
 use futures::stream::{self, StreamExt};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-pub struct SyncPipeline {
-    state: Arc<AppState>,
-    config: AppConfig,
-    source_name: String,
-    source: Arc<dyn SourceProvider>,
-    immich: Arc<ImmichTarget>,
-    nextcloud: Arc<NextcloudTarget>,
+const SYNC_BATCH_SIZE: i64 = 100;
+const DELETE_BATCH_LIMIT: i64 = 10_000;
+
+pub fn build_source_provider(
+    config: &AppConfig,
+    source_type: SourceType,
+    limiter: RateLimiter,
+) -> Arc<dyn SourceProvider> {
+    match source_type {
+        SourceType::Mybox => Arc::new(MyboxProvider::new(
+            config.mybox_api_base.clone(),
+            config.mybox_pat.clone(),
+            limiter,
+        )),
+        SourceType::Gdrive => Arc::new(GoogleDriveProvider::new(
+            config.gdrive_api_base.clone(),
+            config.gdrive_access_token.clone(),
+            limiter,
+        )),
+        SourceType::Takeout => Arc::new(GoogleTakeoutProvider::new(&config.takeout_dir)),
+    }
 }
 
-impl SyncPipeline {
-    pub fn from_config(
-        state: Arc<AppState>,
-        config: AppConfig,
-        source_name: &str,
-    ) -> Result<Self> {
-        let limiter = RateLimiter::new(config.rate_limit_rps, config.max_retries);
-        let normalized_source = source_name.trim().to_ascii_lowercase();
-
-        let source: Arc<dyn SourceProvider> = match normalized_source.as_str() {
-            "mybox" => Arc::new(MyboxProvider::new(
-                config.mybox_api_base.clone(),
-                config.mybox_pat.clone(),
-                limiter.clone(),
-            )),
-            "gdrive" => Arc::new(GoogleDriveProvider::new(
-                config.gdrive_api_base.clone(),
-                config.gdrive_access_token.clone(),
-                limiter.clone(),
-            )),
-            "takeout" => Arc::new(GoogleTakeoutProvider::new(&config.takeout_dir)),
-            other => return Err(anyhow!("지원하지 않는 소스 타입입니다: {}", other)),
-        };
-
-        let immich = Arc::new(ImmichTarget::new(
+pub fn build_target_providers(
+    config: &AppConfig,
+    limiter: RateLimiter,
+) -> HashMap<TargetType, Arc<dyn TargetProvider>> {
+    let mut targets: HashMap<TargetType, Arc<dyn TargetProvider>> = HashMap::new();
+    targets.insert(
+        TargetType::Immich,
+        Arc::new(ImmichTarget::new(
             config.immich_url.clone(),
             config.immich_api_key.clone(),
             limiter.clone(),
-        ));
-
-        let nextcloud = Arc::new(NextcloudTarget::new(
+        )),
+    );
+    targets.insert(
+        TargetType::Nextcloud,
+        Arc::new(NextcloudTarget::new(
             config.nextcloud_url.clone(),
             config.nextcloud_user.clone(),
             config.nextcloud_app_password.clone(),
             config.nextcloud_base_dir.clone(),
             limiter,
-        ));
+        )),
+    );
+    targets
+}
+
+pub struct SyncPipeline {
+    state: Arc<AppState>,
+    config: AppConfig,
+    source_type: SourceType,
+    source: Arc<dyn SourceProvider>,
+    targets: HashMap<TargetType, Arc<dyn TargetProvider>>,
+}
+
+impl SyncPipeline {
+    pub fn from_config(state: Arc<AppState>, config: AppConfig, source_name: &str) -> Result<Self> {
+        let source_type: SourceType = source_name.parse()?;
+        let limiter = RateLimiter::new(config.rate_limit_rps, config.max_retries);
+        let source = build_source_provider(&config, source_type, limiter.clone());
+        let targets = build_target_providers(&config, limiter);
 
         Ok(Self {
             state,
             config,
-            source_name: normalized_source,
+            source_type,
             source,
-            immich,
-            nextcloud,
+            targets,
         })
     }
 
+    fn source_key(&self) -> &'static str {
+        self.source_type.as_str()
+    }
+
     pub async fn run_auto(&self) -> Result<SyncStats> {
+        let src = self.source_key();
         self.run_scan().await?;
         if self.state.is_stopping() {
-            let stats = self.state.db.get_stats(&self.source_name).await?;
+            let stats = self.state.db.get_stats(src).await?;
             self.state
-                .finish_job(&self.source_name, "스캔 단계에서 안전 일시정지되었습니다.")
+                .finish_job(src, "스캔 단계에서 안전 일시정지되었습니다.")
                 .await;
             return Ok(stats);
         }
@@ -85,7 +108,7 @@ impl SyncPipeline {
     }
 
     pub async fn run_scan(&self) -> Result<SyncStats> {
-        let src = &self.source_name;
+        let src = self.source_key();
         self.state.begin_phase(src, JobState::Scanning, 0).await;
         self.state
             .emit_event(
@@ -98,11 +121,7 @@ impl SyncPipeline {
 
         self.state.db.upsert_folder(src, "root", "/").await?;
 
-        loop {
-            if self.state.is_stopping() {
-                break;
-            }
-
+        while !self.state.is_stopping() {
             let pending_folders = self.state.db.get_pending_folders(src).await?;
             if pending_folders.is_empty() {
                 break;
@@ -112,76 +131,8 @@ impl SyncPipeline {
                 if self.state.is_stopping() {
                     break;
                 }
-
-                let mut cursor = folder.last_cursor.clone();
-                loop {
-                    if self.state.is_stopping() {
-                        break;
-                    }
-
-                    let page = self
-                        .source
-                        .list_page(&folder.folder_id, &folder.path, cursor.as_deref())
-                        .await?;
-
-                    for sub in &page.folders {
-                        self.state
-                            .db
-                            .upsert_folder(src, &sub.folder_id, &sub.path)
-                            .await?;
-                    }
-
-                    let mut upserts = Vec::new();
-                    for rf in &page.files {
-                        if let Some(target_type) =
-                            TargetRouter::classify(&rf.name, self.config.enable_nextcloud)
-                        {
-                            upserts.push(FileUpsert {
-                                source_type: src.clone(),
-                                resource_id: rf.resource_id.clone(),
-                                name: rf.name.clone(),
-                                parent_path: rf.parent_path.clone(),
-                                size: rf.size,
-                                created_time: rf.created_time.clone(),
-                                modified_time: rf.modified_time.clone(),
-                                target_type: target_type.as_str().to_string(),
-                                sha1_hash: rf.sha1_hash.clone(),
-                            });
-                        }
-                    }
-
-                    if !upserts.is_empty() {
-                        let added = self.state.db.upsert_files(&upserts).await?;
-                        self.state
-                            .processed_files
-                            .fetch_add(added as u64, Ordering::SeqCst);
-                        self.state
-                            .emit_event(
-                                src,
-                                JobState::Scanning,
-                                Some(folder.path.clone()),
-                                format!(
-                                    "폴더 스캔 중: {} (발견된 파일 {}건 체크포인트 등록)",
-                                    folder.path, added
-                                ),
-                            )
-                            .await;
-                    }
-
-                    if let Some(next_c) = page.next_cursor {
-                        self.state
-                            .db
-                            .update_folder_cursor(src, &folder.folder_id, Some(&next_c))
-                            .await?;
-                        cursor = Some(next_c);
-                    } else {
-                        self.state
-                            .db
-                            .mark_folder_scanned(src, &folder.folder_id)
-                            .await?;
-                        break;
-                    }
-                }
+                self.scan_single_folder(&folder.folder_id, &folder.path, folder.last_cursor)
+                    .await?;
             }
         }
 
@@ -198,8 +149,82 @@ impl SyncPipeline {
         Ok(stats)
     }
 
+    async fn scan_single_folder(
+        &self,
+        folder_id: &str,
+        folder_path: &str,
+        mut cursor: Option<String>,
+    ) -> Result<()> {
+        let src = self.source_key();
+
+        while !self.state.is_stopping() {
+            let page = self
+                .source
+                .list_page(folder_id, folder_path, cursor.as_deref())
+                .await?;
+
+            for sub in &page.folders {
+                self.state
+                    .db
+                    .upsert_folder(src, &sub.folder_id, &sub.path)
+                    .await?;
+            }
+
+            let upserts: Vec<FileUpsert> = page
+                .files
+                .into_iter()
+                .filter_map(|rf| {
+                    let target_type =
+                        TargetRouter::classify(&rf.name, self.config.enable_nextcloud)?;
+                    Some(FileUpsert {
+                        source_type: src.to_string(),
+                        resource_id: rf.resource_id,
+                        name: rf.name,
+                        parent_path: rf.parent_path,
+                        size: rf.size,
+                        created_time: rf.created_time,
+                        modified_time: rf.modified_time,
+                        target_type: target_type.as_str().to_string(),
+                        sha1_hash: rf.sha1_hash,
+                    })
+                })
+                .collect();
+
+            if !upserts.is_empty() {
+                let added = self.state.db.upsert_files(&upserts).await?;
+                self.state
+                    .processed_files
+                    .fetch_add(added as u64, Ordering::SeqCst);
+                self.state
+                    .emit_event(
+                        src,
+                        JobState::Scanning,
+                        Some(folder_path.to_string()),
+                        format!(
+                            "폴더 스캔 중: {} (발견된 파일 {}건 체크포인트 등록)",
+                            folder_path, added
+                        ),
+                    )
+                    .await;
+            }
+
+            if let Some(next_c) = page.next_cursor {
+                self.state
+                    .db
+                    .update_folder_cursor(src, folder_id, Some(&next_c))
+                    .await?;
+                cursor = Some(next_c);
+            } else {
+                self.state.db.mark_folder_scanned(src, folder_id).await?;
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn run_sync(&self) -> Result<SyncStats> {
-        let src = &self.source_name;
+        let src = self.source_key();
         let initial_stats = self.state.db.get_stats(src).await?;
         self.state
             .begin_phase(src, JobState::Syncing, initial_stats.pending_files as u64)
@@ -219,15 +244,11 @@ impl SyncPipeline {
         let max_retries = self.config.max_retries as i64;
         let concurrency = self.config.concurrency.max(1);
 
-        loop {
-            if self.state.is_stopping() {
-                break;
-            }
-
+        while !self.state.is_stopping() {
             let batch = self
                 .state
                 .db
-                .get_pending_files(src, max_retries, 100)
+                .get_pending_files(src, max_retries, SYNC_BATCH_SIZE)
                 .await?;
             if batch.is_empty() {
                 break;
@@ -235,10 +256,9 @@ impl SyncPipeline {
 
             stream::iter(batch)
                 .for_each_concurrent(concurrency, |file| async move {
-                    if self.state.is_stopping() {
-                        return;
+                    if !self.state.is_stopping() {
+                        self.sync_single_file(file).await;
                     }
-                    self.sync_single_file(file).await;
                 })
                 .await;
         }
@@ -261,7 +281,7 @@ impl SyncPipeline {
     }
 
     async fn sync_single_file(&self, file: FileRecord) {
-        let src = &self.source_name;
+        let src = self.source_key();
         let max_retries = self.config.max_retries as i64;
 
         self.state
@@ -269,91 +289,27 @@ impl SyncPipeline {
                 src,
                 JobState::Syncing,
                 Some(file.name.clone()),
-                format!("처리 중: {}/{}", file.parent_path.trim_end_matches('/'), file.name),
+                format!(
+                    "처리 중: {}/{}",
+                    file.parent_path.trim_end_matches('/'),
+                    file.name
+                ),
             )
             .await;
 
-        let res: Result<(String, String, String)> = async {
-            // Fast path: if target is Immich and source already provided a SHA-1 hash (e.g. Google Drive),
-            // check Immich bulk-upload-check before downloading the file!
-            if file.target_type == "immich" {
-                if let Some(ref existing_sha1) = file.sha1_hash {
-                    let check_items = vec![(file.resource_id.clone(), existing_sha1.clone())];
-                    if let Ok(map) = self.immich.check_bulk_hashes(&check_items).await {
-                        if let Some(Some(existing_asset_id)) = map.get(&file.resource_id) {
-                            return Ok((
-                                existing_sha1.clone(),
-                                existing_asset_id.clone(),
-                                "duplicate".to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Stream download to tmpfs (/tmp/mybox_sync) with RAII TempFileGuard and 1-pass SHA-1
-            let downloaded = self
-                .source
-                .download_to_temp(
-                    &file.resource_id,
-                    &file.name,
-                    Path::new(&self.config.tmp_dir),
-                )
-                .await?;
-
-            let sha1 = downloaded.sha1_hash.clone();
-            let created_time = downloaded
-                .created_time_override
-                .as_deref()
-                .unwrap_or(&file.created_time);
-            let modified_time = downloaded
-                .modified_time_override
-                .as_deref()
-                .unwrap_or(&file.modified_time);
-
-            if file.target_type == "immich" {
-                let check_items = vec![(file.resource_id.clone(), sha1.clone())];
-                let map = self.immich.check_bulk_hashes(&check_items).await?;
-                if let Some(Some(existing_asset_id)) = map.get(&file.resource_id) {
-                    return Ok((
-                        sha1,
-                        existing_asset_id.clone(),
-                        "duplicate".to_string(),
-                    ));
-                }
-
-                let (asset_id, status) = self
-                    .immich
-                    .upload_asset(
-                        downloaded.temp_guard.path(),
-                        &file.name,
-                        &file.resource_id,
-                        created_time,
-                        modified_time,
-                    )
-                    .await?;
-                Ok((sha1, asset_id, status))
-            } else {
-                let remote_path = self
-                    .nextcloud
-                    .upload_file(
-                        downloaded.temp_guard.path(),
-                        &file.parent_path,
-                        &file.name,
-                        modified_time,
-                    )
-                    .await?;
-                Ok((sha1, remote_path, "created".to_string()))
-            }
-        }
-        .await;
-
-        match res {
-            Ok((sha1, remote_id, sync_result)) => {
+        match self.transfer_file(&file).await {
+            Ok((sha1, outcome)) => {
+                let result_str = outcome.sync_result.as_str();
                 let _ = self
                     .state
                     .db
-                    .mark_file_uploaded(src, &file.resource_id, &sha1, &remote_id, &sync_result)
+                    .mark_file_uploaded(
+                        src,
+                        &file.resource_id,
+                        &sha1,
+                        &outcome.remote_target_id,
+                        result_str,
+                    )
                     .await;
                 self.state.processed_files.fetch_add(1, Ordering::SeqCst);
                 self.state
@@ -363,7 +319,7 @@ impl SyncPipeline {
                         Some(file.name.clone()),
                         format!(
                             "이주 완료 [{} / {}]: {}",
-                            file.target_type, sync_result, file.name
+                            file.target_type, result_str, file.name
                         ),
                     )
                     .await;
@@ -387,9 +343,69 @@ impl SyncPipeline {
         }
     }
 
+    async fn transfer_file(&self, file: &FileRecord) -> Result<(String, UploadOutcome)> {
+        let target_type: TargetType = file.target_type.parse()?;
+        let target = self
+            .targets
+            .get(&target_type)
+            .ok_or_else(|| anyhow!("등록되지 않은 타겟 플러그인: {}", target_type))?;
+
+        // Zero-download fast path if source metadata already includes a SHA-1 checksum
+        if let Some(ref existing_sha1) = file.sha1_hash {
+            if let Ok(Some(existing_asset_id)) = target
+                .precheck_duplicate(&file.resource_id, existing_sha1)
+                .await
+            {
+                return Ok((
+                    existing_sha1.clone(),
+                    UploadOutcome {
+                        remote_target_id: existing_asset_id,
+                        sync_result: SyncResultKind::Duplicate,
+                    },
+                ));
+            }
+        }
+
+        let downloaded = self
+            .source
+            .download_to_temp(
+                &file.resource_id,
+                &file.name,
+                Path::new(&self.config.tmp_dir),
+            )
+            .await?;
+
+        let created_at = downloaded
+            .created_time_override
+            .as_deref()
+            .unwrap_or(&file.created_time);
+        let modified_at = downloaded
+            .modified_time_override
+            .as_deref()
+            .unwrap_or(&file.modified_time);
+
+        let outcome = target
+            .upload(UploadContext {
+                file_path: downloaded.temp_guard.path(),
+                resource_id: &file.resource_id,
+                filename: &file.name,
+                parent_path: &file.parent_path,
+                sha1_hash: &downloaded.sha1_hash,
+                created_at,
+                modified_at,
+            })
+            .await?;
+
+        Ok((downloaded.sha1_hash.clone(), outcome))
+    }
+
     pub async fn run_delete(&self, dry_run: bool) -> Result<SyncStats> {
-        let src = &self.source_name;
-        let uploaded = self.state.db.get_uploaded_files_for_delete(src, 10_000).await?;
+        let src = self.source_key();
+        let uploaded = self
+            .state
+            .db
+            .get_uploaded_files_for_delete(src, DELETE_BATCH_LIMIT)
+            .await?;
         self.state
             .begin_phase(src, JobState::Deleting, uploaded.len() as u64)
             .await;
@@ -420,24 +436,12 @@ impl SyncPipeline {
                 break;
             }
 
-            let verified = if file.target_type == "immich" {
-                if let Some(ref sha1) = file.sha1_hash {
-                    self.immich
-                        .verify_hash_exists(&file.resource_id, sha1)
-                        .await
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            } else {
-                if let Some(ref remote_path) = file.remote_target_id {
-                    self.nextcloud
-                        .check_file_exists(remote_path, file.size)
-                        .await
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
+            let verified = match file.target_type.parse::<TargetType>() {
+                Ok(t) => match self.targets.get(&t) {
+                    Some(target) => target.verify_exists(&file).await.unwrap_or(false),
+                    None => false,
+                },
+                Err(_) => false,
             };
 
             if !verified {
@@ -465,33 +469,34 @@ impl SyncPipeline {
                         format!("[Dry-Run] 타겟 존재 검증 통과 (삭제 가능): {}", file.name),
                     )
                     .await;
-            } else {
-                match self.source.delete_resource(&file.resource_id).await {
-                    Ok(()) => {
-                        self.state
-                            .db
-                            .mark_file_deleted(src, &file.resource_id)
-                            .await?;
-                        self.state.processed_files.fetch_add(1, Ordering::SeqCst);
-                        self.state
-                            .emit_event(
-                                src,
-                                JobState::Deleting,
-                                Some(file.name.clone()),
-                                format!("🗑️ 원격 휴지통 이동 완료: {}", file.name),
-                            )
-                            .await;
-                    }
-                    Err(err) => {
-                        self.state
-                            .emit_event(
-                                src,
-                                JobState::Deleting,
-                                Some(file.name.clone()),
-                                format!("원격 삭제 실패 ({}): {}", file.name, err),
-                            )
-                            .await;
-                    }
+                continue;
+            }
+
+            match self.source.delete_resource(&file.resource_id).await {
+                Ok(()) => {
+                    self.state
+                        .db
+                        .mark_file_deleted(src, &file.resource_id)
+                        .await?;
+                    self.state.processed_files.fetch_add(1, Ordering::SeqCst);
+                    self.state
+                        .emit_event(
+                            src,
+                            JobState::Deleting,
+                            Some(file.name.clone()),
+                            format!("🗑️ 원격 휴지통 이동 완료: {}", file.name),
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    self.state
+                        .emit_event(
+                            src,
+                            JobState::Deleting,
+                            Some(file.name.clone()),
+                            format!("원격 삭제 실패 ({}): {}", file.name, err),
+                        )
+                        .await;
                 }
             }
         }

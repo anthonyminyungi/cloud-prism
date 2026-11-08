@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::time::Instant;
 use mybox_immich_sync::config::AppConfig;
 use mybox_immich_sync::limiter::RateLimiter;
 use mybox_immich_sync::router::{TargetRouter, TargetType};
+use std::collections::HashMap;
+use std::time::Instant;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -31,18 +31,17 @@ fn test_target_router_classification() {
         TargetRouter::classify("report.hwpx", true),
         Some(TargetType::Nextcloud)
     );
-    assert_eq!(
-        TargetRouter::classify("contract_2026.pdf", false),
-        None
-    );
+    assert_eq!(TargetRouter::classify("contract_2026.pdf", false), None);
 }
 
 #[test]
 fn test_config_db_overrides_precedence() {
-    let mut cfg = AppConfig::default();
-    cfg.mybox_pat = "env_pat_token".to_string();
-    cfg.immich_url = "http://env-immich:2283".to_string();
-    cfg.concurrency = 3;
+    let mut cfg = AppConfig {
+        mybox_pat: "env_pat_token".to_string(),
+        immich_url: "http://env-immich:2283".to_string(),
+        concurrency: 3,
+        ..AppConfig::default()
+    };
 
     let mut overrides = HashMap::new();
     overrides.insert("mybox_pat".to_string(), "db_override_pat".to_string());

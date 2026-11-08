@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use mybox_immich_sync::db::{CheckpointDB, FileUpsert};
+use std::collections::HashMap;
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -17,11 +17,17 @@ async fn test_sqlite_wal_settings_and_file_lifecycle() {
     // 2. Verify settings persistence
     let mut settings = HashMap::new();
     settings.insert("mybox_pat".to_string(), "pat_secret_123".to_string());
-    settings.insert("immich_url".to_string(), "http://192.168.0.10:2283".to_string());
+    settings.insert(
+        "immich_url".to_string(),
+        "http://192.168.0.10:2283".to_string(),
+    );
     db.save_settings(&settings).await.unwrap();
 
     let loaded = db.get_all_settings().await.unwrap();
-    assert_eq!(loaded.get("mybox_pat").map(|s| s.as_str()), Some("pat_secret_123"));
+    assert_eq!(
+        loaded.get("mybox_pat").map(|s| s.as_str()),
+        Some("pat_secret_123")
+    );
     assert_eq!(
         loaded.get("immich_url").map(|s| s.as_str()),
         Some("http://192.168.0.10:2283")
@@ -94,9 +100,15 @@ async fn test_sqlite_wal_settings_and_file_lifecycle() {
     assert_eq!(pending_after_rescan[0].resource_id, "res_doc_1");
 
     // Mark doc failed 3 times so it reaches max_retries and transitions to FAILED
-    db.mark_file_failed("mybox", "res_doc_1", "WebDAV 503", 3).await.unwrap();
-    db.mark_file_failed("mybox", "res_doc_1", "WebDAV 503", 3).await.unwrap();
-    db.mark_file_failed("mybox", "res_doc_1", "WebDAV 503", 3).await.unwrap();
+    db.mark_file_failed("mybox", "res_doc_1", "WebDAV 503", 3)
+        .await
+        .unwrap();
+    db.mark_file_failed("mybox", "res_doc_1", "WebDAV 503", 3)
+        .await
+        .unwrap();
+    db.mark_file_failed("mybox", "res_doc_1", "WebDAV 503", 3)
+        .await
+        .unwrap();
 
     let stats = db.get_stats("mybox").await.unwrap();
     assert_eq!(stats.uploaded_immich_created, 1);
@@ -121,7 +133,10 @@ async fn test_sqlite_wal_settings_and_file_lifecycle() {
     .await
     .unwrap();
 
-    let deletable = db.get_uploaded_files_for_delete("mybox", 100).await.unwrap();
+    let deletable = db
+        .get_uploaded_files_for_delete("mybox", 100)
+        .await
+        .unwrap();
     assert_eq!(deletable.len(), 2);
 
     db.mark_file_deleted("mybox", "res_photo_1").await.unwrap();

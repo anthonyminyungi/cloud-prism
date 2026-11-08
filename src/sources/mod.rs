@@ -2,10 +2,17 @@ pub mod gdrive;
 pub mod mybox;
 pub mod takeout;
 
+use crate::router::SourceType;
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
+use reqwest::Response;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
+
+pub const DEFAULT_FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteFolder {
@@ -66,9 +73,68 @@ pub struct DownloadedSourceFile {
     pub modified_time_override: Option<String>,
 }
 
+pub fn join_remote_path(parent: &str, name: &str) -> String {
+    let trimmed_parent = parent.trim_end_matches('/');
+    let trimmed_name = name.trim_matches('/');
+    if trimmed_parent.is_empty() {
+        format!("/{}", trimmed_name)
+    } else {
+        format!("{}/{}", trimmed_parent, trimmed_name)
+    }
+}
+
+pub fn sanitize_filename(filename: &str) -> String {
+    filename.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+}
+
+pub fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Streams an HTTP response body to a temporary file guarded by `TempFileGuard`
+/// while computing its SHA-1 checksum in a single pass.
+pub async fn stream_response_to_temp(
+    resp: Response,
+    source_prefix: &str,
+    resource_id: &str,
+    filename: &str,
+    tmp_dir: &Path,
+) -> Result<DownloadedSourceFile> {
+    tokio::fs::create_dir_all(tmp_dir).await?;
+    let safe_id = sanitize_filename(resource_id);
+    let safe_name = sanitize_filename(filename);
+    let temp_path = tmp_dir.join(format!("{}_{}_{}", source_prefix, safe_id, safe_name));
+    let temp_guard = TempFileGuard::new(temp_path);
+
+    let mut file = tokio::fs::File::create(temp_guard.path()).await?;
+    let mut hasher = Sha1::new();
+    let mut total_bytes: u64 = 0;
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res?;
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
+        total_bytes += chunk.len() as u64;
+    }
+    file.flush().await?;
+    drop(file);
+
+    Ok(DownloadedSourceFile {
+        temp_guard,
+        sha1_hash: hex::encode(hasher.finalize()),
+        size: total_bytes,
+        created_time_override: None,
+        modified_time_override: None,
+    })
+}
+
 #[async_trait]
 pub trait SourceProvider: Send + Sync {
-    fn source_type(&self) -> &'static str;
+    fn source_type(&self) -> SourceType;
     async fn test_connection(&self) -> Result<String>;
     async fn list_page(
         &self,

@@ -1,7 +1,50 @@
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceType {
+    Mybox,
+    Gdrive,
+    Takeout,
+}
+
+impl SourceType {
+    pub const ALL: &'static [SourceType] =
+        &[SourceType::Mybox, SourceType::Gdrive, SourceType::Takeout];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceType::Mybox => "mybox",
+            SourceType::Gdrive => "gdrive",
+            SourceType::Takeout => "takeout",
+        }
+    }
+}
+
+impl fmt::Display for SourceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SourceType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "mybox" => Ok(SourceType::Mybox),
+            "gdrive" => Ok(SourceType::Gdrive),
+            "takeout" => Ok(SourceType::Takeout),
+            other => Err(anyhow!("지원하지 않는 소스 타입입니다: {}", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TargetType {
     Immich,
@@ -9,6 +52,8 @@ pub enum TargetType {
 }
 
 impl TargetType {
+    pub const ALL: &'static [TargetType] = &[TargetType::Immich, TargetType::Nextcloud];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             TargetType::Immich => "immich",
@@ -17,10 +62,63 @@ impl TargetType {
     }
 
     pub fn from_str_opt(s: &str) -> Option<Self> {
+        s.parse().ok()
+    }
+}
+
+impl fmt::Display for TargetType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TargetType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "immich" => Some(TargetType::Immich),
-            "nextcloud" => Some(TargetType::Nextcloud),
-            _ => None,
+            "immich" => Ok(TargetType::Immich),
+            "nextcloud" => Ok(TargetType::Nextcloud),
+            other => Err(anyhow!("지원하지 않는 타겟 타입입니다: {}", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileStatus {
+    #[serde(rename = "PENDING")]
+    Pending,
+    #[serde(rename = "UPLOADED")]
+    Uploaded,
+    #[serde(rename = "DELETED")]
+    Deleted,
+    #[serde(rename = "FAILED")]
+    Failed,
+}
+
+impl FileStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FileStatus::Pending => "PENDING",
+            FileStatus::Uploaded => "UPLOADED",
+            FileStatus::Deleted => "DELETED",
+            FileStatus::Failed => "FAILED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncResultKind {
+    Created,
+    Duplicate,
+}
+
+impl SyncResultKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SyncResultKind::Created => "created",
+            SyncResultKind::Duplicate => "duplicate",
         }
     }
 }

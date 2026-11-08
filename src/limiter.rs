@@ -79,7 +79,11 @@ impl RateLimiter {
                         sleep(delay).await;
                         continue;
                     }
-                    return Err(anyhow!("HTTP request failed after {} retries: {}", attempt, err));
+                    return Err(anyhow!(
+                        "HTTP request failed after {} retries: {}",
+                        attempt,
+                        err
+                    ));
                 }
             }
         }

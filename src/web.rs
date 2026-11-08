@@ -1,13 +1,8 @@
 use crate::config::SECRET_MASK;
 use crate::limiter::RateLimiter;
-use crate::pipeline::SyncPipeline;
-use crate::sources::gdrive::GoogleDriveProvider;
-use crate::sources::mybox::MyboxProvider;
-use crate::sources::takeout::GoogleTakeoutProvider;
-use crate::sources::SourceProvider;
+use crate::pipeline::{build_source_provider, build_target_providers, SyncPipeline};
+use crate::router::{SourceType, TargetType};
 use crate::state::{AppState, JobState};
-use crate::targets::immich::ImmichTarget;
-use crate::targets::nextcloud::NextcloudTarget;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -25,6 +20,26 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
 const UI_HTML: &str = include_str!("ui.html");
+const RECENT_FAILURES_LIMIT: i64 = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobMode {
+    Auto,
+    Scan,
+    Sync,
+    Delete,
+}
+
+impl JobMode {
+    pub fn initial_state(&self) -> JobState {
+        match self {
+            JobMode::Auto | JobMode::Scan => JobState::Scanning,
+            JobMode::Sync => JobState::Syncing,
+            JobMode::Delete => JobState::Deleting,
+        }
+    }
+}
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -46,11 +61,7 @@ async fn serve_ui() -> Html<&'static str> {
 async fn get_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.effective_config().await {
         Ok(cfg) => (StatusCode::OK, Json(json!(cfg.masked()))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 
@@ -58,35 +69,31 @@ async fn put_settings(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<HashMap<String, Value>>,
 ) -> impl IntoResponse {
-    let mut to_save = HashMap::new();
-    for (k, v) in payload {
-        let s = match v {
-            Value::String(s) => s,
-            Value::Number(n) => n.to_string(),
-            Value::Bool(b) => b.to_string(),
-            _ => continue,
-        };
-        let trimmed = s.trim();
-        if !trimmed.is_empty() && trimmed != SECRET_MASK {
-            to_save.insert(k, trimmed.to_string());
-        }
-    }
+    let to_save: HashMap<String, String> = payload
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let s = match v {
+                Value::String(s) => s,
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                _ => return None,
+            };
+            let trimmed = s.trim();
+            if trimmed.is_empty() || trimmed == SECRET_MASK {
+                None
+            } else {
+                Some((k, trimmed.to_string()))
+            }
+        })
+        .collect();
 
     if let Err(e) = state.db.save_settings(&to_save).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response();
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
 
     match state.effective_config().await {
         Ok(cfg) => (StatusCode::OK, Json(json!(cfg.masked()))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 
@@ -96,150 +103,65 @@ struct ServiceTestResult {
     message: String,
 }
 
+impl ServiceTestResult {
+    fn from_result(res: anyhow::Result<String>) -> Self {
+        match res {
+            Ok(message) => Self { ok: true, message },
+            Err(err) => Self {
+                ok: false,
+                message: err.to_string(),
+            },
+        }
+    }
+}
+
 async fn test_connections(
     State(state): State<Arc<AppState>>,
     Json(overrides): Json<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let mut cfg = match state.effective_config().await {
         Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response()
-        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
     cfg.apply_db_overrides(&overrides);
 
     let limiter = RateLimiter::new(cfg.rate_limit_rps, 1);
     let mut results: HashMap<String, ServiceTestResult> = HashMap::new();
 
-    // 1. MYBOX
-    if !cfg.mybox_pat.is_empty() {
-        let mybox = MyboxProvider::new(
-            cfg.mybox_api_base.clone(),
-            cfg.mybox_pat.clone(),
-            limiter.clone(),
-        );
-        match mybox.test_connection().await {
-            Ok(msg) => {
-                results.insert(
-                    "mybox".to_string(),
-                    ServiceTestResult {
-                        ok: true,
-                        message: msg,
-                    },
-                );
-            }
-            Err(err) => {
-                results.insert(
-                    "mybox".to_string(),
-                    ServiceTestResult {
-                        ok: false,
-                        message: err.to_string(),
-                    },
-                );
-            }
+    let configured_sources: Vec<(SourceType, bool)> = vec![
+        (SourceType::Mybox, !cfg.mybox_pat.is_empty()),
+        (SourceType::Gdrive, !cfg.gdrive_access_token.is_empty()),
+        (
+            SourceType::Takeout,
+            std::path::Path::new(&cfg.takeout_dir).exists(),
+        ),
+    ];
+
+    for (src_type, should_test) in configured_sources {
+        if should_test {
+            let provider = build_source_provider(&cfg, src_type, limiter.clone());
+            results.insert(
+                src_type.as_str().to_string(),
+                ServiceTestResult::from_result(provider.test_connection().await),
+            );
         }
     }
 
-    // 2. Google Drive
-    if !cfg.gdrive_access_token.is_empty() {
-        let gdrive = GoogleDriveProvider::new(
-            cfg.gdrive_api_base.clone(),
-            cfg.gdrive_access_token.clone(),
-            limiter.clone(),
-        );
-        match gdrive.test_connection().await {
-            Ok(msg) => {
-                results.insert(
-                    "gdrive".to_string(),
-                    ServiceTestResult {
-                        ok: true,
-                        message: msg,
-                    },
-                );
-            }
-            Err(err) => {
-                results.insert(
-                    "gdrive".to_string(),
-                    ServiceTestResult {
-                        ok: false,
-                        message: err.to_string(),
-                    },
-                );
-            }
-        }
-    }
+    let targets = build_target_providers(&cfg, limiter);
+    let configured_targets: Vec<(TargetType, bool)> = vec![
+        (TargetType::Immich, !cfg.immich_url.is_empty()),
+        (
+            TargetType::Nextcloud,
+            cfg.enable_nextcloud && !cfg.nextcloud_url.is_empty(),
+        ),
+    ];
 
-    // 3. Google Takeout (if directory exists)
-    let takeout = GoogleTakeoutProvider::new(&cfg.takeout_dir);
-    if let Ok(msg) = takeout.test_connection().await {
-        results.insert(
-            "takeout".to_string(),
-            ServiceTestResult {
-                ok: true,
-                message: msg,
-            },
-        );
-    }
-
-    // 4. Immich
-    if !cfg.immich_url.is_empty() {
-        let immich = ImmichTarget::new(
-            cfg.immich_url.clone(),
-            cfg.immich_api_key.clone(),
-            limiter.clone(),
-        );
-        match immich.test_connection().await {
-            Ok(msg) => {
+    for (target_type, should_test) in configured_targets {
+        if should_test {
+            if let Some(target) = targets.get(&target_type) {
                 results.insert(
-                    "immich".to_string(),
-                    ServiceTestResult {
-                        ok: true,
-                        message: msg,
-                    },
-                );
-            }
-            Err(err) => {
-                results.insert(
-                    "immich".to_string(),
-                    ServiceTestResult {
-                        ok: false,
-                        message: err.to_string(),
-                    },
-                );
-            }
-        }
-    }
-
-    // 5. Nextcloud
-    if cfg.enable_nextcloud && !cfg.nextcloud_url.is_empty() {
-        let nc = NextcloudTarget::new(
-            cfg.nextcloud_url.clone(),
-            cfg.nextcloud_user.clone(),
-            cfg.nextcloud_app_password.clone(),
-            cfg.nextcloud_base_dir.clone(),
-            limiter,
-        );
-        match nc.test_connection().await {
-            Ok(msg) => {
-                results.insert(
-                    "nextcloud".to_string(),
-                    ServiceTestResult {
-                        ok: true,
-                        message: msg,
-                    },
-                );
-            }
-            Err(err) => {
-                results.insert(
-                    "nextcloud".to_string(),
-                    ServiceTestResult {
-                        ok: false,
-                        message: err.to_string(),
-                    },
+                    target_type.as_str().to_string(),
+                    ServiceTestResult::from_result(target.test_connection().await),
                 );
             }
         }
@@ -261,7 +183,7 @@ async fn get_status(
     let source = q
         .source
         .or_else(|| active_source.clone())
-        .unwrap_or_else(|| "mybox".to_string());
+        .unwrap_or_else(|| SourceType::Mybox.as_str().to_string());
 
     let job_state = *state.job_state.read().await;
     let current_file = state.current_file.read().await.clone();
@@ -271,7 +193,7 @@ async fn get_status(
     let stats = state.db.get_stats(&source).await.unwrap_or_default();
     let recent_failures = state
         .db
-        .get_recent_failures(&source, 20)
+        .get_recent_failures(&source, RECENT_FAILURES_LIMIT)
         .await
         .unwrap_or_default();
     let recent_logs: Vec<_> = state.recent_logs.read().await.iter().cloned().collect();
@@ -297,7 +219,7 @@ async fn get_status(
 #[derive(Debug, Deserialize)]
 struct StartJobRequest {
     source: String,
-    mode: String,
+    mode: JobMode,
     #[serde(default)]
     dry_run: bool,
 }
@@ -318,23 +240,14 @@ async fn start_job(
             )
                 .into_response();
         }
-        *js = match req.mode.as_str() {
-            "scan" | "auto" => JobState::Scanning,
-            "sync" => JobState::Syncing,
-            "delete" => JobState::Deleting,
-            _ => JobState::Scanning,
-        };
+        *js = req.mode.initial_state();
     }
 
     let cfg = match state.effective_config().await {
         Ok(c) => c,
         Err(e) => {
             *state.job_state.write().await = JobState::Idle;
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response();
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
         }
     };
 
@@ -342,26 +255,21 @@ async fn start_job(
         Ok(p) => p,
         Err(e) => {
             *state.job_state.write().await = JobState::Idle;
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response();
+            return error_response(StatusCode::BAD_REQUEST, e);
         }
     };
 
     let state_clone = state.clone();
     let source = req.source.clone();
-    let mode = req.mode.clone();
+    let mode = req.mode;
     let dry_run = req.dry_run;
 
     let handle = tokio::spawn(async move {
-        let res = match mode.as_str() {
-            "auto" => pipeline.run_auto().await,
-            "scan" => pipeline.run_scan().await,
-            "sync" => pipeline.run_sync().await,
-            "delete" => pipeline.run_delete(dry_run).await,
-            _ => pipeline.run_auto().await,
+        let res = match mode {
+            JobMode::Auto => pipeline.run_auto().await,
+            JobMode::Scan => pipeline.run_scan().await,
+            JobMode::Sync => pipeline.run_sync().await,
+            JobMode::Delete => pipeline.run_delete(dry_run).await,
         };
 
         if let Err(err) = res {
@@ -401,11 +309,7 @@ async fn retry_failed(
 ) -> impl IntoResponse {
     match state.db.reset_failed_files(&req.source).await {
         Ok(count) => (StatusCode::OK, Json(json!({ "reset_count": count }))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 
@@ -422,4 +326,8 @@ async fn sse_events(
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn error_response(status: StatusCode, err: impl std::fmt::Display) -> axum::response::Response {
+    (status, Json(json!({ "error": err.to_string() }))).into_response()
 }

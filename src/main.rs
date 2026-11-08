@@ -122,10 +122,7 @@ async fn main() -> Result<()> {
                 "원격 휴지통 삭제 완료 (DELETED)",
                 &stats.deleted_files.to_string(),
             ]);
-            table.add_row(vec![
-                "실패 항목 (FAILED)",
-                &stats.failed_files.to_string(),
-            ]);
+            table.add_row(vec!["실패 항목 (FAILED)", &stats.failed_files.to_string()]);
             println!("{table}");
         }
     }

@@ -1,14 +1,78 @@
 use crate::limiter::RateLimiter;
+use crate::router::SourceType;
 use crate::sources::{
-    DownloadedSourceFile, ListPage, RemoteFile, RemoteFolder, SourceProvider, TempFileGuard,
+    build_http_client, join_remote_path, stream_response_to_temp, DownloadedSourceFile, ListPage,
+    RemoteFile, RemoteFolder, SourceProvider, DEFAULT_FALLBACK_TIMESTAMP,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use futures::StreamExt;
-use serde_json::{json, Value};
-use sha1::{Digest, Sha1};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::path::Path;
-use tokio::io::AsyncWriteExt;
+
+const ENDPOINT_ABOUT: &str = "/about";
+const ABOUT_FIELDS: &str = "user,storageQuota";
+const ENDPOINT_FILES: &str = "/files";
+const FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
+
+#[derive(Debug, Default, Deserialize)]
+struct GDriveAboutResponse {
+    #[serde(default)]
+    user: Option<GDriveUserDto>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GDriveUserDto {
+    #[serde(default)]
+    email_address: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GDriveListResponse {
+    #[serde(default)]
+    next_page_token: Option<String>,
+    #[serde(default)]
+    files: Vec<GDriveFileDto>,
+}
+
+fn deserialize_flexible_i64<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let val = Option::<Value>::deserialize(deserializer)?;
+    let parsed = match val {
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+        Some(Value::String(s)) => s.parse::<i64>().unwrap_or(0),
+        _ => 0,
+    };
+    Ok(parsed)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GDriveFileDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    mime_type: String,
+    #[serde(default, deserialize_with = "deserialize_flexible_i64")]
+    size: i64,
+    #[serde(default)]
+    created_time: Option<String>,
+    #[serde(default)]
+    modified_time: Option<String>,
+    #[serde(default)]
+    sha1_checksum: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GDriveTrashPatch {
+    trashed: bool,
+}
 
 pub struct GoogleDriveProvider {
     api_base: String,
@@ -19,23 +83,23 @@ pub struct GoogleDriveProvider {
 
 impl GoogleDriveProvider {
     pub fn new(api_base: String, access_token: String, limiter: RateLimiter) -> Self {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             api_base: api_base.trim_end_matches('/').to_string(),
             access_token,
-            client,
+            client: build_http_client(),
             limiter,
         }
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{}", self.api_base, path)
     }
 }
 
 #[async_trait]
 impl SourceProvider for GoogleDriveProvider {
-    fn source_type(&self) -> &'static str {
-        "gdrive"
+    fn source_type(&self) -> SourceType {
+        SourceType::Gdrive
     }
 
     async fn test_connection(&self) -> Result<String> {
@@ -43,24 +107,27 @@ impl SourceProvider for GoogleDriveProvider {
             return Err(anyhow!("Google Drive 액세스 토큰이 설정되지 않았습니다."));
         }
 
-        let url = format!("{}/about?fields=user,storageQuota", self.api_base);
+        let url = self.endpoint(ENDPOINT_ABOUT);
+        let query = [("fields", ABOUT_FIELDS)];
         let resp = self
             .limiter
-            .send_with_retry(|| self.client.get(&url).bearer_auth(&self.access_token))
+            .send_with_retry(|| {
+                self.client
+                    .get(&url)
+                    .bearer_auth(&self.access_token)
+                    .query(&query)
+            })
             .await?;
 
         if !resp.status().is_success() {
-            return Err(anyhow!(
-                "Google Drive 인증 실패 (HTTP {})",
-                resp.status()
-            ));
+            return Err(anyhow!("Google Drive 인증 실패 (HTTP {})", resp.status()));
         }
 
-        let body: Value = resp.json().await.unwrap_or_else(|_| json!({}));
-        let email = body
-            .pointer("/user/emailAddress")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Authenticated User");
+        let about: GDriveAboutResponse = resp.json().await.unwrap_or_default();
+        let email = about
+            .user
+            .and_then(|u| u.email_address)
+            .unwrap_or_else(|| "Authenticated User".to_string());
         Ok(format!("Google Drive 연결 성공 ({})", email))
     }
 
@@ -70,16 +137,20 @@ impl SourceProvider for GoogleDriveProvider {
         folder_path: &str,
         cursor: Option<&str>,
     ) -> Result<ListPage> {
-        let mut url = format!("{}/files?folder_id={}", self.api_base, folder_id);
-        if let Some(c) = cursor {
-            if !c.is_empty() {
-                url.push_str(&format!("&pageToken={}", c));
-            }
+        let url = self.endpoint(ENDPOINT_FILES);
+        let mut query_params = vec![("folder_id", folder_id)];
+        if let Some(c) = cursor.filter(|c| !c.is_empty()) {
+            query_params.push(("pageToken", c));
         }
 
         let resp = self
             .limiter
-            .send_with_retry(|| self.client.get(&url).bearer_auth(&self.access_token))
+            .send_with_retry(|| {
+                self.client
+                    .get(&url)
+                    .bearer_auth(&self.access_token)
+                    .query(&query_params)
+            })
             .await?;
 
         if !resp.status().is_success() {
@@ -90,76 +161,34 @@ impl SourceProvider for GoogleDriveProvider {
             ));
         }
 
-        let body: Value = resp.json().await?;
-        let mut page = ListPage::default();
+        let dto: GDriveListResponse = resp.json().await?;
+        let mut page = ListPage {
+            next_cursor: dto.next_page_token.filter(|s| !s.is_empty()),
+            ..Default::default()
+        };
 
-        if let Some(next) = body.get("nextPageToken").and_then(|v| v.as_str()) {
-            if !next.is_empty() {
-                page.next_cursor = Some(next.to_string());
-            }
-        }
-
-        if let Some(files) = body.get("files").and_then(|v| v.as_array()) {
-            for item in files {
-                let id = item
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let mime = item
-                    .get("mimeType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-
-                if mime == "application/vnd.google-apps.folder" {
-                    let child_path = if folder_path == "/" {
-                        format!("/{}", name)
-                    } else {
-                        format!("{}/{}", folder_path.trim_end_matches('/'), name)
-                    };
-                    page.folders.push(RemoteFolder {
-                        folder_id: id,
-                        name,
-                        path: child_path,
-                    });
-                } else {
-                    let size = item
-                        .get("size")
-                        .and_then(|v| {
-                            v.as_i64()
-                                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
-                        })
-                        .unwrap_or(0);
-                    let created_time = item
-                        .get("createdTime")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("2026-01-01T00:00:00Z")
-                        .to_string();
-                    let modified_time = item
-                        .get("modifiedTime")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&created_time)
-                        .to_string();
-                    let sha1_hash = item
-                        .get("sha1Checksum")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    page.files.push(RemoteFile {
-                        resource_id: id,
-                        name,
-                        parent_path: folder_path.to_string(),
-                        size,
-                        created_time,
-                        modified_time,
-                        sha1_hash,
-                    });
-                }
+        for item in dto.files {
+            if item.mime_type == FOLDER_MIME_TYPE {
+                let child_path = join_remote_path(folder_path, &item.name);
+                page.folders.push(RemoteFolder {
+                    folder_id: item.id,
+                    name: item.name,
+                    path: child_path,
+                });
+            } else {
+                let created = item
+                    .created_time
+                    .unwrap_or_else(|| DEFAULT_FALLBACK_TIMESTAMP.to_string());
+                let modified = item.modified_time.unwrap_or_else(|| created.clone());
+                page.files.push(RemoteFile {
+                    resource_id: item.id,
+                    name: item.name,
+                    parent_path: folder_path.to_string(),
+                    size: item.size,
+                    created_time: created,
+                    modified_time: modified,
+                    sha1_hash: item.sha1_checksum,
+                });
             }
         }
 
@@ -172,15 +201,16 @@ impl SourceProvider for GoogleDriveProvider {
         filename: &str,
         tmp_dir: &Path,
     ) -> Result<DownloadedSourceFile> {
-        tokio::fs::create_dir_all(tmp_dir).await?;
-        let safe_name = filename.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-        let temp_path = tmp_dir.join(format!("gdrive_{}_{}", resource_id, safe_name));
-        let temp_guard = TempFileGuard::new(temp_path);
-
-        let url = format!("{}/files/{}?alt=media", self.api_base, resource_id);
+        let url = format!("{}/{}", self.endpoint(ENDPOINT_FILES), resource_id);
+        let query = [("alt", "media")];
         let resp = self
             .limiter
-            .send_with_retry(|| self.client.get(&url).bearer_auth(&self.access_token))
+            .send_with_retry(|| {
+                self.client
+                    .get(&url)
+                    .bearer_auth(&self.access_token)
+                    .query(&query)
+            })
             .await?;
 
         if !resp.status().is_success() {
@@ -191,33 +221,19 @@ impl SourceProvider for GoogleDriveProvider {
             ));
         }
 
-        let mut file = tokio::fs::File::create(temp_guard.path()).await?;
-        let mut hasher = Sha1::new();
-        let mut total_bytes: u64 = 0;
-        let mut stream = resp.bytes_stream();
-
-        while let Some(chunk_res) = stream.next().await {
-            let chunk = chunk_res?;
-            hasher.update(&chunk);
-            file.write_all(&chunk).await?;
-            total_bytes += chunk.len() as u64;
-        }
-        file.flush().await?;
-        drop(file);
-
-        let sha1_hash = hex::encode(hasher.finalize());
-        Ok(DownloadedSourceFile {
-            temp_guard,
-            sha1_hash,
-            size: total_bytes,
-            created_time_override: None,
-            modified_time_override: None,
-        })
+        stream_response_to_temp(
+            resp,
+            self.source_type().as_str(),
+            resource_id,
+            filename,
+            tmp_dir,
+        )
+        .await
     }
 
     async fn delete_resource(&self, resource_id: &str) -> Result<()> {
-        let url = format!("{}/files/{}", self.api_base, resource_id);
-        let payload = json!({ "trashed": true });
+        let url = format!("{}/{}", self.endpoint(ENDPOINT_FILES), resource_id);
+        let payload = GDriveTrashPatch { trashed: true };
         let resp = self
             .limiter
             .send_with_retry(|| {

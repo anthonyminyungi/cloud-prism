@@ -1,15 +1,29 @@
+use crate::router::SourceType;
 use crate::sources::{
-    DownloadedSourceFile, ListPage, RemoteFile, SourceProvider, TempFileGuard,
+    sanitize_filename, DownloadedSourceFile, ListPage, RemoteFile, SourceProvider, TempFileGuard,
+    DEFAULT_FALLBACK_TIMESTAMP,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use serde_json::Value;
+use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TakeoutSidecarMetadata {
+    photo_taken_time: Option<TakeoutTimestamp>,
+    creation_time: Option<TakeoutTimestamp>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TakeoutTimestamp {
+    timestamp: Option<String>,
+}
 
 pub struct GoogleTakeoutProvider {
     takeout_dir: PathBuf,
@@ -23,11 +37,11 @@ impl GoogleTakeoutProvider {
     }
 
     fn parse_sidecar_timestamp(json_bytes: &[u8]) -> Option<String> {
-        let val: Value = serde_json::from_slice(json_bytes).ok()?;
-        let ts_str = val
-            .pointer("/photoTakenTime/timestamp")
-            .or_else(|| val.pointer("/creationTime/timestamp"))
-            .and_then(|v| v.as_str())?;
+        let meta: TakeoutSidecarMetadata = serde_json::from_slice(json_bytes).ok()?;
+        let ts_str = meta
+            .photo_taken_time
+            .and_then(|t| t.timestamp)
+            .or_else(|| meta.creation_time.and_then(|t| t.timestamp))?;
         let secs = ts_str.parse::<i64>().ok()?;
         Utc.timestamp_opt(secs, 0)
             .single()
@@ -37,8 +51,8 @@ impl GoogleTakeoutProvider {
 
 #[async_trait]
 impl SourceProvider for GoogleTakeoutProvider {
-    fn source_type(&self) -> &'static str {
-        "takeout"
+    fn source_type(&self) -> SourceType {
+        SourceType::Takeout
     }
 
     async fn test_connection(&self) -> Result<String> {
@@ -49,19 +63,16 @@ impl SourceProvider for GoogleTakeoutProvider {
             ));
         }
 
-        let mut zip_count = 0usize;
-        for entry in std::fs::read_dir(&self.takeout_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("zip"))
-                .unwrap_or(false)
-            {
-                zip_count += 1;
-            }
-        }
+        let zip_count = std::fs::read_dir(&self.takeout_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("zip"))
+                    .unwrap_or(false)
+            })
+            .count();
 
         Ok(format!(
             "Google Takeout 경로 확인 성공 (ZIP 아카이브 {}개 발견)",
@@ -123,14 +134,13 @@ impl SourceProvider for GoogleTakeoutProvider {
                     .map(|p| format!("/{}", p.trim_matches('/')))
                     .unwrap_or_else(|| "/".to_string());
 
-                let resource_id = format!("{}::{}", zip_name, entry_name);
                 page.files.push(RemoteFile {
-                    resource_id,
+                    resource_id: format!("{}::{}", zip_name, entry_name),
                     name: filename,
                     parent_path: parent,
                     size: zf.size() as i64,
-                    created_time: "2026-01-01T00:00:00Z".to_string(),
-                    modified_time: "2026-01-01T00:00:00Z".to_string(),
+                    created_time: DEFAULT_FALLBACK_TIMESTAMP.to_string(),
+                    modified_time: DEFAULT_FALLBACK_TIMESTAMP.to_string(),
                     sha1_hash: None,
                 });
             }
@@ -151,8 +161,7 @@ impl SourceProvider for GoogleTakeoutProvider {
 
         let zip_path = self.takeout_dir.join(zip_name);
         tokio::fs::create_dir_all(tmp_dir).await?;
-        let safe_name = filename.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-        let temp_path = tmp_dir.join(format!("takeout_{}", safe_name));
+        let temp_path = tmp_dir.join(format!("takeout_{}", sanitize_filename(filename)));
         let temp_guard = TempFileGuard::new(temp_path);
 
         let file = File::open(&zip_path)?;
@@ -176,28 +185,20 @@ impl SourceProvider for GoogleTakeoutProvider {
             out.flush()?;
         }
 
-        // Check optional Google Takeout sidecar JSON (`<entry>.json` or `<entry>.supplemental-metadata.json`)
-        let mut created_override = None;
         let sidecar_candidates = [
             format!("{}.json", entry_name),
             format!("{}.supplemental-metadata.json", entry_name),
         ];
-        for cand in sidecar_candidates {
-            if let Ok(mut sidecar) = archive.by_name(&cand) {
-                let mut json_buf = Vec::new();
-                if sidecar.read_to_end(&mut json_buf).is_ok() {
-                    if let Some(ts) = Self::parse_sidecar_timestamp(&json_buf) {
-                        created_override = Some(ts);
-                        break;
-                    }
-                }
-            }
-        }
+        let created_override = sidecar_candidates.iter().find_map(|cand| {
+            let mut sidecar = archive.by_name(cand).ok()?;
+            let mut json_buf = Vec::new();
+            sidecar.read_to_end(&mut json_buf).ok()?;
+            Self::parse_sidecar_timestamp(&json_buf)
+        });
 
-        let sha1_hash = hex::encode(hasher.finalize());
         Ok(DownloadedSourceFile {
             temp_guard,
-            sha1_hash,
+            sha1_hash: hex::encode(hasher.finalize()),
             size: total_bytes,
             created_time_override: created_override.clone(),
             modified_time_override: created_override,
@@ -205,7 +206,6 @@ impl SourceProvider for GoogleTakeoutProvider {
     }
 
     async fn delete_resource(&self, _resource_id: &str) -> Result<()> {
-        // Local Takeout ZIP archives are not deleted remotely
         Ok(())
     }
 }
@@ -260,4 +260,3 @@ mod tests {
         assert!(!temp_file_path.exists());
     }
 }
-

@@ -51,11 +51,13 @@ async fn test_web_dashboard_settings_connection_and_job_lifecycle() {
         .mount(&mock_server)
         .await;
 
-    let mut cfg = AppConfig::default();
-    cfg.db_path = db_path.to_str().unwrap().to_string();
-    cfg.tmp_dir = temp_dir.path().join("tmp").to_str().unwrap().to_string();
-    cfg.mybox_api_base = mock_server.uri();
-    cfg.rate_limit_rps = 100.0;
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: temp_dir.path().join("tmp").to_str().unwrap().to_string(),
+        mybox_api_base: mock_server.uri(),
+        rate_limit_rps: 100.0,
+        ..AppConfig::default()
+    };
 
     let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
     let state = AppState::new(db, cfg);
@@ -188,9 +190,8 @@ async fn test_web_dashboard_settings_connection_and_job_lifecycle() {
         .await
         .unwrap();
     assert_eq!(status_resp.status(), StatusCode::OK);
-    let status_json: Value = serde_json::from_slice(
-        &to_bytes(status_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let status_json: Value =
+        serde_json::from_slice(&to_bytes(status_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
     assert_eq!(status_json["stats"]["pending_files"], 1);
 }
