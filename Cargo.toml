@@ -1,0 +1,37 @@
+[package]
+name = "mybox-immich-sync"
+version = "0.1.0"
+edition = "2021"
+description = "TrueNAS SCALE Web App for Multi-Cloud (MYBOX, Google) to NAS (Immich & Nextcloud) migration and deferred delete"
+
+[[bin]]
+name = "mybox-sync"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.7"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+comfy-table = "7.1"
+dotenvy = "0.15"
+futures = "0.3"
+hex = "0.4"
+indicatif = "0.17"
+percent-encoding = "2.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1.40", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+zip = "2.2"
+
+[dev-dependencies]
+tempfile = "3.12"
+tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
