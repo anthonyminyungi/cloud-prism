@@ -227,6 +227,8 @@ impl CheckpointDB {
                 ])
                 .update_columns([
                     folder_entity::Column::Path,
+                    folder_entity::Column::LastCursor,
+                    folder_entity::Column::ScanStatus,
                     folder_entity::Column::UpdatedAt,
                 ])
                 .to_owned(),
@@ -286,6 +288,21 @@ impl CheckpointDB {
         Ok(rows)
     }
 
+    /// Prepares a scan cycle for `source_type`.
+    /// Returns `(is_resuming, scan_started_at)`:
+    /// - If `PENDING` folders exist from a previously paused scan, resumes from them (`is_resuming = true`).
+    /// - Otherwise, starts a fresh incremental scan from `"root"` (`is_resuming = false`).
+    pub async fn prepare_scan(&self, source_type: &str) -> Result<(bool, String)> {
+        let pending = self.get_pending_folders(source_type).await?;
+        let scan_started_at = Utc::now().to_rfc3339();
+        if !pending.is_empty() {
+            return Ok((true, scan_started_at));
+        }
+
+        self.upsert_folder(source_type, "root", "/").await?;
+        Ok((false, scan_started_at))
+    }
+
     pub async fn upsert_files(&self, files: &[FileUpsert]) -> Result<usize> {
         if files.is_empty() {
             return Ok(0);
@@ -295,48 +312,114 @@ impl CheckpointDB {
         let txn = self.conn.begin().await?;
 
         for f in files {
-            let active = file_entity::ActiveModel {
-                source_type: Set(f.source_type.clone()),
-                resource_id: Set(f.resource_id.clone()),
-                name: Set(f.name.clone()),
-                parent_path: Set(f.parent_path.clone()),
-                size: Set(f.size),
-                created_time: Set(f.created_time.clone()),
-                modified_time: Set(f.modified_time.clone()),
-                target_type: Set(f.target_type.clone()),
-                sha1_hash: Set(f.sha1_hash.clone()),
-                remote_target_id: Set(None),
-                sync_result: Set(None),
-                status: Set(FileStatus::Pending.as_str().to_string()),
-                retry_count: Set(0),
-                error_msg: Set(None),
-                updated_at: Set(now.clone()),
-            };
+            let existing =
+                file_entity::Entity::find_by_id((f.source_type.clone(), f.resource_id.clone()))
+                    .one(&txn)
+                    .await?;
 
-            let mut conflict = OnConflict::columns([
-                file_entity::Column::SourceType,
-                file_entity::Column::ResourceId,
-            ]);
-            conflict.update_columns([
-                file_entity::Column::Name,
-                file_entity::Column::ParentPath,
-                file_entity::Column::Size,
-                file_entity::Column::ModifiedTime,
-                file_entity::Column::TargetType,
-                file_entity::Column::UpdatedAt,
-            ]);
-            if f.sha1_hash.is_some() {
-                conflict.update_column(file_entity::Column::Sha1Hash);
+            match existing {
+                None => {
+                    let active = file_entity::ActiveModel {
+                        source_type: Set(f.source_type.clone()),
+                        resource_id: Set(f.resource_id.clone()),
+                        name: Set(f.name.clone()),
+                        parent_path: Set(f.parent_path.clone()),
+                        size: Set(f.size),
+                        created_time: Set(f.created_time.clone()),
+                        modified_time: Set(f.modified_time.clone()),
+                        target_type: Set(f.target_type.clone()),
+                        sha1_hash: Set(f.sha1_hash.clone()),
+                        remote_target_id: Set(None),
+                        sync_result: Set(None),
+                        status: Set(FileStatus::Pending.as_str().to_string()),
+                        retry_count: Set(0),
+                        error_msg: Set(None),
+                        updated_at: Set(now.clone()),
+                    };
+                    file_entity::Entity::insert(active).exec(&txn).await?;
+                }
+                Some(old) => {
+                    let hash_changed = match (&f.sha1_hash, &old.sha1_hash) {
+                        (Some(new_h), Some(old_h)) => new_h != old_h,
+                        _ => false,
+                    };
+                    let content_changed =
+                        old.size != f.size || old.modified_time != f.modified_time || hash_changed;
+
+                    let mut active: file_entity::ActiveModel = old.into();
+                    active.name = Set(f.name.clone());
+                    active.parent_path = Set(f.parent_path.clone());
+                    active.size = Set(f.size);
+                    active.modified_time = Set(f.modified_time.clone());
+                    active.target_type = Set(f.target_type.clone());
+                    active.updated_at = Set(now.clone());
+
+                    if content_changed {
+                        active.sha1_hash = Set(f.sha1_hash.clone());
+                        active.remote_target_id = Set(None);
+                        active.sync_result = Set(None);
+                        active.status = Set(FileStatus::Pending.as_str().to_string());
+                        active.retry_count = Set(0);
+                        active.error_msg = Set(None);
+                    } else if f.sha1_hash.is_some() {
+                        active.sha1_hash = Set(f.sha1_hash.clone());
+                    }
+
+                    file_entity::Entity::update(active).exec(&txn).await?;
+                }
             }
-
-            file_entity::Entity::insert(active)
-                .on_conflict(conflict)
-                .exec(&txn)
-                .await?;
         }
 
         txn.commit().await?;
         Ok(files.len())
+    }
+
+    /// Reconciles items that were deleted directly by the user on the remote cloud
+    /// (i.e. their `updated_at` is older than `scan_started_at` after a full scan completes).
+    /// - NAS (Immich/Nextcloud) files are NEVER deleted.
+    /// - Unbacked (`PENDING` / `FAILED`) files missing on remote are removed from the sync queue.
+    /// - Already backed-up (`UPLOADED`) files missing on remote are marked `DELETED` so they are
+    ///   excluded from future sync and remote-trash deletion while keeping NAS backup stats intact.
+    pub async fn reconcile_missing_remote_items(
+        &self,
+        source_type: &str,
+        scan_started_at: &str,
+    ) -> Result<(u64, u64)> {
+        let now = Utc::now().to_rfc3339();
+        let txn = self.conn.begin().await?;
+
+        let removed_unbacked = file_entity::Entity::delete_many()
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .filter(file_entity::Column::UpdatedAt.lt(scan_started_at))
+            .filter(
+                file_entity::Column::Status
+                    .is_in([FileStatus::Pending.as_str(), FileStatus::Failed.as_str()]),
+            )
+            .exec(&txn)
+            .await?
+            .rows_affected;
+
+        let excluded_uploaded = file_entity::Entity::update_many()
+            .col_expr(
+                file_entity::Column::Status,
+                Expr::value(FileStatus::Deleted.as_str()),
+            )
+            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now))
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .filter(file_entity::Column::UpdatedAt.lt(scan_started_at))
+            .filter(file_entity::Column::Status.eq(FileStatus::Uploaded.as_str()))
+            .exec(&txn)
+            .await?
+            .rows_affected;
+
+        folder_entity::Entity::delete_many()
+            .filter(folder_entity::Column::SourceType.eq(source_type))
+            .filter(folder_entity::Column::UpdatedAt.lt(scan_started_at))
+            .exec(&txn)
+            .await?;
+
+        txn.commit().await?;
+        Ok((removed_unbacked, excluded_uploaded))
     }
 
     pub async fn get_pending_files(

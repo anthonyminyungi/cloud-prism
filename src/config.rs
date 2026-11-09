@@ -1,7 +1,9 @@
+use crate::router::SourceType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
+use std::path::Path;
 
 pub const DEFAULT_PORT: u16 = 3080;
 pub const DEFAULT_DB_PATH: &str = "/data/sync_state.db";
@@ -13,6 +15,7 @@ pub const DEFAULT_NEXTCLOUD_BASE_DIR: &str = "/Cloud-Backup";
 pub const DEFAULT_CONCURRENCY: usize = 3;
 pub const DEFAULT_RATE_LIMIT_RPS: f64 = 5.0;
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
+pub const DEFAULT_SYNC_INTERVAL_MINUTES: u64 = 0;
 
 const URL_KEYS: &[&str] = &[
     "mybox_api_base",
@@ -41,6 +44,8 @@ pub struct AppConfig {
     pub concurrency: usize,
     pub rate_limit_rps: f64,
     pub max_retries: u32,
+    #[serde(default)]
+    pub sync_interval_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,6 +59,7 @@ pub struct RuntimeConfigSummary {
     pub nextcloud_base_dir: String,
     pub concurrency: usize,
     pub rate_limit_rps: f64,
+    pub sync_interval_minutes: u64,
 }
 
 impl Default for AppConfig {
@@ -77,6 +83,7 @@ impl Default for AppConfig {
             concurrency: DEFAULT_CONCURRENCY,
             rate_limit_rps: DEFAULT_RATE_LIMIT_RPS,
             max_retries: DEFAULT_MAX_RETRIES,
+            sync_interval_minutes: DEFAULT_SYNC_INTERVAL_MINUTES,
         }
     }
 }
@@ -160,6 +167,36 @@ impl AppConfig {
             nextcloud_base_dir: self.nextcloud_base_dir.clone(),
             concurrency: self.concurrency,
             rate_limit_rps: self.rate_limit_rps,
+            sync_interval_minutes: self.sync_interval_minutes,
         }
+    }
+
+    pub fn configured_sources(&self) -> Vec<SourceType> {
+        let mut sources = Vec::new();
+        if !self.mybox_pat.trim().is_empty() {
+            sources.push(SourceType::Mybox);
+        }
+        if !self.gdrive_access_token.trim().is_empty() {
+            sources.push(SourceType::Gdrive);
+        }
+        let takeout_path = Path::new(&self.takeout_dir);
+        if takeout_path.exists() {
+            let has_zip = std::fs::read_dir(takeout_path)
+                .ok()
+                .map(|entries| {
+                    entries.filter_map(|e| e.ok()).any(|e| {
+                        e.path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|ext| ext.eq_ignore_ascii_case("zip"))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if has_zip {
+                sources.push(SourceType::Takeout);
+            }
+        }
+        sources
     }
 }

@@ -371,7 +371,8 @@
           `Takeout: ${c.takeout_dir}`,
           `Immich: ${c.immich_configured ? '✅ 설정됨' : '⚪ 미설정'}`,
           `Nextcloud: ${c.enable_nextcloud ? (c.nextcloud_configured ? `✅ 설정됨 (${c.nextcloud_base_dir})` : '⚠️ 인증정보 누락') : '⚪ 비활성화'}`,
-          `워커: ${c.concurrency}개 / ${c.rate_limit_rps} RPS`
+          `워커: ${c.concurrency}개 / ${c.rate_limit_rps} RPS`,
+          `자동 동기화: ${c.sync_interval_minutes > 0 ? `⏱️ ${c.sync_interval_minutes}분 주기` : '⚪ 수동 전용'}`
         ];
         document.getElementById('envPills').innerHTML = pills.map(p => `<span class="env-pill">${p}</span>`).join('');
       }

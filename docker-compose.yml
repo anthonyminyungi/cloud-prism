@@ -25,6 +25,7 @@ services:
       - CONCURRENCY=${CONCURRENCY:-3}
       - RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-5.0}
       - MAX_RETRIES=${MAX_RETRIES:-3}
+      - SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-0}
     volumes:
       # TrueNAS SCALE 예시: /mnt/<Pool이름>/apps/mybox-sync/data:/data
       - ./data:/data

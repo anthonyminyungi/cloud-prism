@@ -124,3 +124,149 @@ async fn test_sqlite_wal_checkpoint_and_file_lifecycle() {
     assert_eq!(stats_after_del.deleted_files, 1);
     assert_eq!(stats_after_del.uploaded_nextcloud, 1);
 }
+
+#[tokio::test]
+async fn test_incremental_scan_modification_and_remote_direct_delete_reconciliation() {
+    let db = CheckpointDB::connect(":memory:").await.unwrap();
+
+    // Cycle 1: Initial scan
+    let (is_resuming, _) = db.prepare_scan("mybox").await.unwrap();
+    assert!(!is_resuming);
+    db.mark_folder_scanned("mybox", "root").await.unwrap();
+
+    let initial_files = vec![
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "f_unchanged".to_string(),
+            name: "keep.jpg".to_string(),
+            parent_path: "/".to_string(),
+            size: 1000,
+            created_time: "2026-01-01T00:00:00Z".to_string(),
+            modified_time: "2026-01-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "f_modified".to_string(),
+            name: "edit.jpg".to_string(),
+            parent_path: "/".to_string(),
+            size: 2000,
+            created_time: "2026-01-01T00:00:00Z".to_string(),
+            modified_time: "2026-01-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "f_remote_del_uploaded".to_string(),
+            name: "backed_up_then_deleted_on_cloud.pdf".to_string(),
+            parent_path: "/".to_string(),
+            size: 3000,
+            created_time: "2026-01-01T00:00:00Z".to_string(),
+            modified_time: "2026-01-01T00:00:00Z".to_string(),
+            target_type: "nextcloud".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "f_remote_del_pending".to_string(),
+            name: "deleted_before_sync.jpg".to_string(),
+            parent_path: "/".to_string(),
+            size: 4000,
+            created_time: "2026-01-01T00:00:00Z".to_string(),
+            modified_time: "2026-01-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+    ];
+    db.upsert_files(&initial_files).await.unwrap();
+
+    // First 3 files are uploaded to NAS; 4th remains PENDING
+    db.mark_file_uploaded("mybox", "f_unchanged", "h1", "id1", "created")
+        .await
+        .unwrap();
+    db.mark_file_uploaded("mybox", "f_modified", "h2", "id2", "created")
+        .await
+        .unwrap();
+    db.mark_file_uploaded("mybox", "f_remote_del_uploaded", "h3", "id3", "created")
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+    // Cycle 2: All folders were SCANNED, so prepare_scan starts a fresh incremental cycle
+    let (is_resuming_2, scan_started_at) = db.prepare_scan("mybox").await.unwrap();
+    assert!(!is_resuming_2);
+    assert_eq!(db.get_pending_folders("mybox").await.unwrap().len(), 1);
+
+    // On remote cloud:
+    // - f_unchanged is untouched
+    // - f_modified has new size & modified_time
+    // - f_remote_del_uploaded & f_remote_del_pending were deleted directly by user on remote cloud
+    // - f_new was newly added
+    let cycle2_files = vec![
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "f_unchanged".to_string(),
+            name: "keep.jpg".to_string(),
+            parent_path: "/".to_string(),
+            size: 1000,
+            created_time: "2026-01-01T00:00:00Z".to_string(),
+            modified_time: "2026-01-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "f_modified".to_string(),
+            name: "edit.jpg".to_string(),
+            parent_path: "/".to_string(),
+            size: 2500,
+            created_time: "2026-01-01T00:00:00Z".to_string(),
+            modified_time: "2026-02-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "f_new".to_string(),
+            name: "brand_new.jpg".to_string(),
+            parent_path: "/".to_string(),
+            size: 5000,
+            created_time: "2026-02-01T00:00:00Z".to_string(),
+            modified_time: "2026-02-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+    ];
+    db.upsert_files(&cycle2_files).await.unwrap();
+    db.mark_folder_scanned("mybox", "root").await.unwrap();
+
+    let (removed_unbacked, excluded_uploaded) = db
+        .reconcile_missing_remote_items("mybox", &scan_started_at)
+        .await
+        .unwrap();
+    assert_eq!(removed_unbacked, 1); // f_remote_del_pending removed
+    assert_eq!(excluded_uploaded, 1); // f_remote_del_uploaded marked DELETED (excluded from sync/delete)
+
+    // Only f_modified and f_new should be in the pending sync queue!
+    let pending_queue = db.get_pending_files("mybox", 3, 100).await.unwrap();
+    let pending_ids: Vec<&str> = pending_queue
+        .iter()
+        .map(|f| f.resource_id.as_str())
+        .collect();
+    assert_eq!(pending_ids, vec!["f_new", "f_modified"]);
+
+    // Only f_unchanged should be in the remote-trash delete queue (f_remote_del_uploaded is already deleted remotely)
+    let delete_queue = db
+        .get_uploaded_files_for_delete("mybox", 100)
+        .await
+        .unwrap();
+    assert_eq!(delete_queue.len(), 1);
+    assert_eq!(delete_queue[0].resource_id, "f_unchanged");
+
+    // NAS backup stats for f_remote_del_uploaded are still preserved!
+    let stats = db.get_stats("mybox").await.unwrap();
+    assert_eq!(stats.uploaded_nextcloud, 1);
+}

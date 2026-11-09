@@ -110,16 +110,23 @@ impl SyncPipeline {
     pub async fn run_scan(&self) -> Result<SyncStats> {
         let src = self.source_key();
         self.state.begin_phase(src, JobState::Scanning, 0).await;
+        let (is_resuming, scan_started_at) = self.state.db.prepare_scan(src).await?;
+
         self.state
             .emit_event(
                 src,
                 JobState::Scanning,
                 None,
-                format!("[{}] 원격 폴더 트리 및 파일 목록 스캔을 시작합니다.", src),
+                if is_resuming {
+                    format!(
+                        "[{}] 이전 중단 지점부터 원격 폴더 스캔을 이어받습니다.",
+                        src
+                    )
+                } else {
+                    format!("[{}] 원격 폴더 트리 및 증분 변경분 스캔을 시작합니다.", src)
+                },
             )
             .await;
-
-        self.state.db.upsert_folder(src, "root", "/").await?;
 
         while !self.state.is_stopping() {
             let pending_folders = self.state.db.get_pending_folders(src).await?;
@@ -133,6 +140,27 @@ impl SyncPipeline {
                 }
                 self.scan_single_folder(&folder.folder_id, &folder.path, folder.last_cursor)
                     .await?;
+            }
+        }
+
+        if !is_resuming && !self.state.is_stopping() {
+            let (removed_unbacked, excluded_uploaded) = self
+                .state
+                .db
+                .reconcile_missing_remote_items(src, &scan_started_at)
+                .await?;
+            if removed_unbacked > 0 || excluded_uploaded > 0 {
+                self.state
+                    .emit_event(
+                        src,
+                        JobState::Scanning,
+                        None,
+                        format!(
+                            "[{}] 원격에서 직접 삭제된 파일 정리 완료 (NAS 백업 보존 / 동기화 큐 제외: 미백업 {}건, 백업완료 {}건)",
+                            src, removed_unbacked, excluded_uploaded
+                        ),
+                    )
+                    .await;
             }
         }
 
@@ -519,4 +547,66 @@ impl SyncPipeline {
             .await;
         Ok(stats)
     }
+}
+
+pub fn spawn_auto_sync_scheduler(state: Arc<AppState>) {
+    let interval_mins = state.config.sync_interval_minutes;
+    if interval_mins == 0 {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_mins * 60));
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+
+            let sources = state.config.configured_sources();
+            if sources.is_empty() {
+                continue;
+            }
+
+            for src_type in sources {
+                let src_key = src_type.as_str();
+                {
+                    let mut js = state.job_state.write().await;
+                    if *js != JobState::Idle {
+                        break;
+                    }
+                    *js = JobState::Scanning;
+                }
+
+                state
+                    .emit_event(
+                        src_key,
+                        JobState::Scanning,
+                        None,
+                        format!(
+                            "[자동 스케줄러] {}분 주기 증분 스캔 & 동기화를 시작합니다. (원격 삭제 제외)",
+                            interval_mins
+                        ),
+                    )
+                    .await;
+
+                match SyncPipeline::from_config(state.clone(), state.config.clone(), src_key) {
+                    Ok(pipeline) => {
+                        if let Err(err) = pipeline.run_auto().await {
+                            state
+                                .finish_job(
+                                    src_key,
+                                    format!("[자동 스케줄러] 작업 중 오류 발생: {}", err),
+                                )
+                                .await;
+                        }
+                    }
+                    Err(err) => {
+                        state
+                            .finish_job(src_key, format!("[자동 스케줄러] 초기화 실패: {}", err))
+                            .await;
+                    }
+                }
+            }
+        }
+    });
 }

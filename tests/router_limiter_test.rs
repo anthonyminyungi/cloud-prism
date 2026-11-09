@@ -48,6 +48,7 @@ fn test_config_env_map_parsing_and_url_normalization() {
     // Empty value in env map should NOT overwrite default values
     env_map.insert("takeout_dir".to_string(), "".to_string());
     env_map.insert("concurrency".to_string(), "8".to_string());
+    env_map.insert("sync_interval_minutes".to_string(), "180".to_string());
 
     cfg.apply_env_map(&env_map);
 
@@ -55,7 +56,10 @@ fn test_config_env_map_parsing_and_url_normalization() {
     assert_eq!(cfg.immich_url, "http://env-immich:2283");
     assert_eq!(cfg.takeout_dir, "/data/takeout");
     assert_eq!(cfg.concurrency, 8);
+    assert_eq!(cfg.sync_interval_minutes, 180);
     assert!(cfg.summary().mybox_configured);
+    assert_eq!(cfg.summary().sync_interval_minutes, 180);
+    assert_eq!(cfg.configured_sources().len(), 1);
 }
 
 #[tokio::test]
