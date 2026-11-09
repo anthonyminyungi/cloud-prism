@@ -1,3 +1,4 @@
+use crate::config::SettingsUpdateRequest;
 use crate::limiter::RateLimiter;
 use crate::pipeline::{build_source_provider, build_target_providers, SyncPipeline};
 use crate::router::{SourceType, TargetType};
@@ -49,6 +50,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(serve_ui))
         .route("/api/connections/test", post(test_connections))
+        .route("/api/settings", post(update_settings))
         .route("/api/status", get(get_status))
         .route("/api/jobs/start", post(start_job))
         .route("/api/jobs/stop", post(stop_job))
@@ -235,6 +237,37 @@ async fn set_takeout_path(
         .into_response()
 }
 
+async fn update_settings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SettingsUpdateRequest>,
+) -> impl IntoResponse {
+    match state.update_settings(&req).await {
+        Ok(cfg) => {
+            let current_state = *state.job_state.read().await;
+            state
+                .emit_event(
+                    "system",
+                    current_state,
+                    None,
+                    "환경 설정이 저장되어 즉시 반영되었습니다 (/data/settings.json).",
+                )
+                .await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "saved": true,
+                    "config_summary": cfg.summary()
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("설정 저장 실패: {}", err),
+        ),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct UploadTakeoutQuery {
     filename: Option<String>,
@@ -337,6 +370,8 @@ struct StartJobRequest {
     mode: JobMode,
     #[serde(default)]
     dry_run: bool,
+    #[serde(default)]
+    limit: Option<u64>,
 }
 
 async fn start_job(
@@ -360,7 +395,7 @@ async fn start_job(
 
     let cfg = state.effective_config().await;
     let pipeline = match SyncPipeline::from_config(state.clone(), cfg, &req.source) {
-        Ok(p) => p,
+        Ok(p) => p.with_limit(req.limit),
         Err(e) => {
             *state.job_state.write().await = JobState::Idle;
             return error_response(StatusCode::BAD_REQUEST, e);

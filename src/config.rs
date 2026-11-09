@@ -1,9 +1,10 @@
 use crate::router::SourceType;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_PORT: u16 = 3080;
 pub const DEFAULT_DB_PATH: &str = "/data/sync_state.db";
@@ -51,15 +52,41 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeConfigSummary {
     pub mybox_configured: bool,
+    pub mybox_api_base: String,
     pub gdrive_configured: bool,
+    pub gdrive_api_base: String,
     pub takeout_dir: String,
     pub immich_configured: bool,
+    pub immich_url: String,
     pub enable_nextcloud: bool,
     pub nextcloud_configured: bool,
+    pub nextcloud_url: String,
+    pub nextcloud_user: String,
     pub nextcloud_base_dir: String,
     pub concurrency: usize,
     pub rate_limit_rps: f64,
+    pub max_retries: u32,
     pub sync_interval_minutes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SettingsUpdateRequest {
+    pub mybox_pat: Option<String>,
+    pub mybox_api_base: Option<String>,
+    pub gdrive_access_token: Option<String>,
+    pub gdrive_api_base: Option<String>,
+    pub takeout_dir: Option<String>,
+    pub immich_url: Option<String>,
+    pub immich_api_key: Option<String>,
+    pub enable_nextcloud: Option<bool>,
+    pub nextcloud_url: Option<String>,
+    pub nextcloud_user: Option<String>,
+    pub nextcloud_app_password: Option<String>,
+    pub nextcloud_base_dir: Option<String>,
+    pub concurrency: Option<usize>,
+    pub rate_limit_rps: Option<f64>,
+    pub max_retries: Option<u32>,
+    pub sync_interval_minutes: Option<u64>,
 }
 
 impl Default for AppConfig {
@@ -156,18 +183,153 @@ impl AppConfig {
     pub fn summary(&self) -> RuntimeConfigSummary {
         RuntimeConfigSummary {
             mybox_configured: !self.mybox_pat.is_empty(),
+            mybox_api_base: self.mybox_api_base.clone(),
             gdrive_configured: !self.gdrive_access_token.is_empty(),
+            gdrive_api_base: self.gdrive_api_base.clone(),
             takeout_dir: self.takeout_dir.clone(),
             immich_configured: !self.immich_url.is_empty() && !self.immich_api_key.is_empty(),
+            immich_url: self.immich_url.clone(),
             enable_nextcloud: self.enable_nextcloud,
             nextcloud_configured: self.enable_nextcloud
                 && !self.nextcloud_url.is_empty()
                 && !self.nextcloud_user.is_empty()
                 && !self.nextcloud_app_password.is_empty(),
+            nextcloud_url: self.nextcloud_url.clone(),
+            nextcloud_user: self.nextcloud_user.clone(),
             nextcloud_base_dir: self.nextcloud_base_dir.clone(),
             concurrency: self.concurrency,
             rate_limit_rps: self.rate_limit_rps,
+            max_retries: self.max_retries,
             sync_interval_minutes: self.sync_interval_minutes,
+        }
+    }
+
+    pub fn settings_file_path(&self) -> PathBuf {
+        Path::new(&self.db_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("settings.json")
+    }
+
+    pub fn load_persisted_if_exists(&mut self) {
+        let path = self.settings_file_path();
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let Ok(req) = serde_json::from_slice::<SettingsUpdateRequest>(&bytes) else {
+            return;
+        };
+        self.apply_settings_update(&req);
+    }
+
+    pub fn save_persisted(&self) -> Result<()> {
+        let path = self.settings_file_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let persisted = SettingsUpdateRequest {
+            mybox_pat: Some(self.mybox_pat.clone()),
+            mybox_api_base: Some(self.mybox_api_base.clone()),
+            gdrive_access_token: Some(self.gdrive_access_token.clone()),
+            gdrive_api_base: Some(self.gdrive_api_base.clone()),
+            takeout_dir: Some(self.takeout_dir.clone()),
+            immich_url: Some(self.immich_url.clone()),
+            immich_api_key: Some(self.immich_api_key.clone()),
+            enable_nextcloud: Some(self.enable_nextcloud),
+            nextcloud_url: Some(self.nextcloud_url.clone()),
+            nextcloud_user: Some(self.nextcloud_user.clone()),
+            nextcloud_app_password: Some(self.nextcloud_app_password.clone()),
+            nextcloud_base_dir: Some(self.nextcloud_base_dir.clone()),
+            concurrency: Some(self.concurrency),
+            rate_limit_rps: Some(self.rate_limit_rps),
+            max_retries: Some(self.max_retries),
+            sync_interval_minutes: Some(self.sync_interval_minutes),
+        };
+        let json_bytes = serde_json::to_vec_pretty(&persisted)?;
+        std::fs::write(path, json_bytes)?;
+        Ok(())
+    }
+
+    pub fn apply_settings_update(&mut self, req: &SettingsUpdateRequest) {
+        if let Some(ref v) = req.mybox_pat {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.mybox_pat = trimmed.to_string();
+            }
+        }
+        if let Some(ref v) = req.mybox_api_base {
+            let trimmed = v.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                self.mybox_api_base = trimmed.to_string();
+            }
+        }
+        if let Some(ref v) = req.gdrive_access_token {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.gdrive_access_token = trimmed.to_string();
+            }
+        }
+        if let Some(ref v) = req.gdrive_api_base {
+            let trimmed = v.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                self.gdrive_api_base = trimmed.to_string();
+            }
+        }
+        if let Some(ref v) = req.takeout_dir {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.takeout_dir = trimmed.to_string();
+            }
+        }
+        if let Some(ref v) = req.immich_url {
+            self.immich_url = v.trim().trim_end_matches('/').to_string();
+        }
+        if let Some(ref v) = req.immich_api_key {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.immich_api_key = trimmed.to_string();
+            }
+        }
+        if let Some(enable) = req.enable_nextcloud {
+            self.enable_nextcloud = enable;
+        }
+        if let Some(ref v) = req.nextcloud_url {
+            self.nextcloud_url = v.trim().trim_end_matches('/').to_string();
+        }
+        if let Some(ref v) = req.nextcloud_user {
+            self.nextcloud_user = v.trim().to_string();
+        }
+        if let Some(ref v) = req.nextcloud_app_password {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.nextcloud_app_password = trimmed.to_string();
+            }
+        }
+        if let Some(ref v) = req.nextcloud_base_dir {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.nextcloud_base_dir = if trimmed.starts_with('/') {
+                    trimmed.to_string()
+                } else {
+                    format!("/{}", trimmed)
+                };
+            }
+        }
+        if let Some(c) = req.concurrency {
+            if c > 0 {
+                self.concurrency = c;
+            }
+        }
+        if let Some(rps) = req.rate_limit_rps {
+            if rps > 0.0 {
+                self.rate_limit_rps = rps;
+            }
+        }
+        if let Some(r) = req.max_retries {
+            self.max_retries = r;
+        }
+        if let Some(mins) = req.sync_interval_minutes {
+            self.sync_interval_minutes = mins;
         }
     }
 

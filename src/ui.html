@@ -654,13 +654,26 @@
       font-size: 12.5px;
     }
 
-    /* Dedicated Settings Tab View */
+    /*환경 설정 전용 탭 뷰 (입력 및 저장 폼) */
     .settings-view {
       display: none;
     }
 
     .settings-view.active {
       display: block;
+    }
+
+    .settings-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 14px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 16px;
     }
 
     .settings-card {
@@ -675,7 +688,7 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 12px 16px;
+      padding: 11px 16px;
       border-bottom: 1px solid var(--border);
       background: var(--surface-subtle);
     }
@@ -695,19 +708,59 @@
     .settings-table th,
     .settings-table td {
       text-align: left;
-      padding: 11px 16px;
+      padding: 12px 16px;
       border-bottom: 1px solid var(--border);
+      vertical-align: top;
     }
 
+    .settings-table tr:last-child th,
     .settings-table tr:last-child td {
       border-bottom: none;
     }
 
     .settings-table th {
       width: 220px;
-      color: var(--muted);
+      color: var(--text);
       font-weight: 500;
       background: var(--surface);
+    }
+
+    .field-sub {
+      display: block;
+      font-size: 11.5px;
+      color: var(--muted);
+      font-weight: 400;
+      margin-top: 2px;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    @media (max-width: 720px) {
+      .form-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .form-field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .form-field label {
+      font-size: 11.5px;
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    .conn-result-line {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
     }
 
     /* Modal */
@@ -828,6 +881,13 @@
             <div id="progressMeta" class="progress-meta num">0% · 0.0 파일/초</div>
           </div>
           <div class="action-toolbar">
+            <select id="sampleLimitSelect" class="btn job-trigger num" aria-label="처리 건수 제한" title="테스트용 최대 스캔/동기화 파일 수 제한">
+              <option value="0">범위: 전체 파일</option>
+              <option value="1">테스트: 1개만</option>
+              <option value="5">테스트: 5개만</option>
+              <option value="20">테스트: 20개만</option>
+              <option value="100">테스트: 100개만</option>
+            </select>
             <button id="primaryActionBtn" class="btn btn-primary" onclick="handlePrimaryAction()">스캔 + 동기화 시작</button>
             <button id="scanOnlyBtn" class="btn job-trigger" onclick="startJob('scan', false)">스캔만</button>
             <button id="syncOnlyBtn" class="btn job-trigger" onclick="startJob('sync', false)">동기화만</button>
@@ -900,27 +960,172 @@
       </section>
     </main>
 
-    <!-- 환경 설정 전용 탭 뷰 -->
+    <!-- 환경 설정 전용 탭 뷰 (웹 폼에서 직접 입력 및 /data/settings.json 영구 저장) -->
     <section id="settingsView" class="settings-view">
+      <div class="settings-toolbar">
+        <div>
+          <div style="font-size:14px;font-weight:600;">초기 구성 및 연동 설정</div>
+          <div id="settingsSaveNotice" style="font-size:12px;color:var(--muted);">
+            입력한 설정은 서버의 <span class="mono">/data/settings.json</span>에 영구 저장되며 컨테이너 재시작 없이 즉시 적용됩니다.
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn" onclick="testConnections()">연결 테스트만 실행</button>
+          <button class="btn btn-primary" onclick="saveSettings(true)">설정 저장 및 연결 테스트</button>
+        </div>
+      </div>
+
       <div class="settings-card">
         <div class="settings-card-header">
-          <span class="settings-card-title">데이터 소스 및 타겟 서버 연결 진단</span>
-          <button class="btn btn-primary" onclick="testConnections()">전체 연결 테스트 실행</button>
+          <span class="settings-card-title">1. 데이터 소스 (Cloud Sources)</span>
         </div>
         <table class="settings-table">
-          <tbody id="settingsSourceTargetBody">
-            <tr><th>상태</th><td>환경 정보를 불러오는 중...</td></tr>
+          <tbody>
+            <tr>
+              <th>
+                네이버 MYBOX
+                <span id="cfgMyboxBadge" class="field-sub">확인 중...</span>
+              </th>
+              <td>
+                <div class="form-grid">
+                  <div class="form-field">
+                    <label for="cfgMyboxPat">개인 액세스 토큰 (MYBOX_PAT)</label>
+                    <input id="cfgMyboxPat" type="password" class="input-text mono" placeholder="토큰 입력 (비워두면 기존 값 유지)" autocomplete="off" />
+                  </div>
+                  <div class="form-field">
+                    <label for="cfgMyboxApiBase">API Base URL</label>
+                    <input id="cfgMyboxApiBase" type="text" class="input-text mono" placeholder="https://apis.naver.com/mybox" />
+                  </div>
+                </div>
+                <div id="connStatusMybox" class="conn-result-line mono"></div>
+              </td>
+            </tr>
+            <tr>
+              <th>
+                Google Drive
+                <span id="cfgGdriveBadge" class="field-sub">확인 중...</span>
+              </th>
+              <td>
+                <div class="form-grid">
+                  <div class="form-field">
+                    <label for="cfgGdriveToken">OAuth 액세스 토큰 (GDRIVE_ACCESS_TOKEN)</label>
+                    <input id="cfgGdriveToken" type="password" class="input-text mono" placeholder="토큰 입력 (비워두면 기존 값 유지)" autocomplete="off" />
+                  </div>
+                  <div class="form-field">
+                    <label for="cfgGdriveApiBase">API Base URL</label>
+                    <input id="cfgGdriveApiBase" type="text" class="input-text mono" placeholder="https://www.googleapis.com/drive/v3" />
+                  </div>
+                </div>
+                <div id="connStatusGdrive" class="conn-result-line mono"></div>
+              </td>
+            </tr>
+            <tr>
+              <th>
+                Google Takeout
+                <span id="cfgTakeoutBadge" class="field-sub">로컬 ZIP 폴더</span>
+              </th>
+              <td>
+                <div class="form-field">
+                  <label for="cfgTakeoutDir">서버 내 Takeout ZIP 폴더 경로 (TAKEOUT_DIR)</label>
+                  <input id="cfgTakeoutDir" type="text" class="input-text mono" placeholder="/data/takeout" />
+                </div>
+                <div id="connStatusTakeout" class="conn-result-line mono"></div>
+              </td>
+            </tr>
           </tbody>
         </table>
       </div>
 
       <div class="settings-card">
         <div class="settings-card-header">
-          <span class="settings-card-title">파이프라인 실행 파라미터 (환경변수 기준)</span>
+          <span class="settings-card-title">2. 타겟 스토리지 서버 (Immich & Nextcloud)</span>
         </div>
         <table class="settings-table">
-          <tbody id="settingsEngineBody">
-            <tr><th>상태</th><td>환경 정보를 불러오는 중...</td></tr>
+          <tbody>
+            <tr>
+              <th>
+                Immich (사진·영상)
+                <span id="cfgImmichBadge" class="field-sub">확인 중...</span>
+              </th>
+              <td>
+                <div class="form-grid">
+                  <div class="form-field">
+                    <label for="cfgImmichUrl">Immich 서버 URL (IMMICH_URL)</label>
+                    <input id="cfgImmichUrl" type="text" class="input-text mono" placeholder="http://192.168.0.10:2283" />
+                  </div>
+                  <div class="form-field">
+                    <label for="cfgImmichApiKey">Immich API Key (IMMICH_API_KEY)</label>
+                    <input id="cfgImmichApiKey" type="password" class="input-text mono" placeholder="API Key 입력 (비워두면 기존 값 유지)" autocomplete="off" />
+                  </div>
+                </div>
+                <div id="connStatusImmich" class="conn-result-line mono"></div>
+              </td>
+            </tr>
+            <tr>
+              <th>
+                Nextcloud (문서·일반 파일)
+                <span id="cfgNextcloudBadge" class="field-sub">확인 중...</span>
+              </th>
+              <td>
+                <div style="margin-bottom:10px;">
+                  <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px;cursor:pointer;">
+                    <input id="cfgEnableNextcloud" type="checkbox" checked />
+                    <span>Nextcloud 문서·일반 파일 이주 활성화</span>
+                  </label>
+                </div>
+                <div class="form-grid">
+                  <div class="form-field">
+                    <label for="cfgNextcloudUrl">Nextcloud 서버 URL</label>
+                    <input id="cfgNextcloudUrl" type="text" class="input-text mono" placeholder="http://192.168.0.10:8080" />
+                  </div>
+                  <div class="form-field">
+                    <label for="cfgNextcloudBaseDir">업로드 대상 폴더 경로</label>
+                    <input id="cfgNextcloudBaseDir" type="text" class="input-text mono" placeholder="/Cloud-Backup" />
+                  </div>
+                  <div class="form-field">
+                    <label for="cfgNextcloudUser">사용자 계정 ID (NEXTCLOUD_USER)</label>
+                    <input id="cfgNextcloudUser" type="text" class="input-text mono" placeholder="admin" />
+                  </div>
+                  <div class="form-field">
+                    <label for="cfgNextcloudPassword">앱 비밀번호 (NEXTCLOUD_APP_PASSWORD)</label>
+                    <input id="cfgNextcloudPassword" type="password" class="input-text mono" placeholder="비밀번호 입력 (비워두면 기존 값 유지)" autocomplete="off" />
+                  </div>
+                </div>
+                <div id="connStatusNextcloud" class="conn-result-line mono"></div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="settings-card">
+        <div class="settings-card-header">
+          <span class="settings-card-title">3. 파이프라인 실행 옵션</span>
+        </div>
+        <table class="settings-table">
+          <tbody>
+            <tr>
+              <th>
+                성능 및 스케줄링
+                <span class="field-sub">동시성 · 속도 제한 · 주기</span>
+              </th>
+              <td>
+                <div class="form-grid" style="grid-template-columns: repeat(3, 1fr);">
+                  <div class="form-field">
+                    <label for="cfgConcurrency">동시 처리 워커 수</label>
+                    <input id="cfgConcurrency" type="number" min="1" max="32" class="input-text mono" placeholder="3" />
+                  </div>
+                  <div class="form-field">
+                    <label for="cfgRateLimitRps">초당 API 요청 제한 (RPS)</label>
+                    <input id="cfgRateLimitRps" type="number" step="0.5" min="0.5" class="input-text mono" placeholder="5.0" />
+                  </div>
+                  <div class="form-field">
+                    <label for="cfgSyncInterval">자동 동기화 주기 (분, 0=수동)</label>
+                    <input id="cfgSyncInterval" type="number" min="0" class="input-text mono" placeholder="0" />
+                  </div>
+                </div>
+              </td>
+            </tr>
           </tbody>
         </table>
       </div>
@@ -1211,10 +1416,26 @@
       }
     }
 
-    function formatConnBadge(key) {
+    let settingsFormInitialized = false;
+
+    function setInputIfUntouched(id, val) {
+      const el = document.getElementById(id);
+      if (!el || document.activeElement === el) return;
+      if (!settingsFormInitialized || el.value === '') {
+        el.value = val ?? '';
+      }
+    }
+
+    function renderConnLine(elId, key) {
+      const el = document.getElementById(elId);
+      if (!el) return;
       const r = lastConnectionResults[key];
-      if (!r) return '';
-      return ` · <span style="color:${r.ok ? 'var(--ok)' : 'var(--err)'}">${r.ok ? '연결 정상' : '연결 실패'}: ${r.message}</span>`;
+      if (!r) {
+        el.textContent = '';
+        return;
+      }
+      el.style.color = r.ok ? 'var(--ok)' : 'var(--err)';
+      el.textContent = `${r.ok ? '연결 정상' : '연결 실패'}: ${r.message}`;
     }
 
     function renderSettingsTables(d) {
@@ -1222,33 +1443,98 @@
       const t = d.takeout_info || {};
       const archives = t.archives || [];
 
-      const ncDesc = !c.enable_nextcloud
-        ? '<span class="dot"></span> 비활성화됨'
-        : (c.nextcloud_configured
-            ? `<span class="dot ok"></span> 설정됨 (업로드 경로: <span class="mono">${c.nextcloud_base_dir}</span>)`
-            : '<span class="dot warn"></span> 인증정보 누락');
+      document.getElementById('cfgMyboxBadge').innerHTML =
+        `<span class="dot ${c.mybox_configured ? 'ok' : 'warn'}"></span> ${c.mybox_configured ? '토큰 저장됨' : '미설정'}`;
+      document.getElementById('cfgGdriveBadge').innerHTML =
+        `<span class="dot ${c.gdrive_configured ? 'ok' : 'warn'}"></span> ${c.gdrive_configured ? '토큰 저장됨' : '미설정'}`;
+      document.getElementById('cfgTakeoutBadge').innerHTML =
+        `<span class="dot ${archives.length > 0 ? 'ok' : ''}"></span> ZIP ${archives.length}개 인식`;
+      document.getElementById('cfgImmichBadge').innerHTML =
+        `<span class="dot ${c.immich_configured ? 'ok' : 'warn'}"></span> ${c.immich_configured ? '설정됨' : '미설정'}`;
+      document.getElementById('cfgNextcloudBadge').innerHTML = !c.enable_nextcloud
+        ? '<span class="dot"></span> 비활성'
+        : `<span class="dot ${c.nextcloud_configured ? 'ok' : 'warn'}"></span> ${c.nextcloud_configured ? '설정됨' : '인증 누락'}`;
 
-      const stRows = [
-        ['네이버 MYBOX', `<span class="dot ${c.mybox_configured ? 'ok' : 'warn'}"></span> ${c.mybox_configured ? 'PAT 토큰 설정됨' : '미설정 (MYBOX_PAT 환경변수 필요)'}${formatConnBadge('mybox')}`],
-        ['Google Drive', `<span class="dot ${c.gdrive_configured ? 'ok' : 'warn'}"></span> ${c.gdrive_configured ? 'OAuth 액세스 토큰 설정됨' : '미설정 (GDRIVE_ACCESS_TOKEN 환경변수 필요)'}${formatConnBadge('gdrive')}`],
-        ['Google Takeout', `<span class="dot ${archives.length > 0 ? 'ok' : ''}"></span> 경로: <span class="mono">${t.dir || c.takeout_dir || '-'}</span> (ZIP ${archives.length}개)${formatConnBadge('takeout')}`],
-        ['Immich (사진·영상 타겟)', `<span class="dot ${c.immich_configured ? 'ok' : 'warn'}"></span> ${c.immich_configured ? 'URL 및 API Key 설정됨' : '미설정 (IMMICH_URL / IMMICH_API_KEY 필요)'}${formatConnBadge('immich')}`],
-        ['Nextcloud (문서·일반 타겟)', `${ncDesc}${formatConnBadge('nextcloud')}`]
-      ];
+      document.getElementById('cfgMyboxPat').placeholder = c.mybox_configured
+        ? '•••••••• (저장됨 — 변경 시에만 새 토큰 입력)'
+        : 'MYBOX PAT 토큰 입력';
+      document.getElementById('cfgGdriveToken').placeholder = c.gdrive_configured
+        ? '•••••••• (저장됨 — 변경 시에만 새 토큰 입력)'
+        : 'Google Drive OAuth 토큰 입력';
+      document.getElementById('cfgImmichApiKey').placeholder = c.immich_configured
+        ? '•••••••• (저장됨 — 변경 시에만 새 API Key 입력)'
+        : 'Immich API Key 입력';
+      document.getElementById('cfgNextcloudPassword').placeholder = c.nextcloud_configured
+        ? '•••••••• (저장됨 — 변경 시에만 새 비밀번호 입력)'
+        : 'Nextcloud 앱 비밀번호 입력';
 
-      document.getElementById('settingsSourceTargetBody').innerHTML = stRows
-        .map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`)
-        .join('');
+      setInputIfUntouched('cfgMyboxApiBase', c.mybox_api_base || 'https://apis.naver.com/mybox');
+      setInputIfUntouched('cfgGdriveApiBase', c.gdrive_api_base || 'https://www.googleapis.com/drive/v3');
+      setInputIfUntouched('cfgTakeoutDir', t.dir || c.takeout_dir || '/data/takeout');
+      setInputIfUntouched('cfgImmichUrl', c.immich_url || '');
+      setInputIfUntouched('cfgNextcloudUrl', c.nextcloud_url || '');
+      setInputIfUntouched('cfgNextcloudBaseDir', c.nextcloud_base_dir || '/Cloud-Backup');
+      setInputIfUntouched('cfgNextcloudUser', c.nextcloud_user || '');
+      setInputIfUntouched('cfgConcurrency', c.concurrency || 3);
+      setInputIfUntouched('cfgRateLimitRps', c.rate_limit_rps || 5);
+      setInputIfUntouched('cfgSyncInterval', c.sync_interval_minutes ?? 0);
 
-      const engineRows = [
-        ['동시 처리 워커 (CONCURRENCY)', `<span class="mono">${c.concurrency || 3}개</span>`],
-        ['API 요청 속도 제한 (RATE_LIMIT_RPS)', `<span class="mono">${c.rate_limit_rps || 5} RPS</span>`],
-        ['자동 증분 동기화 주기 (SYNC_INTERVAL_MINUTES)', c.sync_interval_minutes > 0 ? `<span class="mono">${c.sync_interval_minutes}분 주기</span>` : '수동 실행 전용 (0)']
-      ];
+      if (!settingsFormInitialized) {
+        const ncCheck = document.getElementById('cfgEnableNextcloud');
+        if (ncCheck) ncCheck.checked = Boolean(c.enable_nextcloud);
+        settingsFormInitialized = true;
+      }
 
-      document.getElementById('settingsEngineBody').innerHTML = engineRows
-        .map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`)
-        .join('');
+      renderConnLine('connStatusMybox', 'mybox');
+      renderConnLine('connStatusGdrive', 'gdrive');
+      renderConnLine('connStatusTakeout', 'takeout');
+      renderConnLine('connStatusImmich', 'immich');
+      renderConnLine('connStatusNextcloud', 'nextcloud');
+    }
+
+    async function saveSettings(runTestAfter) {
+      const notice = document.getElementById('settingsSaveNotice');
+      const payload = {
+        mybox_pat: document.getElementById('cfgMyboxPat').value,
+        mybox_api_base: document.getElementById('cfgMyboxApiBase').value,
+        gdrive_access_token: document.getElementById('cfgGdriveToken').value,
+        gdrive_api_base: document.getElementById('cfgGdriveApiBase').value,
+        takeout_dir: document.getElementById('cfgTakeoutDir').value,
+        immich_url: document.getElementById('cfgImmichUrl').value,
+        immich_api_key: document.getElementById('cfgImmichApiKey').value,
+        enable_nextcloud: document.getElementById('cfgEnableNextcloud').checked,
+        nextcloud_url: document.getElementById('cfgNextcloudUrl').value,
+        nextcloud_user: document.getElementById('cfgNextcloudUser').value,
+        nextcloud_app_password: document.getElementById('cfgNextcloudPassword').value,
+        nextcloud_base_dir: document.getElementById('cfgNextcloudBaseDir').value,
+        concurrency: Number(document.getElementById('cfgConcurrency').value) || 3,
+        rate_limit_rps: Number(document.getElementById('cfgRateLimitRps').value) || 5.0,
+        sync_interval_minutes: Number(document.getElementById('cfgSyncInterval').value) || 0
+      };
+
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        notice.style.color = 'var(--err)';
+        notice.textContent = `설정 저장 실패: ${data.error || '오류 발생'}`;
+        return;
+      }
+
+      document.getElementById('cfgMyboxPat').value = '';
+      document.getElementById('cfgGdriveToken').value = '';
+      document.getElementById('cfgImmichApiKey').value = '';
+      document.getElementById('cfgNextcloudPassword').value = '';
+
+      notice.style.color = 'var(--ok)';
+      notice.textContent = '설정이 저장되었습니다 (/data/settings.json).';
+      await fetchStatus();
+      if (runTestAfter) {
+        await testConnections();
+      }
     }
 
     function renderStatus(d) {
@@ -1362,10 +1648,14 @@
     }
 
     async function startJob(mode, dryRun) {
+      const limitSelect = document.getElementById('sampleLimitSelect');
+      const rawLimit = limitSelect ? Number(limitSelect.value) : 0;
+      const limit = rawLimit > 0 ? rawLimit : null;
+
       const res = await fetch('/api/jobs/start', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ source: currentSource, mode, dry_run: dryRun })
+        body: JSON.stringify({ source: currentSource, mode, dry_run: dryRun, limit })
       });
       if (res.status === 409) {
         appendLog(new Date().toLocaleTimeString(), '이미 실행 중인 작업이 있습니다.');

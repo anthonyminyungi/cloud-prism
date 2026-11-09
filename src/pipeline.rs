@@ -72,6 +72,7 @@ pub struct SyncPipeline {
     source_type: SourceType,
     source: Arc<dyn SourceProvider>,
     targets: HashMap<TargetType, Arc<dyn TargetProvider>>,
+    limit_files: Option<u64>,
 }
 
 impl SyncPipeline {
@@ -87,7 +88,21 @@ impl SyncPipeline {
             source_type,
             source,
             targets,
+            limit_files: None,
         })
+    }
+
+    pub fn with_limit(mut self, limit: Option<u64>) -> Self {
+        self.limit_files = limit.filter(|&n| n > 0);
+        self
+    }
+
+    fn is_limit_reached(&self) -> bool {
+        if let Some(limit) = self.limit_files {
+            self.state.processed_files.load(Ordering::SeqCst) >= limit
+        } else {
+            false
+        }
     }
 
     fn source_key(&self) -> &'static str {
@@ -128,14 +143,14 @@ impl SyncPipeline {
             )
             .await;
 
-        while !self.state.is_stopping() {
+        while !self.state.is_stopping() && !self.is_limit_reached() {
             let pending_folders = self.state.db.get_pending_folders(src).await?;
             if pending_folders.is_empty() {
                 break;
             }
 
             for folder in pending_folders {
-                if self.state.is_stopping() {
+                if self.state.is_stopping() || self.is_limit_reached() {
                     break;
                 }
                 self.scan_single_folder(&folder.folder_id, &folder.path, folder.last_cursor)
@@ -143,7 +158,7 @@ impl SyncPipeline {
             }
         }
 
-        if !is_resuming && !self.state.is_stopping() {
+        if !is_resuming && !self.state.is_stopping() && self.limit_files.is_none() {
             let (removed_unbacked, excluded_uploaded) = self
                 .state
                 .db
@@ -185,7 +200,7 @@ impl SyncPipeline {
     ) -> Result<()> {
         let src = self.source_key();
 
-        while !self.state.is_stopping() {
+        while !self.state.is_stopping() && !self.is_limit_reached() {
             let page = self
                 .source
                 .list_page(folder_id, folder_path, cursor.as_deref())
@@ -198,7 +213,7 @@ impl SyncPipeline {
                     .await?;
             }
 
-            let upserts: Vec<FileUpsert> = page
+            let mut upserts: Vec<FileUpsert> = page
                 .files
                 .into_iter()
                 .filter_map(|rf| {
@@ -218,6 +233,16 @@ impl SyncPipeline {
                 })
                 .collect();
 
+            let mut truncated_by_limit = false;
+            if let Some(limit) = self.limit_files {
+                let current = self.state.processed_files.load(Ordering::SeqCst);
+                let remaining = limit.saturating_sub(current) as usize;
+                if upserts.len() > remaining {
+                    upserts.truncate(remaining);
+                    truncated_by_limit = true;
+                }
+            }
+
             if !upserts.is_empty() {
                 let added = self.state.db.upsert_files(&upserts).await?;
                 self.state
@@ -234,6 +259,10 @@ impl SyncPipeline {
                         ),
                     )
                     .await;
+            }
+
+            if truncated_by_limit || self.is_limit_reached() {
+                break;
             }
 
             if let Some(next_c) = page.next_cursor {
@@ -254,8 +283,12 @@ impl SyncPipeline {
     pub async fn run_sync(&self) -> Result<SyncStats> {
         let src = self.source_key();
         let initial_stats = self.state.db.get_stats(src).await?;
+        let planned_total = match self.limit_files {
+            Some(limit) => (initial_stats.pending_files as u64).min(limit),
+            None => initial_stats.pending_files as u64,
+        };
         self.state
-            .begin_phase(src, JobState::Syncing, initial_stats.pending_files as u64)
+            .begin_phase(src, JobState::Syncing, planned_total)
             .await;
         self.state
             .emit_event(
@@ -263,8 +296,8 @@ impl SyncPipeline {
                 JobState::Syncing,
                 None,
                 format!(
-                    "[{}] 동기화 시작 (대기 항목: {}건, 워커 수: {})",
-                    src, initial_stats.pending_files, self.config.concurrency
+                    "[{}] 동기화 시작 (대상 항목: {}건 / 전체 대기: {}건, 워커 수: {})",
+                    src, planned_total, initial_stats.pending_files, self.config.concurrency
                 ),
             )
             .await;
@@ -272,11 +305,23 @@ impl SyncPipeline {
         let max_retries = self.config.max_retries as i64;
         let concurrency = self.config.concurrency.max(1);
 
-        while !self.state.is_stopping() {
+        while !self.state.is_stopping() && !self.is_limit_reached() {
+            let batch_size = match self.limit_files {
+                Some(limit) => {
+                    let done = self.state.processed_files.load(Ordering::SeqCst);
+                    let rem = limit.saturating_sub(done);
+                    if rem == 0 {
+                        break;
+                    }
+                    rem.min(SYNC_BATCH_SIZE as u64) as i64
+                }
+                None => SYNC_BATCH_SIZE,
+            };
+
             let batch = self
                 .state
                 .db
-                .get_pending_files(src, max_retries, SYNC_BATCH_SIZE)
+                .get_pending_files(src, max_retries, batch_size)
                 .await?;
             if batch.is_empty() {
                 break;
@@ -284,7 +329,7 @@ impl SyncPipeline {
 
             stream::iter(batch)
                 .for_each_concurrent(concurrency, |file| async move {
-                    if !self.state.is_stopping() {
+                    if !self.state.is_stopping() && !self.is_limit_reached() {
                         self.sync_single_file(file).await;
                     }
                 })

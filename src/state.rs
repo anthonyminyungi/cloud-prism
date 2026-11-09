@@ -1,5 +1,6 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SettingsUpdateRequest};
 use crate::db::CheckpointDB;
+use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -48,7 +49,7 @@ pub struct ProgressEvent {
 pub struct AppState {
     pub db: CheckpointDB,
     pub config: AppConfig,
-    pub takeout_dir_override: RwLock<Option<String>>,
+    pub runtime_config: RwLock<AppConfig>,
     pub job_state: RwLock<JobState>,
     pub active_source: RwLock<Option<String>>,
     pub current_file: RwLock<Option<String>>,
@@ -63,11 +64,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: CheckpointDB, config: AppConfig) -> Arc<Self> {
+        let mut initial_runtime = config.clone();
+        initial_runtime.load_persisted_if_exists();
         let (event_tx, _) = broadcast::channel(256);
         Arc::new(Self {
             db,
             config,
-            takeout_dir_override: RwLock::new(None),
+            runtime_config: RwLock::new(initial_runtime),
             job_state: RwLock::new(JobState::Idle),
             active_source: RwLock::new(None),
             current_file: RwLock::new(None),
@@ -82,15 +85,20 @@ impl AppState {
     }
 
     pub async fn effective_config(&self) -> AppConfig {
-        let mut cfg = self.config.clone();
-        if let Some(ref dir) = *self.takeout_dir_override.read().await {
-            cfg.takeout_dir = dir.clone();
-        }
-        cfg
+        self.runtime_config.read().await.clone()
     }
 
     pub async fn set_takeout_dir(&self, dir: String) {
-        *self.takeout_dir_override.write().await = Some(dir);
+        let mut cfg = self.runtime_config.write().await;
+        cfg.takeout_dir = dir;
+        let _ = cfg.save_persisted();
+    }
+
+    pub async fn update_settings(&self, req: &SettingsUpdateRequest) -> Result<AppConfig> {
+        let mut cfg = self.runtime_config.write().await;
+        cfg.apply_settings_update(req);
+        cfg.save_persisted()?;
+        Ok(cfg.clone())
     }
 
     pub fn is_stopping(&self) -> bool {

@@ -33,7 +33,7 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
         .mount(&mock_server)
         .await;
 
-    // Mock MYBOX list_page for scan job
+    // Mock MYBOX list_page for scan job (returns 2 items to verify sample limit=1)
     Mock::given(method("GET"))
         .and(path("/v1/files"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -45,6 +45,14 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
                     "size": 12345,
                     "created_time": "2026-10-01T00:00:00Z",
                     "modified_time": "2026-10-01T00:00:00Z"
+                },
+                {
+                    "resource_id": "web_photo_2",
+                    "name": "ocean.jpg",
+                    "is_folder": false,
+                    "size": 23456,
+                    "created_time": "2026-10-02T00:00:00Z",
+                    "modified_time": "2026-10-02T00:00:00Z"
                 }
             ]
         })))
@@ -83,6 +91,7 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     assert!(html.contains("id=\"takeoutArchivePanel\""));
     assert!(html.contains("id=\"settingsView\""));
     assert!(html.contains("id=\"metricStrip\""));
+    assert!(html.contains("id=\"sampleLimitSelect\""));
     assert!(html.contains("toggleTheme"));
     assert!(!html.contains("id=\"envDrawer\""));
     assert!(!html.contains("id=\"actionDropdown\""));
@@ -126,7 +135,7 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     assert_eq!(conflict_resp.status(), StatusCode::CONFLICT);
     *state.job_state.write().await = JobState::Idle;
 
-    // 4. Start scan job via POST /api/jobs/start and verify status + config_summary via GET /api/status
+    // 4. Start scan job with limit=1 via POST /api/jobs/start and verify only 1 of 2 files is queued
     let start_resp = app
         .clone()
         .oneshot(
@@ -135,7 +144,7 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
                 .uri("/api/jobs/start")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"source": "mybox", "mode": "scan", "dry_run": false}).to_string(),
+                    json!({"source": "mybox", "mode": "scan", "dry_run": false, "limit": 1}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -210,4 +219,36 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
             .unwrap();
     assert_eq!(upload_json["uploaded"], "takeout-2026-001.zip");
     assert_eq!(upload_json["archives"].as_array().unwrap().len(), 1);
+
+    // 6. Save runtime settings via POST /api/settings and verify persistence to settings.json
+    let settings_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "gdrive_access_token": "new_gdrive_oauth_token",
+                        "concurrency": 6,
+                        "rate_limit_rps": 12.5,
+                        "sync_interval_minutes": 30
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings_resp.status(), StatusCode::OK);
+    let settings_json: Value =
+        serde_json::from_slice(&to_bytes(settings_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(settings_json["saved"], true);
+    assert_eq!(settings_json["config_summary"]["gdrive_configured"], true);
+    assert_eq!(settings_json["config_summary"][" mybox_configured".trim()], true); // Blank secret preserves existing MYBOX token
+    assert_eq!(settings_json["config_summary"]["concurrency"], 6);
+    assert_eq!(settings_json["config_summary"]["sync_interval_minutes"], 30);
+    assert!(temp_dir.path().join("settings.json").exists());
 }

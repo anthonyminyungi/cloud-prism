@@ -29,16 +29,22 @@ enum Commands {
     Auto {
         #[arg(long, default_value = "mybox")]
         source: String,
+        #[arg(long)]
+        limit: Option<u64>,
     },
     /// Scan remote folder tree and register checkpoints
     Scan {
         #[arg(long, default_value = "mybox")]
         source: String,
+        #[arg(long)]
+        limit: Option<u64>,
     },
     /// Sync pending files to Immich and Nextcloud
     Sync {
         #[arg(long, default_value = "mybox")]
         source: String,
+        #[arg(long)]
+        limit: Option<u64>,
     },
     /// Re-verify targets and move uploaded files to remote cloud trash
     Delete {
@@ -70,18 +76,18 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(listener, app).await?;
         }
-        Commands::Auto { source } => {
-            let pipeline = SyncPipeline::from_config(state, cfg, &source)?;
+        Commands::Auto { source, limit } => {
+            let pipeline = SyncPipeline::from_config(state, cfg, &source)?.with_limit(limit);
             let stats = pipeline.run_auto().await?;
             println!("Auto completed: {:?}", stats);
         }
-        Commands::Scan { source } => {
-            let pipeline = SyncPipeline::from_config(state, cfg, &source)?;
+        Commands::Scan { source, limit } => {
+            let pipeline = SyncPipeline::from_config(state, cfg, &source)?.with_limit(limit);
             let stats = pipeline.run_scan().await?;
             println!("Scan completed: {:?}", stats);
         }
-        Commands::Sync { source } => {
-            let pipeline = SyncPipeline::from_config(state, cfg, &source)?;
+        Commands::Sync { source, limit } => {
+            let pipeline = SyncPipeline::from_config(state, cfg, &source)?.with_limit(limit);
             let stats = pipeline.run_sync().await?;
             println!("Sync completed: {:?}", stats);
         }

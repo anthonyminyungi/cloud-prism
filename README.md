@@ -10,9 +10,9 @@ TrueNAS SCALE 환경에 최적화된 **멀티 클라우드(네이버 MYBOX · Go
    - 별도의 프론트엔드 컨테이너 없이 Rust(`axum`) 단일 바이너리에 반응형 한국어 대시보드를 내장했습니다.
    - 컨테이너 기동 시 **`Idle`(대기 상태, CPU 0%)**로 시작하며, 웹 UI에서 연결 테스트 · 소스별 동기화/일시정지/원격 삭제를 명시적으로 제어할 수 있습니다.
    - **SSE(`GET /api/events`)** 실시간 스트리밍으로 진행률(%), 초당 처리 속도, 현재 파일명 및 최근 로그를 실시간 표시합니다.
-2. **TrueNAS SCALE 앱 환경변수 기반 단일 설정 주입**:
-   - API 주소, API 키/토큰, 경로, 동시성/속도 제한 등 모든 설정은 TrueNAS SCALE Custom App(또는 Compose) 배포 시 환경변수로만 주입받습니다.
-   - 민감한 인증키를 SQLite DB에 평문 저장하거나 웹 API로 노출하지 않으며, 웹 대시보드에서는 설정 여부 요약 배지와 `[🔌 전체 연결 테스트]` 기능만 안전하게 제공합니다.
+2. **웹 대시보드 내 설정 폼 & `/data/settings.json` 영구 저장 (Zero-Env 배포)**:
+   - TrueNAS SCALE에 배포할 때 복잡한 환경변수를 일일이 입력할 필요 없이, 포트(`3080`)와 `/data` 볼륨만 마운트해 컨테이너를 띄우면 됩니다.
+   - 웹 대시보드의 **`[환경 설정]`** 탭에서 MYBOX PAT 토큰, Google Drive 토큰, Immich URL/API Key, Nextcloud 계정 정보 및 동시성 옵션을 직접 입력·저장할 수 있으며, 저장된 설정은 `/data/settings.json`에 보관되어 컨테이너 재시작 후에도 유지됩니다. (비밀번호/토큰 원문은 브라우저로 다시 노출되지 않습니다.)
 3. **확장자 기반 자동 라우팅 (`TargetRouter`)**:
    - **사진·동영상** (`.jpg`, `.heic`, `.png`, `.dng`, `.mp4`, `.mov` 등): **Immich**로 이주 (`bulk-upload-check` SHA-1 중복 사전 검사로 중복 파일 업로드 스킵, Google Drive는 서버 `sha1Checksum`으로 무다운로드 즉시 스킵)
    - **일반 문서·파일** (`.pdf`, `.docx`, `.xlsx`, `.hwp`, `.hwpx`, `.zip` 등): 원본 폴더 트리와 수정 시각(`X-OC-MTime`)을 보존하여 **Nextcloud WebDAV**로 이주

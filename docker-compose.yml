@@ -1,7 +1,7 @@
 services:
-  mybox-sync:
+  cloud-prism:
     build: .
-    container_name: mybox-immich-sync
+    container_name: cloud-prism
     ports:
       - "3080:3080"
     environment:
@@ -9,25 +9,11 @@ services:
       - TZ=Asia/Seoul
       - DB_PATH=/data/sync_state.db
       - TMP_DIR=/tmp/mybox_sync
-      # TrueNAS SCALE 앱 설치/편집 화면의 Environment Variables에서 주입하는 설정값
-      - MYBOX_PAT=${MYBOX_PAT:-}
-      - MYBOX_API_BASE=${MYBOX_API_BASE:-https://apis.naver.com/mybox}
-      - GDRIVE_ACCESS_TOKEN=${GDRIVE_ACCESS_TOKEN:-}
-      - GDRIVE_API_BASE=${GDRIVE_API_BASE:-https://www.googleapis.com/drive/v3}
+      # 모든 토큰·URL·옵션은 웹 대시보드(:3080)의 [환경 설정] 탭에서 입력 시 /data/settings.json에 영구 저장됩니다.
+      # (선택) 초기 기본값을 환경변수로 미리 주입하고 싶을 때만 아래 항목을 설정하세요.
       - TAKEOUT_DIR=${TAKEOUT_DIR:-/data/takeout}
-      - IMMICH_URL=${IMMICH_URL:-}
-      - IMMICH_API_KEY=${IMMICH_API_KEY:-}
-      - ENABLE_NEXTCLOUD=${ENABLE_NEXTCLOUD:-true}
-      - NEXTCLOUD_URL=${NEXTCLOUD_URL:-}
-      - NEXTCLOUD_USER=${NEXTCLOUD_USER:-}
-      - NEXTCLOUD_APP_PASSWORD=${NEXTCLOUD_APP_PASSWORD:-}
-      - NEXTCLOUD_BASE_DIR=${NEXTCLOUD_BASE_DIR:-/Cloud-Backup}
-      - CONCURRENCY=${CONCURRENCY:-3}
-      - RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-5.0}
-      - MAX_RETRIES=${MAX_RETRIES:-3}
-      - SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-0}
     volumes:
-      # TrueNAS SCALE 예시: /mnt/<Pool이름>/apps/mybox-sync/data:/data
+      # TrueNAS SCALE 예시: /mnt/<Pool이름>/apps/cloud-prism:/data
       - ./data:/data
     tmpfs:
       # ZFS 디스크 쓰기(CoW) 및 스냅샷 부풀림 방지를 위해 임시 다운로드는 RAM(tmpfs)에서 처리 후 즉시 삭제
