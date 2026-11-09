@@ -79,6 +79,15 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     let html = String::from_utf8_lossy(&html_bytes);
     assert!(html.contains("네이버 MYBOX"));
     assert!(html.contains("Immich"));
+    assert!(html.contains("id=\"workspaceView\""));
+    assert!(html.contains("id=\"takeoutArchivePanel\""));
+    assert!(html.contains("id=\"settingsView\""));
+    assert!(html.contains("id=\"metricStrip\""));
+    assert!(html.contains("toggleTheme"));
+    assert!(!html.contains("id=\"envDrawer\""));
+    assert!(!html.contains("id=\"actionDropdown\""));
+    assert!(!html.contains("📦"));
+    assert!(!html.contains("🚀"));
 
     // 2. POST /api/connections/test verifies MYBOX and Immich connectivity from environment config
     let resp = app
@@ -146,6 +155,7 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     }
 
     let status_resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/status?source=mybox")
@@ -162,4 +172,42 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     assert_eq!(status_json["config_summary"]["mybox_configured"], true);
     assert_eq!(status_json["config_summary"]["immich_configured"], true);
     assert_eq!(status_json["config_summary"]["concurrency"], 4);
+
+    // 5. Set Takeout directory path and upload a .zip archive via Web API
+    let custom_takeout_dir = temp_dir.path().join("custom_takeout");
+    let custom_takeout_str = custom_takeout_dir.to_str().unwrap().to_string();
+
+    let path_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/takeout/path")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "takeout_dir": custom_takeout_str }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(path_resp.status(), StatusCode::OK);
+
+    let upload_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/takeout/upload?filename=takeout-2026-001.zip")
+                .body(Body::from("PK\x05\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload_resp.status(), StatusCode::OK);
+    let upload_json: Value =
+        serde_json::from_slice(&to_bytes(upload_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(upload_json["uploaded"], "takeout-2026-001.zip");
+    assert_eq!(upload_json["archives"].as_array().unwrap().len(), 1);
 }

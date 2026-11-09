@@ -3,290 +3,936 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Cloud-Prism · 멀티 클라우드(MYBOX · Google) → NAS(Immich · Nextcloud) 이주 대시보드</title>
+  <title>Cloud Prism</title>
+  <script>
+    (function() {
+      const saved = localStorage.getItem('cp_theme');
+      if (saved === 'light' || saved === 'dark') {
+        document.documentElement.setAttribute('data-theme', saved);
+      } else {
+        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
+      }
+    })();
+  </script>
   <style>
-    :root {
-      --bg: #0f172a;
-      --panel: #1e293b;
-      --panel-hover: #334155;
-      --border: #334155;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --accent: #38bdf8;
-      --green: #22c55e;
-      --amber: #f59e0b;
-      --red: #ef4444;
+    :root, html[data-theme="dark"] {
+      --bg: #09090b;
+      --surface: #121215;
+      --surface-subtle: #18181b;
+      --surface-hover: #222226;
+      --border: #27272a;
+      --text: #fafafa;
+      --muted: #a1a1aa;
+      --subtle: #71717a;
+      --primary-bg: #fafafa;
+      --primary-text: #09090b;
+      --primary-hover: #e4e4e7;
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html[data-theme="light"] {
+      --bg: #fafafa;
+      --surface: #ffffff;
+      --surface-subtle: #f4f4f5;
+      --surface-hover: #e4e4e7;
+      --border: #e4e4e7;
+      --text: #09090b;
+      --muted: #52525b;
+      --subtle: #71717a;
+      --primary-bg: #18181b;
+      --primary-text: #fafafa;
+      --primary-hover: #27272a;
+      --ok: #059669;
+      --warn: #d97706;
+      --err: #dc2626;
+      --shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Segoe UI", Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Inter", "Segoe UI", Roboto, sans-serif;
       background: var(--bg);
       color: var(--text);
+      font-size: 14px;
       line-height: 1.5;
-      padding: 24px;
+      -webkit-font-smoothing: antialiased;
+      padding: 24px 20px 48px;
     }
-    .container { max-width: 1180px; margin: 0 auto; }
-    header {
+
+    .mono, .num {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .container {
+      max-width: 980px;
+      margin: 0 auto;
+    }
+
+    /* Top Navigation Bar */
+    .topbar {
       display: flex;
       justify-content: space-between;
       align-items: center;
       flex-wrap: wrap;
       gap: 12px;
-      padding-bottom: 18px;
+      padding-bottom: 14px;
       border-bottom: 1px solid var(--border);
       margin-bottom: 20px;
     }
-    header h1 { font-size: 1.35rem; font-weight: 700; }
-    header p { color: var(--muted); font-size: 0.88rem; }
-    .badge {
+
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      color: var(--text);
+    }
+
+    .divider-v {
+      width: 1px;
+      height: 16px;
+      background: var(--border);
+    }
+
+    .main-nav {
+      display: inline-flex;
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px;
+      gap: 2px;
+    }
+
+    .tab-btn {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12.5px;
+      font-weight: 500;
+      padding: 6px 13px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: color 0.12s, background 0.12s;
+    }
+
+    .tab-btn:hover {
+      color: var(--text);
+    }
+
+    .tab-btn.active {
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-badge {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
-      padding: 8px 14px;
-      border-radius: 999px;
-      background: var(--panel);
+      gap: 7px;
+      padding: 5px 10px;
+      border-radius: 6px;
       border: 1px solid var(--border);
-      font-weight: 600;
-      font-size: 0.9rem;
+      background: var(--surface);
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--muted);
     }
-    .tabs {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 20px;
-      flex-wrap: wrap;
+
+    .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--subtle);
+      flex-shrink: 0;
     }
-    .tab-btn {
-      padding: 10px 18px;
-      border-radius: 10px;
+    .dot.ok { background: var(--ok); }
+    .dot.warn { background: var(--warn); }
+    .dot.err { background: var(--err); }
+
+    /* Buttons & Inputs */
+    .btn {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 6px 12px;
+      font-size: 12.5px;
+      font-weight: 500;
+      border-radius: 6px;
       border: 1px solid var(--border);
-      background: var(--panel);
+      background: var(--surface);
       color: var(--text);
       cursor: pointer;
-      font-weight: 600;
-      transition: all 0.15s;
+      transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+      white-space: nowrap;
     }
-    .tab-btn.active {
-      background: var(--accent);
-      color: #0f172a;
-      border-color: var(--accent);
+
+    .btn:hover:not(:disabled) {
+      background: var(--surface-hover);
     }
-    .card-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 16px;
-      margin-bottom: 20px;
+
+    .btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
-    .card {
-      background: var(--panel);
+
+    .btn-primary {
+      background: var(--primary-bg);
+      color: var(--primary-text);
+      border-color: var(--primary-bg);
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: var(--primary-hover);
+      border-color: var(--primary-hover);
+    }
+
+    .btn-danger-outline {
+      color: var(--err);
+      border-color: var(--border);
+    }
+
+    .btn-danger-outline:hover:not(:disabled) {
+      background: rgba(239, 68, 68, 0.1);
+      border-color: var(--err);
+    }
+
+    .btn-danger {
+      background: var(--err);
+      color: #ffffff;
+      border-color: var(--err);
+    }
+
+    .btn-danger:hover:not(:disabled) {
+      opacity: 0.9;
+    }
+
+    .btn-ghost {
+      border-color: transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 4px 8px;
+      font-size: 12px;
+    }
+
+    .btn-ghost:hover:not(:disabled) {
+      color: var(--text);
+      background: var(--surface-subtle);
+    }
+
+    .link-btn {
+      appearance: none;
+      border: none;
+      background: none;
+      color: var(--text);
+      font-size: 12px;
+      text-decoration: underline;
+      text-underline-offset: 3px;
+      cursor: pointer;
+      padding: 0;
+    }
+
+    .link-btn:hover {
+      color: var(--muted);
+    }
+
+    .input-text {
+      flex: 1;
+      min-width: 200px;
+      padding: 6px 10px;
+      font-size: 12.5px;
+      border-radius: 6px;
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 18px;
+      background: var(--bg);
+      color: var(--text);
+      outline: none;
     }
-    .card-title { font-size: 0.85rem; color: var(--muted); margin-bottom: 8px; }
-    .card-value { font-size: 1.65rem; font-weight: 700; margin-bottom: 4px; }
-    .card-sub { font-size: 0.8rem; color: var(--muted); }
-    .progress-box, .env-panel, .failure-panel {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 18px;
-      margin-bottom: 20px;
+
+    .input-text:focus {
+      border-color: var(--muted);
     }
-    .progress-header {
+
+    /* Source Context Banner */
+    .source-context {
       display: flex;
       justify-content: space-between;
-      font-size: 0.9rem;
-      margin-bottom: 8px;
-    }
-    .progress-bar-bg {
-      width: 100%;
-      height: 12px;
-      background: #0f172a;
-      border-radius: 999px;
-      overflow: hidden;
-    }
-    .progress-bar-fill {
-      height: 100%;
-      width: 0%;
-      background: linear-gradient(90deg, var(--accent), var(--green));
-      transition: width 0.25s ease;
-    }
-    .controls {
-      display: flex;
+      align-items: flex-start;
+      gap: 16px;
       flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 20px;
-    }
-    button.btn {
-      padding: 10px 16px;
-      border-radius: 10px;
+      padding: 14px 16px;
+      background: var(--surface);
       border: 1px solid var(--border);
-      background: var(--panel);
-      color: var(--text);
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.15s;
+      border-radius: 6px;
+      margin-bottom: 14px;
     }
-    button.btn:hover { background: var(--panel-hover); }
-    button.btn-primary { background: var(--green); color: #052e16; border-color: var(--green); }
-    button.btn-amber { background: var(--amber); color: #451a03; border-color: var(--amber); }
-    button.btn-danger { background: var(--red); color: #fff; border-color: var(--red); }
-    .env-summary-row {
+
+    .source-context-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 3px;
+    }
+
+    .source-context-desc {
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+
+    .source-auth-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 4px;
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--text);
+      white-space: nowrap;
+    }
+
+    /* Takeout-Specific Archive Panel */
+    .takeout-panel {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 16px;
+      margin-bottom: 14px;
+    }
+
+    .takeout-panel.active {
+      display: block;
+    }
+
+    .takeout-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 14px;
+    }
+
+    @media (max-width: 760px) {
+      .takeout-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .takeout-box {
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 14px;
+    }
+
+    .box-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+
+    .box-help {
+      font-size: 11.5px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .path-form {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .upload-dropzone {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 12px;
+      border: 1px dashed var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+      cursor: pointer;
+      transition: border-color 0.12s;
+    }
+
+    .upload-dropzone:hover, .upload-dropzone.dragover {
+      border-color: var(--text);
+    }
+
+    .upload-status {
+      font-size: 12px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .archive-list-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
-    }
-    .env-pills {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      font-size: 0.82rem;
+      font-size: 12px;
       color: var(--muted);
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
     }
-    .env-pill {
-      padding: 4px 10px;
-      border-radius: 999px;
-      background: #0f172a;
-      border: 1px solid var(--border);
-    }
-    .failure-list {
-      margin-top: 10px;
-      font-size: 0.82rem;
-      color: #fca5a5;
-      max-height: 140px;
+
+    .archive-list {
+      max-height: 130px;
       overflow-y: auto;
+      font-size: 12.5px;
     }
-    .failure-item {
+
+    .archive-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
       padding: 6px 0;
       border-bottom: 1px solid var(--border);
     }
-    .failure-item:last-child { border-bottom: none; }
-    .console-box {
-      background: #020617;
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 16px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.82rem;
-      height: 280px;
-      overflow-y: auto;
+
+    .archive-row:last-child {
+      border-bottom: none;
     }
-    .log-line { margin-bottom: 4px; color: #cbd5e1; }
-    .log-time { color: #64748b; margin-right: 8px; }
+
+    /* Action & Progress Bar */
+    .control-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      margin-bottom: 14px;
+    }
+
+    .control-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 16px;
+      flex-wrap: wrap;
+    }
+
+    .status-info {
+      flex: 1;
+      min-width: 220px;
+      overflow: hidden;
+    }
+
+    .current-task {
+      font-size: 13.5px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 2px;
+    }
+
+    .progress-meta {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .action-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .cloud-delete-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .progress-track {
+      width: 100%;
+      height: 3px;
+      background: var(--surface-subtle);
+    }
+
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--text);
+      transition: width 0.2s ease;
+    }
+
+    /* 4-Column Inline Metric Strip */
+    .metric-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 14px;
+      overflow: hidden;
+    }
+
+    @media (max-width: 720px) {
+      .metric-strip {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    .metric-cell {
+      padding: 14px 16px;
+      border-right: 1px solid var(--border);
+    }
+
+    .metric-cell:last-child {
+      border-right: none;
+    }
+
+    .metric-label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .metric-value {
+      font-size: 20px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      color: var(--text);
+      margin-bottom: 2px;
+    }
+
+    .metric-sub {
+      font-size: 12px;
+      color: var(--subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    /* Bottom Viewer (Logs & Failures) */
+    .viewer-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .viewer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface-subtle);
+    }
+
+    .viewer-tabs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .vtab-btn {
+      appearance: none;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12.5px;
+      font-weight: 500;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .vtab-btn:hover {
+      color: var(--text);
+    }
+
+    .vtab-btn.active {
+      background: var(--surface);
+      color: var(--text);
+      border-color: var(--border);
+    }
+
+    .count-pill {
+      font-size: 11px;
+      padding: 0 6px;
+      border-radius: 999px;
+      background: var(--surface-hover);
+      color: var(--muted);
+    }
+
+    .count-pill.has-error {
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--err);
+    }
+
+    .viewer-body {
+      height: 290px;
+      overflow-y: auto;
+      padding: 12px 14px;
+      font-size: 12.5px;
+    }
+
+    .log-line {
+      padding: 2px 0;
+      color: var(--text);
+      word-break: break-all;
+    }
+
+    .log-time {
+      color: var(--subtle);
+      margin-right: 10px;
+      user-select: none;
+    }
+
+    .failure-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .failure-row:last-child {
+      border-bottom: none;
+    }
+
+    .failure-path {
+      font-weight: 500;
+      color: var(--text);
+      margin-bottom: 2px;
+      word-break: break-all;
+    }
+
+    .failure-err {
+      color: var(--err);
+      font-size: 12px;
+    }
+
+    .failure-meta {
+      color: var(--subtle);
+      font-size: 11.5px;
+      white-space: nowrap;
+    }
+
+    .empty-state {
+      color: var(--subtle);
+      padding: 20px 0;
+      text-align: center;
+      font-size: 12.5px;
+    }
+
+    /* Dedicated Settings Tab View */
+    .settings-view {
+      display: none;
+    }
+
+    .settings-view.active {
+      display: block;
+    }
+
+    .settings-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 16px;
+      overflow: hidden;
+    }
+
+    .settings-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface-subtle);
+    }
+
+    .settings-card-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .settings-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    .settings-table th,
+    .settings-table td {
+      text-align: left;
+      padding: 11px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .settings-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .settings-table th {
+      width: 220px;
+      color: var(--muted);
+      font-weight: 500;
+      background: var(--surface);
+    }
+
+    /* Modal */
     .modal-backdrop {
       display: none;
       position: fixed;
       inset: 0;
-      background: rgba(2, 6, 23, 0.78);
+      background: rgba(0, 0, 0, 0.6);
       align-items: center;
       justify-content: center;
       z-index: 50;
     }
+
     .modal {
-      background: var(--panel);
+      background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      max-width: 480px;
+      border-radius: 6px;
+      max-width: 440px;
       width: 92%;
-      padding: 22px;
+      padding: 20px;
+      box-shadow: var(--shadow);
     }
-    .modal h3 { margin-bottom: 10px; }
-    .modal p { color: var(--muted); font-size: 0.9rem; margin-bottom: 18px; }
+
+    .modal h3 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .modal p {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 18px;
+      line-height: 1.55;
+    }
+
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
   </style>
 </head>
 <body>
   <div class="container">
-    <header>
-      <div>
-        <h1>TrueNAS SCALE 멀티 클라우드 → NAS 이주 엔진</h1>
-        <p>네이버 MYBOX · Google Drive · Google Takeout → Immich(사진/영상) & Nextcloud(문서/일반파일)</p>
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="brand">Cloud Prism</span>
+        <span class="divider-v"></span>
+        <nav class="main-nav" aria-label="주요 메뉴">
+          <button class="tab-btn active" data-tab="mybox" onclick="selectMainTab('mybox', this)">네이버 MYBOX</button>
+          <button class="tab-btn" data-tab="gdrive" onclick="selectMainTab('gdrive', this)">Google Drive</button>
+          <button class="tab-btn" data-tab="takeout" onclick="selectMainTab('takeout', this)">Google Takeout</button>
+          <button class="tab-btn" data-tab="settings" onclick="selectMainTab('settings', this)">환경 설정</button>
+        </nav>
       </div>
-      <div id="jobStatusBadge" class="badge">⚪ 대기 중 (Idle)</div>
+      <div class="topbar-right">
+        <div id="jobStatusBadge" class="status-badge">
+          <span id="jobStatusDot" class="dot"></span>
+          <span id="jobStatusText">대기 중</span>
+        </div>
+        <button class="btn" id="themeToggleBtn" onclick="toggleTheme()" aria-label="테마 전환">테마</button>
+      </div>
     </header>
 
-    <div class="tabs">
-      <button class="tab-btn active" onclick="selectSource('mybox', this)">📦 네이버 MYBOX</button>
-      <button class="tab-btn" onclick="selectSource('gdrive', this)">☁️ Google Drive</button>
-      <button class="tab-btn" onclick="selectSource('takeout', this)">🗂️ Google Takeout</button>
-    </div>
-
-    <div class="env-panel">
-      <div class="env-summary-row">
+    <!-- 소스별 작업 워크스페이스 뷰 (MYBOX / Google Drive / Google Takeout) -->
+    <main id="workspaceView">
+      <section id="sourceContextPanel" class="source-context">
         <div>
-          <strong style="font-size:0.95rem;">🔧 TrueNAS SCALE 앱 환경변수 구성 상태</strong>
-          <div id="envPills" class="env-pills" style="margin-top:8px;">
-            <span class="env-pill">환경변수 상태 불러오는 중...</span>
+          <div id="sourceContextTitle" class="source-context-title">네이버 MYBOX 원격 클라우드 동기화</div>
+          <div id="sourceContextDesc" class="source-context-desc">
+            MYBOX 폴더 트리를 증분 스캔하여 사진·영상은 Immich로, 일반 문서는 Nextcloud로 이주합니다.
           </div>
         </div>
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-          <button class="btn" onclick="testConnections()">🔌 전체 연결 테스트</button>
-          <span id="connTestOutput" style="font-size:0.85rem;color:var(--muted);"></span>
+        <div id="sourceAuthBadge" class="source-auth-pill">
+          <span id="sourceAuthDot" class="dot"></span>
+          <span id="sourceAuthText">상태 확인 중...</span>
         </div>
-      </div>
-    </div>
+      </section>
 
-    <div class="progress-box">
-      <div class="progress-header">
-        <span id="currentFileLabel">대기 중 — 실행할 작업을 선택하세요</span>
-        <span id="progressMeta">0% (0.0 파일/초)</span>
-      </div>
-      <div class="progress-bar-bg">
-        <div id="progressBar" class="progress-bar-fill"></div>
-      </div>
-    </div>
-
-    <div class="card-grid">
-      <div class="card">
-        <div class="card-title">스캔 / 대기 중 (PENDING)</div>
-        <div id="statPending" class="card-value">0건</div>
-        <div id="statFolders" class="card-sub">스캔 완료 폴더: 0개 (0 B)</div>
-      </div>
-      <div class="card">
-        <div class="card-title">📸 Immich 이주 완료 (UPLOADED)</div>
-        <div id="statImmich" class="card-value">0건</div>
-        <div id="statImmichSub" class="card-sub">신규: 0 / 중복 스킵: 0</div>
-      </div>
-      <div class="card">
-        <div class="card-title">📁 Nextcloud 이주 완료 (UPLOADED)</div>
-        <div id="statNextcloud" class="card-value">0건</div>
-        <div id="statNextcloudSub" class="card-sub">이주 용량 합계: 0 B</div>
-      </div>
-      <div class="card">
-        <div class="card-title">🗑️ 원격 삭제 완료 & ⚠️ 실패</div>
-        <div id="statDeletedFailed" class="card-value">0 / 0</div>
-        <div class="card-sub">
-          <span id="statDeletedBytes" style="margin-right:6px;">절감: 0 B</span>
-          <button class="btn" style="padding:3px 8px;font-size:0.75rem;margin-top:4px;" onclick="retryFailed()">🔄 실패 항목 재시도</button>
+      <!-- Google Takeout 탭 전용: 경로 지정 + ZIP 업로드 + 아카이브 목록 -->
+      <section id="takeoutArchivePanel" class="takeout-panel">
+        <div class="takeout-grid">
+          <div class="takeout-box">
+            <div class="box-label">1. 서버 내 Takeout 폴더 경로 지정</div>
+            <div class="box-help">NAS/서버에 이미 다운로드된 Google Takeout ZIP 폴더 경로를 입력합니다.</div>
+            <div class="path-form">
+              <input id="takeoutDirInput" type="text" class="input-text mono" placeholder="/data/takeout" />
+              <button class="btn" onclick="saveTakeoutPath()">경로 적용</button>
+            </div>
+          </div>
+          <div class="takeout-box">
+            <div class="box-label">2. 브라우저에서 Takeout ZIP 직접 업로드</div>
+            <div class="box-help">내 PC의 takeout-*.zip 파일을 선택하거나 끌어다 놓으면 위 경로로 즉시 업로드됩니다.</div>
+            <div id="zipDropzone" class="upload-dropzone" onclick="document.getElementById('zipFileInput').click()">
+              <span id="zipUploadStatus" class="upload-status">클릭하거나 .zip 파일을 이곳에 드롭하세요</span>
+              <span class="btn" style="padding:3px 8px;font-size:11.5px;">파일 선택</span>
+              <input id="zipFileInput" type="file" accept=".zip" multiple style="display:none;" onchange="handleZipFileSelect(this.files)" />
+            </div>
+          </div>
         </div>
+        <div>
+          <div class="archive-list-header">
+            <span>인식된 Takeout ZIP 아카이브 목록</span>
+            <span id="takeoutArchiveSummary" class="num">0개 · 0 B</span>
+          </div>
+          <div id="takeoutArchiveList" class="archive-list mono">
+            <div class="empty-state">지정된 폴더에 인식된 .zip 아카이브가 없습니다.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 명시적 작업 제어 바 (드롭다운 없이 소스 성격에 맞는 버튼 바로 노출) -->
+      <section class="control-panel">
+        <div class="control-row">
+          <div class="status-info">
+            <div id="currentFileLabel" class="current-task">대기 중 — 실행할 작업을 선택하세요</div>
+            <div id="progressMeta" class="progress-meta num">0% · 0.0 파일/초</div>
+          </div>
+          <div class="action-toolbar">
+            <button id="primaryActionBtn" class="btn btn-primary" onclick="handlePrimaryAction()">스캔 + 동기화 시작</button>
+            <button id="scanOnlyBtn" class="btn job-trigger" onclick="startJob('scan', false)">스캔만</button>
+            <button id="syncOnlyBtn" class="btn job-trigger" onclick="startJob('sync', false)">동기화만</button>
+            <div id="cloudDeleteGroup" class="cloud-delete-group">
+              <span class="divider-v" style="margin: 0 4px;"></span>
+              <button class="btn job-trigger" onclick="startJob('delete', true)">원격 삭제 Dry-run</button>
+              <button class="btn btn-danger-outline job-trigger" onclick="openDeleteModal()">휴지통 이동</button>
+            </div>
+          </div>
+        </div>
+        <div class="progress-track">
+          <div id="progressBar" class="progress-fill"></div>
+        </div>
+      </section>
+
+      <!-- 4열 인라인 메트릭 스트립 -->
+      <section id="metricStrip" class="metric-strip">
+        <div class="metric-cell">
+          <div id="metricPendingLabel" class="metric-label">대기 중 (Pending)</div>
+          <div id="statPending" class="metric-value num">0</div>
+          <div class="metric-sub">
+            <span id="statFolders" class="num">폴더 0개 · 0 B</span>
+          </div>
+        </div>
+        <div class="metric-cell">
+          <div class="metric-label">Immich 완료</div>
+          <div id="statImmich" class="metric-value num">0</div>
+          <div class="metric-sub">
+            <span id="statImmichSub" class="num">신규 0 · 중복 0</span>
+          </div>
+        </div>
+        <div class="metric-cell">
+          <div class="metric-label">Nextcloud 완료</div>
+          <div id="statNextcloud" class="metric-value num">0</div>
+          <div class="metric-sub">
+            <span id="statNextcloudSub" class="num">누적 0 B</span>
+          </div>
+        </div>
+        <div class="metric-cell">
+          <div id="metricFourthLabel" class="metric-label">원격 삭제 · 실패</div>
+          <div id="statDeletedFailed" class="metric-value num">0 / 0</div>
+          <div class="metric-sub">
+            <span id="statDeletedBytes" class="num">절감 0 B</span>
+            <button id="inlineRetryBtn" class="link-btn" style="display:none;" onclick="retryFailed()">재시도</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 하단 실시간 로그 / 실패 목록 탭 -->
+      <section class="viewer-panel">
+        <div class="viewer-header">
+          <div id="viewerTabs" class="viewer-tabs">
+            <button id="tabLogsBtn" class="vtab-btn active" onclick="switchViewerTab('logs')">실시간 로그</button>
+            <button id="tabFailuresBtn" class="vtab-btn" onclick="switchViewerTab('failures')">
+              실패 항목
+              <span id="failureCountBadge" class="count-pill num">0</span>
+            </button>
+          </div>
+          <div>
+            <button id="clearLogsBtn" class="btn btn-ghost" onclick="clearLogs()">로그 지우기</button>
+            <button id="retryAllBtn" class="btn btn-ghost" style="display:none;" onclick="retryFailed()">실패 항목 전체 재시도</button>
+          </div>
+        </div>
+        <div id="logConsole" class="viewer-body mono">
+          <div class="log-line"><span class="log-time">[시스템]</span>대시보드 연결됨. 실시간 이벤트 스트림 수신 대기 중.</div>
+        </div>
+        <div id="failureView" class="viewer-body" style="display:none;">
+          <div id="failureList"></div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 환경 설정 전용 탭 뷰 -->
+    <section id="settingsView" class="settings-view">
+      <div class="settings-card">
+        <div class="settings-card-header">
+          <span class="settings-card-title">데이터 소스 및 타겟 서버 연결 진단</span>
+          <button class="btn btn-primary" onclick="testConnections()">전체 연결 테스트 실행</button>
+        </div>
+        <table class="settings-table">
+          <tbody id="settingsSourceTargetBody">
+            <tr><th>상태</th><td>환경 정보를 불러오는 중...</td></tr>
+          </tbody>
+        </table>
       </div>
-    </div>
 
-    <div id="failurePanel" class="failure-panel" style="display:none;">
-      <strong style="font-size:0.9rem;color:#f87171;">⚠️ 최근 실패 파일 목록 (최대 20건)</strong>
-      <div id="failureList" class="failure-list"></div>
-    </div>
-
-    <div class="controls">
-      <button class="btn btn-primary" onclick="startJob('auto', false)">▶️ 원클릭 스캔 & 동기화 시작</button>
-      <button class="btn" onclick="startJob('scan', false)">🔍 스캔만 실행</button>
-      <button class="btn" onclick="startJob('sync', false)">🚀 동기화만 실행</button>
-      <button class="btn btn-amber" onclick="stopJob()">⏸️ 일시정지 (안전 중단)</button>
-      <button class="btn" onclick="startJob('delete', true)">🧪 원격 삭제 시뮬레이션 (Dry-Run)</button>
-      <button class="btn btn-danger" onclick="openDeleteModal()">🗑️ 완료 항목 원격 삭제 (휴지통 이동)</button>
-    </div>
-
-    <div class="console-box" id="logConsole">
-      <div class="log-line"><span class="log-time">[시스템]</span>대시보드가 준비되었습니다. 실시간 SSE 스트림에 연결 중...</div>
-    </div>
+      <div class="settings-card">
+        <div class="settings-card-header">
+          <span class="settings-card-title">파이프라인 실행 파라미터 (환경변수 기준)</span>
+        </div>
+        <table class="settings-table">
+          <tbody id="settingsEngineBody">
+            <tr><th>상태</th><td>환경 정보를 불러오는 중...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
   </div>
 
+  <!-- 원격 삭제 확인 모달 -->
   <div class="modal-backdrop" id="deleteModal">
     <div class="modal">
-      <h3>🗑️ 완료 항목 원격 삭제 (휴지통 이동)</h3>
-      <p>이미 Immich 또는 Nextcloud로 이주가 완료(`UPLOADED`)된 파일만 대상이 되며, 삭제 직전 타겟 서버에 해시/크기가 존재하는지 100% 재검증한 뒤 원격 클라우드 휴지통으로 이동합니다. 계속하시겠습니까?</p>
-      <div style="display:flex;gap:10px;justify-content:flex-end;">
+      <h3>완료 항목 원격 삭제 (휴지통 이동)</h3>
+      <p>Immich 또는 Nextcloud로 이주가 완료(UPLOADED)된 파일만 대상이 되며, 삭제 직전 타겟 서버에 파일이 존재하는지 재검증한 뒤 원격 클라우드 휴지통으로 이동합니다. 계속하시겠습니까?</p>
+      <div class="modal-actions">
         <button class="btn" onclick="closeDeleteModal()">취소</button>
         <button class="btn btn-danger" onclick="confirmDelete()">재검증 후 휴지통 이동 실행</button>
       </div>
@@ -294,8 +940,102 @@
   </div>
 
   <script>
+    let currentTab = 'mybox';
     let currentSource = 'mybox';
+    let currentJobState = 'idle';
     let initialLogsLoaded = false;
+    let lastStatusData = null;
+    let lastConnectionResults = {};
+
+    const SOURCE_META = {
+      mybox: {
+        title: '네이버 MYBOX 원격 클라우드 동기화',
+        desc: 'MYBOX 폴더 트리를 증분 스캔하여 사진·영상은 Immich로, 일반 문서는 Nextcloud로 이주합니다. 완료된 항목은 재검증 후 원격 휴지통으로 정리할 수 있습니다.',
+        primaryIdleLabel: '스캔 + 동기화 시작',
+        scanLabel: '스캔만',
+        supportsRemoteDelete: true
+      },
+      gdrive: {
+        title: 'Google Drive 클라우드 동기화',
+        desc: 'Google Drive v3 API를 통해 폴더 구조와 파일 체크섬을 스캔하고 Immich · Nextcloud로 이주합니다. 완료된 항목은 재검증 후 Drive 휴지통으로 이동할 수 있습니다.',
+        primaryIdleLabel: '스캔 + 동기화 시작',
+        scanLabel: '스캔만',
+        supportsRemoteDelete: true
+      },
+      takeout: {
+        title: 'Google Takeout ZIP 아카이브 추출 및 메타데이터 매칭',
+        desc: '지정된 폴더 또는 업로드된 Takeout .zip 압축파일 내부의 미디어와 동반 .json 메타데이터(photoTakenTime)를 매칭하여 원본 촬영일시를 보존한 채 이주합니다.',
+        primaryIdleLabel: 'ZIP 스캔 + 이주 시작',
+        scanLabel: 'ZIP 목록 스캔만',
+        supportsRemoteDelete: false
+      }
+    };
+
+    function updateThemeButtonLabel() {
+      const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+      const btn = document.getElementById('themeToggleBtn');
+      if (btn) btn.textContent = theme === 'dark' ? 'Light' : 'Dark';
+    }
+
+    function toggleTheme() {
+      const current = document.documentElement.getAttribute('data-theme') || 'dark';
+      const next = current === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('cp_theme', next);
+      updateThemeButtonLabel();
+    }
+
+    function selectMainTab(tab, btn) {
+      currentTab = tab;
+      document.querySelectorAll('.main-nav .tab-btn').forEach(b => b.classList.remove('active'));
+      if (btn) btn.classList.add('active');
+
+      const workspace = document.getElementById('workspaceView');
+      const settings = document.getElementById('settingsView');
+
+      if (tab === 'settings') {
+        workspace.style.display = 'none';
+        settings.classList.add('active');
+        fetchStatus();
+      } else {
+        currentSource = tab;
+        settings.classList.remove('active');
+        workspace.style.display = 'block';
+        applySourceLayout(currentSource);
+        fetchStatus();
+      }
+    }
+
+    function applySourceLayout(src) {
+      const meta = SOURCE_META[src] || SOURCE_META.mybox;
+      document.getElementById('sourceContextTitle').textContent = meta.title;
+      document.getElementById('sourceContextDesc').textContent = meta.desc;
+      document.getElementById('scanOnlyBtn').textContent = meta.scanLabel;
+
+      const isTakeout = src === 'takeout';
+      document.getElementById('takeoutArchivePanel').classList.toggle('active', isTakeout);
+      document.getElementById('cloudDeleteGroup').style.display = meta.supportsRemoteDelete ? 'inline-flex' : 'none';
+      document.getElementById('metricPendingLabel').textContent = isTakeout ? '추출 대기 미디어 (Pending)' : '대기 중 (Pending)';
+      document.getElementById('metricFourthLabel').textContent = isTakeout ? '실패 항목 (원본 ZIP 보존)' : '원격 삭제 · 실패';
+
+      if (currentJobState === 'idle') {
+        document.getElementById('primaryActionBtn').textContent = meta.primaryIdleLabel;
+      }
+    }
+
+    function switchViewerTab(tab) {
+      const isLogs = tab === 'logs';
+      document.getElementById('tabLogsBtn').classList.toggle('active', isLogs);
+      document.getElementById('tabFailuresBtn').classList.toggle('active', !isLogs);
+      document.getElementById('logConsole').style.display = isLogs ? 'block' : 'none';
+      document.getElementById('failureView').style.display = isLogs ? 'none' : 'block';
+      document.getElementById('clearLogsBtn').style.display = isLogs ? 'inline-flex' : 'none';
+      document.getElementById('retryAllBtn').style.display = !isLogs ? 'inline-flex' : 'none';
+    }
+
+    function clearLogs() {
+      document.getElementById('logConsole').innerHTML = '';
+    }
 
     function formatBytes(bytes) {
       const b = Number(bytes) || 0;
@@ -310,95 +1050,299 @@
       const spd = Number(speedFps) || 0;
       if (rem <= 0 || spd <= 0.01) return '';
       const secs = Math.round(rem / spd);
-      if (secs < 60) return ` · 남은 시간 약 ${secs}초`;
+      if (secs < 60) return ` · 남은 시간 ${secs}초`;
       const mins = Math.floor(secs / 60);
       const remSecs = secs % 60;
-      return ` · 남은 시간 약 ${mins}분 ${remSecs}초`;
-    }
-
-    function selectSource(src, btn) {
-      currentSource = src;
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      fetchStatus();
+      return ` · 남은 시간 ${mins}분 ${remSecs}초`;
     }
 
     function appendLog(time, msg) {
       const box = document.getElementById('logConsole');
       const div = document.createElement('div');
       div.className = 'log-line';
-      div.innerHTML = `<span class="log-time">[${time}]</span>${msg}`;
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'log-time';
+      timeSpan.textContent = `[${time}]`;
+      div.appendChild(timeSpan);
+      div.appendChild(document.createTextNode(msg));
       box.appendChild(div);
       box.scrollTop = box.scrollHeight;
     }
 
     async function testConnections() {
-      const out = document.getElementById('connTestOutput');
-      out.textContent = '연결 테스트 중...';
-      const res = await fetch('/api/connections/test', {
-        method: 'POST'
+      try {
+        const res = await fetch('/api/connections/test', { method: 'POST' });
+        const data = await res.json();
+        lastConnectionResults = data.results || {};
+        const parts = [];
+        for (const [k, v] of Object.entries(lastConnectionResults)) {
+          parts.push(`${k}: ${v.ok ? '정상' : '실패'} (${v.message})`);
+        }
+        appendLog(new Date().toLocaleTimeString(), '연결 테스트: ' + (parts.join(' · ') || '설정된 항목 없음'));
+        if (lastStatusData) renderSettingsTables(lastStatusData);
+      } catch (_) {}
+    }
+
+    async function saveTakeoutPath() {
+      const input = document.getElementById('takeoutDirInput');
+      const takeout_dir = (input.value || '').trim();
+      if (!takeout_dir) return;
+      const res = await fetch('/api/takeout/path', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ takeout_dir })
       });
       const data = await res.json();
-      const parts = [];
-      for (const [k, v] of Object.entries(data.results || {})) {
-        parts.push(`${v.ok ? '✅' : '❌'} ${k}: ${v.message}`);
+      if (!res.ok) {
+        appendLog(new Date().toLocaleTimeString(), `Takeout 경로 오류: ${data.error || '변경 실패'}`);
+        return;
       }
-      out.textContent = parts.length > 0 ? parts.join(' | ') : '설정된 소스/타겟 환경변수가 없습니다.';
-      appendLog(new Date().toLocaleTimeString(), '🔌 연결 테스트 결과: ' + out.textContent);
+      fetchStatus();
+    }
+
+    async function handleZipFileSelect(fileList) {
+      if (!fileList || fileList.length === 0) return;
+      const statusEl = document.getElementById('zipUploadStatus');
+      for (let i = 0; i < fileList.length; i++) {
+        const file = fileList[i];
+        statusEl.textContent = `업로드 중 (${i + 1}/${fileList.length}): ${file.name} (${formatBytes(file.size)})...`;
+        try {
+          const res = await fetch(`/api/takeout/upload?filename=${encodeURIComponent(file.name)}`, {
+            method: 'POST',
+            body: file
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            statusEl.textContent = `업로드 실패: ${data.error || file.name}`;
+            return;
+          }
+        } catch (err) {
+          statusEl.textContent = `업로드 중 네트워크 오류: ${file.name}`;
+          return;
+        }
+      }
+      statusEl.textContent = `업로드 완료 (${fileList.length}개 파일). 클릭하여 추가 업로드`;
+      document.getElementById('zipFileInput').value = '';
+      fetchStatus();
+    }
+
+    const dropzone = document.getElementById('zipDropzone');
+    if (dropzone) {
+      dropzone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropzone.classList.add('dragover');
+      });
+      dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+      dropzone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropzone.classList.remove('dragover');
+        if (e.dataTransfer && e.dataTransfer.files) {
+          handleZipFileSelect(e.dataTransfer.files);
+        }
+      });
     }
 
     async function fetchStatus() {
-      const res = await fetch(`/api/status?source=${currentSource}`);
-      if (!res.ok) return;
-      const d = await res.json();
-      renderStatus(d);
+      try {
+        const res = await fetch(`/api/status?source=${currentSource}`);
+        if (!res.ok) return;
+        const d = await res.json();
+        lastStatusData = d;
+        renderStatus(d);
+      } catch (_) {}
+    }
+
+    function renderSourceAuthBadge(d) {
+      const c = d.config_summary || {};
+      const t = d.takeout_info || {};
+      const dot = document.getElementById('sourceAuthDot');
+      const text = document.getElementById('sourceAuthText');
+      dot.className = 'dot';
+
+      if (currentSource === 'mybox') {
+        if (c.mybox_configured) {
+          dot.classList.add('ok');
+          text.textContent = 'MYBOX PAT 토큰 설정됨';
+        } else {
+          dot.classList.add('warn');
+          text.textContent = 'MYBOX PAT 미설정 (환경 설정 탭 확인)';
+        }
+      } else if (currentSource === 'gdrive') {
+        if (c.gdrive_configured) {
+          dot.classList.add('ok');
+          text.textContent = 'Google Drive 토큰 설정됨';
+        } else {
+          dot.classList.add('warn');
+          text.textContent = 'Google Drive 토큰 미설정 (환경 설정 탭 확인)';
+        }
+      } else if (currentSource === 'takeout') {
+        const archives = t.archives || [];
+        if (archives.length > 0) {
+          dot.classList.add('ok');
+          text.textContent = `ZIP 아카이브 ${archives.length}개 준비됨`;
+        } else {
+          dot.classList.add('warn');
+          text.textContent = '인식된 ZIP 파일 없음 (경로 지정 또는 업로드 필요)';
+        }
+      }
+    }
+
+    function renderTakeoutPanel(d) {
+      const t = d.takeout_info || {};
+      const dirInput = document.getElementById('takeoutDirInput');
+      if (dirInput && document.activeElement !== dirInput && t.dir) {
+        dirInput.value = t.dir;
+      }
+
+      const archives = t.archives || [];
+      const totalBytes = archives.reduce((acc, a) => acc + (Number(a.size_bytes) || 0), 0);
+      document.getElementById('takeoutArchiveSummary').textContent = `${archives.length}개 · ${formatBytes(totalBytes)}`;
+
+      const listEl = document.getElementById('takeoutArchiveList');
+      if (archives.length > 0) {
+        listEl.innerHTML = archives.map(a => `
+          <div class="archive-row">
+            <span>${a.name}</span>
+            <span class="num" style="color:var(--muted);">${formatBytes(a.size_bytes)}</span>
+          </div>
+        `).join('');
+      } else {
+        listEl.innerHTML = '<div class="empty-state">지정된 폴더에 인식된 .zip 아카이브가 없습니다.</div>';
+      }
+    }
+
+    function formatConnBadge(key) {
+      const r = lastConnectionResults[key];
+      if (!r) return '';
+      return ` · <span style="color:${r.ok ? 'var(--ok)' : 'var(--err)'}">${r.ok ? '연결 정상' : '연결 실패'}: ${r.message}</span>`;
+    }
+
+    function renderSettingsTables(d) {
+      const c = d.config_summary || {};
+      const t = d.takeout_info || {};
+      const archives = t.archives || [];
+
+      const ncDesc = !c.enable_nextcloud
+        ? '<span class="dot"></span> 비활성화됨'
+        : (c.nextcloud_configured
+            ? `<span class="dot ok"></span> 설정됨 (업로드 경로: <span class="mono">${c.nextcloud_base_dir}</span>)`
+            : '<span class="dot warn"></span> 인증정보 누락');
+
+      const stRows = [
+        ['네이버 MYBOX', `<span class="dot ${c.mybox_configured ? 'ok' : 'warn'}"></span> ${c.mybox_configured ? 'PAT 토큰 설정됨' : '미설정 (MYBOX_PAT 환경변수 필요)'}${formatConnBadge('mybox')}`],
+        ['Google Drive', `<span class="dot ${c.gdrive_configured ? 'ok' : 'warn'}"></span> ${c.gdrive_configured ? 'OAuth 액세스 토큰 설정됨' : '미설정 (GDRIVE_ACCESS_TOKEN 환경변수 필요)'}${formatConnBadge('gdrive')}`],
+        ['Google Takeout', `<span class="dot ${archives.length > 0 ? 'ok' : ''}"></span> 경로: <span class="mono">${t.dir || c.takeout_dir || '-'}</span> (ZIP ${archives.length}개)${formatConnBadge('takeout')}`],
+        ['Immich (사진·영상 타겟)', `<span class="dot ${c.immich_configured ? 'ok' : 'warn'}"></span> ${c.immich_configured ? 'URL 및 API Key 설정됨' : '미설정 (IMMICH_URL / IMMICH_API_KEY 필요)'}${formatConnBadge('immich')}`],
+        ['Nextcloud (문서·일반 타겟)', `${ncDesc}${formatConnBadge('nextcloud')}`]
+      ];
+
+      document.getElementById('settingsSourceTargetBody').innerHTML = stRows
+        .map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`)
+        .join('');
+
+      const engineRows = [
+        ['동시 처리 워커 (CONCURRENCY)', `<span class="mono">${c.concurrency || 3}개</span>`],
+        ['API 요청 속도 제한 (RATE_LIMIT_RPS)', `<span class="mono">${c.rate_limit_rps || 5} RPS</span>`],
+        ['자동 증분 동기화 주기 (SYNC_INTERVAL_MINUTES)', c.sync_interval_minutes > 0 ? `<span class="mono">${c.sync_interval_minutes}분 주기</span>` : '수동 실행 전용 (0)']
+      ];
+
+      document.getElementById('settingsEngineBody').innerHTML = engineRows
+        .map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`)
+        .join('');
     }
 
     function renderStatus(d) {
-      const badge = document.getElementById('jobStatusBadge');
       const st = d.state || 'idle';
-      if (st === 'idle') badge.textContent = '⚪ 대기 중 (Idle)';
-      else if (st === 'scanning') badge.textContent = `🟢 [${d.active_source || currentSource}] 스캔 진행 중...`;
-      else if (st === 'syncing') badge.textContent = `🟢 [${d.active_source || currentSource}] 동기화 진행 중...`;
-      else if (st === 'deleting') badge.textContent = `🟠 [${d.active_source || currentSource}] 원격 삭제 진행 중...`;
-      else if (st === 'stopping') badge.textContent = '🟠 안전 정지 중...';
+      currentJobState = st;
 
-      if (d.config_summary) {
-        const c = d.config_summary;
-        const pills = [
-          `MYBOX: ${c.mybox_configured ? '✅ 설정됨' : '⚪ 미설정'}`,
-          `GDrive: ${c.gdrive_configured ? '✅ 설정됨' : '⚪ 미설정'}`,
-          `Takeout: ${c.takeout_dir}`,
-          `Immich: ${c.immich_configured ? '✅ 설정됨' : '⚪ 미설정'}`,
-          `Nextcloud: ${c.enable_nextcloud ? (c.nextcloud_configured ? `✅ 설정됨 (${c.nextcloud_base_dir})` : '⚠️ 인증정보 누락') : '⚪ 비활성화'}`,
-          `워커: ${c.concurrency}개 / ${c.rate_limit_rps} RPS`,
-          `자동 동기화: ${c.sync_interval_minutes > 0 ? `⏱️ ${c.sync_interval_minutes}분 주기` : '⚪ 수동 전용'}`
-        ];
-        document.getElementById('envPills').innerHTML = pills.map(p => `<span class="env-pill">${p}</span>`).join('');
+      const dot = document.getElementById('jobStatusDot');
+      const text = document.getElementById('jobStatusText');
+      const primaryBtn = document.getElementById('primaryActionBtn');
+      const triggers = document.querySelectorAll('.job-trigger');
+      const meta = SOURCE_META[currentSource] || SOURCE_META.mybox;
+
+      dot.className = 'dot';
+      const activeSrc = d.active_source || currentSource;
+
+      if (st === 'idle') {
+        text.textContent = '대기 중';
+        primaryBtn.textContent = meta.primaryIdleLabel;
+        primaryBtn.disabled = false;
+        triggers.forEach(b => b.disabled = false);
+      } else if (st === 'scanning') {
+        dot.classList.add('ok');
+        text.textContent = `${activeSrc} · 스캔 중`;
+        primaryBtn.textContent = '일시정지';
+        primaryBtn.disabled = false;
+        triggers.forEach(b => b.disabled = true);
+      } else if (st === 'syncing') {
+        dot.classList.add('ok');
+        text.textContent = `${activeSrc} · 동기화 중`;
+        primaryBtn.textContent = '일시정지';
+        primaryBtn.disabled = false;
+        triggers.forEach(b => b.disabled = true);
+      } else if (st === 'deleting') {
+        dot.classList.add('warn');
+        text.textContent = `${activeSrc} · 삭제 중`;
+        primaryBtn.textContent = '일시정지';
+        primaryBtn.disabled = false;
+        triggers.forEach(b => b.disabled = true);
+      } else if (st === 'stopping') {
+        dot.classList.add('warn');
+        text.textContent = '안전 정지 중';
+        primaryBtn.textContent = '정지 중...';
+        primaryBtn.disabled = true;
+        triggers.forEach(b => b.disabled = true);
       }
 
+      renderSourceAuthBadge(d);
+      renderTakeoutPanel(d);
+      renderSettingsTables(d);
+
       const s = d.stats || {};
-      document.getElementById('statPending').textContent = `${s.pending_files || 0}건`;
-      document.getElementById('statFolders').textContent = `폴더: ${s.scanned_folders || 0}개 완료 / 대기 용량: ${formatBytes(s.pending_bytes)}`;
+      const failedCount = s.failed_files || 0;
+      const isTakeout = currentSource === 'takeout';
+      const archivesCount = ((d.takeout_info || {}).archives || []).length;
+
+      document.getElementById('statPending').textContent = (s.pending_files || 0).toLocaleString();
+      document.getElementById('statFolders').textContent = isTakeout
+        ? `ZIP ${archivesCount}개 · 대기 ${formatBytes(s.pending_bytes)}`
+        : `폴더 ${s.scanned_folders || 0}개 · ${formatBytes(s.pending_bytes)}`;
+
       const immichTotal = (s.uploaded_immich_created || 0) + (s.uploaded_immich_duplicate || 0);
-      document.getElementById('statImmich').textContent = `${immichTotal}건`;
-      document.getElementById('statImmichSub').textContent = `신규: ${s.uploaded_immich_created || 0} / 중복 스킵: ${s.uploaded_immich_duplicate || 0}`;
-      document.getElementById('statNextcloud').textContent = `${s.uploaded_nextcloud || 0}건`;
-      document.getElementById('statNextcloudSub').textContent = `이주 용량 합계: ${formatBytes(s.uploaded_bytes)}`;
-      document.getElementById('statDeletedFailed').textContent = `${s.deleted_files || 0} / ${s.failed_files || 0}`;
-      document.getElementById('statDeletedBytes').textContent = `삭제 용량: ${formatBytes(s.deleted_bytes)}`;
+      document.getElementById('statImmich').textContent = immichTotal.toLocaleString();
+      document.getElementById('statImmichSub').textContent = `신규 ${s.uploaded_immich_created || 0} · 중복 ${s.uploaded_immich_duplicate || 0}`;
+
+      document.getElementById('statNextcloud').textContent = (s.uploaded_nextcloud || 0).toLocaleString();
+      document.getElementById('statNextcloudSub').textContent = `누적 ${formatBytes(s.uploaded_bytes)}`;
+
+      if (isTakeout) {
+        document.getElementById('statDeletedFailed').textContent = `${failedCount}`;
+        document.getElementById('statDeletedBytes').textContent = '로컬 ZIP 아카이브 유지';
+      } else {
+        document.getElementById('statDeletedFailed').textContent = `${s.deleted_files || 0} / ${failedCount}`;
+        document.getElementById('statDeletedBytes').textContent = `절감 ${formatBytes(s.deleted_bytes)}`;
+      }
+      document.getElementById('inlineRetryBtn').style.display = failedCount > 0 ? 'inline' : 'none';
 
       const failures = d.recent_failures || [];
-      const failurePanel = document.getElementById('failurePanel');
+      const badge = document.getElementById('failureCountBadge');
+      badge.textContent = failedCount;
+      badge.classList.toggle('has-error', failedCount > 0);
+
       const failureList = document.getElementById('failureList');
       if (failures.length > 0) {
-        failurePanel.style.display = 'block';
-        failureList.innerHTML = failures.map(f =>
-          `<div class="failure-item">[${f.target_type}] ${f.parent_path}/${f.name} (재시도 ${f.retry_count}회): ${f.error_msg}</div>`
-        ).join('');
+        failureList.innerHTML = failures.map(f => `
+          <div class="failure-row">
+            <div>
+              <div class="failure-path mono">[${f.target_type}] ${f.parent_path}/${f.name}</div>
+              <div class="failure-err mono">${f.error_msg}</div>
+            </div>
+            <div class="failure-meta num">재시도 ${f.retry_count}회</div>
+          </div>
+        `).join('');
       } else {
-        failurePanel.style.display = 'none';
-        failureList.innerHTML = '';
+        failureList.innerHTML = '<div class="empty-state">최근 실패한 항목이 없습니다.</div>';
       }
 
       if (!initialLogsLoaded && Array.isArray(d.recent_logs)) {
@@ -409,6 +1353,14 @@
       }
     }
 
+    function handlePrimaryAction() {
+      if (currentJobState === 'idle') {
+        startJob('auto', false);
+      } else {
+        stopJob();
+      }
+    }
+
     async function startJob(mode, dryRun) {
       const res = await fetch('/api/jobs/start', {
         method: 'POST',
@@ -416,7 +1368,7 @@
         body: JSON.stringify({ source: currentSource, mode, dry_run: dryRun })
       });
       if (res.status === 409) {
-        alert('이미 실행 중인 백그라운드 작업이 있습니다.');
+        appendLog(new Date().toLocaleTimeString(), '이미 실행 중인 작업이 있습니다.');
         return;
       }
       fetchStatus();
@@ -436,26 +1388,41 @@
       fetchStatus();
     }
 
-    function openDeleteModal() { document.getElementById('deleteModal').style.display = 'flex'; }
-    function closeDeleteModal() { document.getElementById('deleteModal').style.display = 'none'; }
-    function confirmDelete() { closeDeleteModal(); startJob('delete', false); }
+    function openDeleteModal() {
+      document.getElementById('deleteModal').style.display = 'flex';
+    }
+
+    function closeDeleteModal() {
+      document.getElementById('deleteModal').style.display = 'none';
+    }
+
+    function confirmDelete() {
+      closeDeleteModal();
+      startJob('delete', false);
+    }
 
     function connectSSE() {
       const es = new EventSource('/api/events');
       es.onmessage = (e) => {
         try {
           const ev = JSON.parse(e.data);
-          appendLog(ev.timestamp.slice(11, 19), ev.message);
-          document.getElementById('currentFileLabel').textContent = ev.current_file ? `처리 중: ${ev.current_file}` : ev.message;
-          const pct = ev.total_files > 0 ? Math.min(100, Math.round((ev.processed_files / ev.total_files) * 100)) : 0;
+          appendLog((ev.timestamp || '').slice(11, 19), ev.message || '');
+          document.getElementById('currentFileLabel').textContent = ev.current_file
+            ? `${ev.current_file}`
+            : (ev.message || '대기 중');
+          const pct = ev.total_files > 0
+            ? Math.min(100, Math.round((ev.processed_files / ev.total_files) * 100))
+            : 0;
           const eta = formatEta(ev.processed_files, ev.total_files, ev.speed_fps);
           document.getElementById('progressBar').style.width = `${pct}%`;
-          document.getElementById('progressMeta').textContent = `${pct}% (${(ev.speed_fps || 0).toFixed(1)} 파일/초${eta})`;
+          document.getElementById('progressMeta').textContent = `${pct}% · ${(ev.speed_fps || 0).toFixed(1)} 파일/초${eta}`;
           fetchStatus();
         } catch (_) {}
       };
     }
 
+    updateThemeButtonLabel();
+    applySourceLayout(currentSource);
     fetchStatus();
     connectSSE();
     setInterval(fetchStatus, 3000);

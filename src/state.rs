@@ -48,6 +48,7 @@ pub struct ProgressEvent {
 pub struct AppState {
     pub db: CheckpointDB,
     pub config: AppConfig,
+    pub takeout_dir_override: RwLock<Option<String>>,
     pub job_state: RwLock<JobState>,
     pub active_source: RwLock<Option<String>>,
     pub current_file: RwLock<Option<String>>,
@@ -66,6 +67,7 @@ impl AppState {
         Arc::new(Self {
             db,
             config,
+            takeout_dir_override: RwLock::new(None),
             job_state: RwLock::new(JobState::Idle),
             active_source: RwLock::new(None),
             current_file: RwLock::new(None),
@@ -77,6 +79,18 @@ impl AppState {
             event_tx,
             job_handle: Mutex::new(None),
         })
+    }
+
+    pub async fn effective_config(&self) -> AppConfig {
+        let mut cfg = self.config.clone();
+        if let Some(ref dir) = *self.takeout_dir_override.read().await {
+            cfg.takeout_dir = dir.clone();
+        }
+        cfg
+    }
+
+    pub async fn set_takeout_dir(&self, dir: String) {
+        *self.takeout_dir_override.write().await = Some(dir);
     }
 
     pub fn is_stopping(&self) -> bool {

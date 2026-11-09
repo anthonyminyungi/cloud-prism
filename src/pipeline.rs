@@ -562,7 +562,8 @@ pub fn spawn_auto_sync_scheduler(state: Arc<AppState>) {
         loop {
             ticker.tick().await;
 
-            let sources = state.config.configured_sources();
+            let current_cfg = state.effective_config().await;
+            let sources = current_cfg.configured_sources();
             if sources.is_empty() {
                 continue;
             }
@@ -589,7 +590,7 @@ pub fn spawn_auto_sync_scheduler(state: Arc<AppState>) {
                     )
                     .await;
 
-                match SyncPipeline::from_config(state.clone(), state.config.clone(), src_key) {
+                match SyncPipeline::from_config(state.clone(), current_cfg.clone(), src_key) {
                     Ok(pipeline) => {
                         if let Err(err) = pipeline.run_auto().await {
                             state

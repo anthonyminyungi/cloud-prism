@@ -6,13 +6,45 @@ use crate::sources::{
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TakeoutArchiveInfo {
+    pub name: String,
+    pub size_bytes: u64,
+}
+
+pub fn list_takeout_archives(dir: impl AsRef<Path>) -> Vec<TakeoutArchiveInfo> {
+    let path = dir.as_ref();
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    let mut list: Vec<TakeoutArchiveInfo> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let p = e.path();
+            let is_zip = p
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("zip"))
+                .unwrap_or(false);
+            if !is_zip {
+                return None;
+            }
+            let name = p.file_name()?.to_str()?.to_string();
+            let size_bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+            Some(TakeoutArchiveInfo { name, size_bytes })
+        })
+        .collect();
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    list
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]

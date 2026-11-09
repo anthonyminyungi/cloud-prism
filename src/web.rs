@@ -1,8 +1,11 @@
 use crate::limiter::RateLimiter;
 use crate::pipeline::{build_source_provider, build_target_providers, SyncPipeline};
 use crate::router::{SourceType, TargetType};
+use crate::sources::sanitize_filename;
+use crate::sources::takeout::list_takeout_archives;
 use crate::state::{AppState, JobState};
-use axum::extract::{Query, State};
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
@@ -13,8 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
@@ -48,6 +53,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/start", post(start_job))
         .route("/api/jobs/stop", post(stop_job))
         .route("/api/jobs/retry-failed", post(retry_failed))
+        .route("/api/takeout/path", post(set_takeout_path))
+        .route(
+            "/api/takeout/upload",
+            post(upload_takeout_zip).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/events", get(sse_events))
         .with_state(state)
 }
@@ -75,7 +85,7 @@ impl ServiceTestResult {
 }
 
 async fn test_connections(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cfg = &state.config;
+    let cfg = state.effective_config().await;
     let limiter = RateLimiter::new(cfg.rate_limit_rps, 1);
     let mut results: HashMap<String, ServiceTestResult> = HashMap::new();
 
@@ -90,7 +100,7 @@ async fn test_connections(State(state): State<Arc<AppState>>) -> impl IntoRespon
 
     for (src_type, should_test) in configured_sources {
         if should_test {
-            let provider = build_source_provider(cfg, src_type, limiter.clone());
+            let provider = build_source_provider(&cfg, src_type, limiter.clone());
             results.insert(
                 src_type.as_str().to_string(),
                 ServiceTestResult::from_result(provider.test_connection().await),
@@ -98,7 +108,7 @@ async fn test_connections(State(state): State<Arc<AppState>>) -> impl IntoRespon
         }
     }
 
-    let targets = build_target_providers(cfg, limiter);
+    let targets = build_target_providers(&cfg, limiter);
     let configured_targets: Vec<(TargetType, bool)> = vec![
         (TargetType::Immich, !cfg.immich_url.is_empty()),
         (
@@ -136,6 +146,7 @@ async fn get_status(
         .or_else(|| active_source.clone())
         .unwrap_or_else(|| SourceType::Mybox.as_str().to_string());
 
+    let cfg = state.effective_config().await;
     let job_state = *state.job_state.read().await;
     let current_file = state.current_file.read().await.clone();
     let processed_files = state.processed_files.load(Ordering::SeqCst);
@@ -149,6 +160,9 @@ async fn get_status(
         .unwrap_or_default();
     let recent_logs: Vec<_> = state.recent_logs.read().await.iter().cloned().collect();
 
+    let takeout_archives = list_takeout_archives(&cfg.takeout_dir);
+    let takeout_dir_exists = Path::new(&cfg.takeout_dir).exists();
+
     (
         StatusCode::OK,
         Json(json!({
@@ -159,10 +173,159 @@ async fn get_status(
             "processed_files": processed_files,
             "total_files": total_files,
             "speed_fps": speed_fps,
-            "config_summary": state.config.summary(),
+            "config_summary": cfg.summary(),
+            "takeout_info": {
+                "dir": cfg.takeout_dir,
+                "exists": takeout_dir_exists,
+                "archives": takeout_archives
+            },
             "stats": stats,
             "recent_failures": recent_failures,
             "recent_logs": recent_logs
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SetTakeoutPathRequest {
+    takeout_dir: String,
+}
+
+async fn set_takeout_path(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetTakeoutPathRequest>,
+) -> impl IntoResponse {
+    let trimmed = req.takeout_dir.trim();
+    if trimmed.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "Takeout 경로가 비어 있습니다.");
+    }
+
+    if let Err(err) = tokio::fs::create_dir_all(trimmed).await {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Takeout 디렉터리를 열거나 생성할 수 없습니다 ({}): {}", trimmed, err),
+        );
+    }
+
+    state.set_takeout_dir(trimmed.to_string()).await;
+    let archives = list_takeout_archives(trimmed);
+    let current_state = *state.job_state.read().await;
+    state
+        .emit_event(
+            "takeout",
+            current_state,
+            None,
+            format!(
+                "[takeout] 아카이브 경로 변경: {} (ZIP {}개 인식됨)",
+                trimmed,
+                archives.len()
+            ),
+        )
+        .await;
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "takeout_dir": trimmed,
+            "exists": true,
+            "archives": archives
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadTakeoutQuery {
+    filename: Option<String>,
+}
+
+async fn upload_takeout_zip(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UploadTakeoutQuery>,
+    body: Body,
+) -> impl IntoResponse {
+    let raw_name = q
+        .filename
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("takeout-upload.zip");
+
+    let safe_name = sanitize_filename(raw_name);
+    if !safe_name.to_ascii_lowercase().ends_with(".zip") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Google Takeout 아카이브는 .zip 확장자 파일만 업로드할 수 있습니다.",
+        );
+    }
+
+    let cfg = state.effective_config().await;
+    if let Err(err) = tokio::fs::create_dir_all(&cfg.takeout_dir).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Takeout 폴더 생성 실패 ({}): {}", cfg.takeout_dir, err),
+        );
+    }
+
+    let dest_path = Path::new(&cfg.takeout_dir).join(&safe_name);
+    let mut file = match tokio::fs::File::create(&dest_path).await {
+        Ok(f) => f,
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ZIP 파일 생성 실패: {}", err),
+            )
+        }
+    };
+
+    let mut stream = body.into_data_stream();
+    let mut written_bytes: u64 = 0;
+
+    while let Some(chunk_res) = stream.next().await {
+        match chunk_res {
+            Ok(chunk) => {
+                if let Err(err) = file.write_all(&chunk).await {
+                    let _ = tokio::fs::remove_file(&dest_path).await;
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("ZIP 파일 쓰기 실패: {}", err),
+                    );
+                }
+                written_bytes += chunk.len() as u64;
+            }
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&dest_path).await;
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("업로드 스트림 수신 중단: {}", err),
+                );
+            }
+        }
+    }
+
+    let _ = file.flush().await;
+    let archives = list_takeout_archives(&cfg.takeout_dir);
+    let current_state = *state.job_state.read().await;
+    state
+        .emit_event(
+            "takeout",
+            current_state,
+            None,
+            format!(
+                "[takeout] ZIP 업로드 완료: {} ({} bytes)",
+                safe_name, written_bytes
+            ),
+        )
+        .await;
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "uploaded": safe_name,
+            "size_bytes": written_bytes,
+            "takeout_dir": cfg.takeout_dir,
+            "archives": archives
         })),
     )
         .into_response()
@@ -195,8 +358,8 @@ async fn start_job(
         *js = req.mode.initial_state();
     }
 
-    let pipeline = match SyncPipeline::from_config(state.clone(), state.config.clone(), &req.source)
-    {
+    let cfg = state.effective_config().await;
+    let pipeline = match SyncPipeline::from_config(state.clone(), cfg, &req.source) {
         Ok(p) => p,
         Err(e) => {
             *state.job_state.write().await = JobState::Idle;
