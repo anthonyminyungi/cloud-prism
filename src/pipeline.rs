@@ -401,10 +401,12 @@ impl SyncPipeline {
 
     pub async fn run_delete(&self, dry_run: bool) -> Result<SyncStats> {
         let src = self.source_key();
+        let initial_stats = self.state.db.get_stats(src).await?;
+        let fetch_limit = initial_stats.total_files.max(DELETE_BATCH_LIMIT);
         let uploaded = self
             .state
             .db
-            .get_uploaded_files_for_delete(src, DELETE_BATCH_LIMIT)
+            .get_uploaded_files_for_delete(src, fetch_limit)
             .await?;
         self.state
             .begin_phase(src, JobState::Deleting, uploaded.len() as u64)

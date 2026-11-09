@@ -1,22 +1,77 @@
-use anyhow::Result;
+use crate::router::{FileStatus, SyncResultKind, TargetType};
+use anyhow::{anyhow, Result};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+use sea_orm::entity::prelude::*;
+use sea_orm::sea_query::{Expr, ExprTrait, Index, OnConflict};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, QueryOrder, QuerySelect,
+    Schema, Set, SqlxSqliteConnector, Statement, TransactionTrait,
 };
-use sqlx::Row;
+use serde::{Deserialize, Serialize};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::path::Path;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FolderRecord {
-    pub source_type: String,
-    pub folder_id: String,
-    pub path: String,
-    pub last_cursor: Option<String>,
-    pub scan_status: String,
-    pub updated_at: String,
+pub const SCAN_STATUS_PENDING: &str = "PENDING";
+pub const SCAN_STATUS_SCANNED: &str = "SCANNED";
+
+pub mod folder_entity {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "folders")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub source_type: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub folder_id: String,
+        pub path: String,
+        pub last_cursor: Option<String>,
+        pub scan_status: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod file_entity {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "files")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub source_type: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub resource_id: String,
+        pub name: String,
+        pub parent_path: String,
+        pub size: i64,
+        pub created_time: String,
+        pub modified_time: String,
+        pub target_type: String,
+        pub sha1_hash: Option<String>,
+        pub remote_target_id: Option<String>,
+        pub sync_result: Option<String>,
+        pub status: String,
+        pub retry_count: i64,
+        pub error_msg: Option<String>,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub type FolderRecord = folder_entity::Model;
+pub type FileRecord = file_entity::Model;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileUpsert {
@@ -29,25 +84,6 @@ pub struct FileUpsert {
     pub modified_time: String,
     pub target_type: String,
     pub sha1_hash: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileRecord {
-    pub source_type: String,
-    pub resource_id: String,
-    pub name: String,
-    pub parent_path: String,
-    pub size: i64,
-    pub created_time: String,
-    pub modified_time: String,
-    pub target_type: String,
-    pub sha1_hash: Option<String>,
-    pub remote_target_id: Option<String>,
-    pub sync_result: Option<String>,
-    pub status: String,
-    pub retry_count: i64,
-    pub error_msg: Option<String>,
-    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,9 +114,24 @@ pub struct SyncStats {
     pub total_files: i64,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct FolderStatGroup {
+    scan_status: String,
+    cnt: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct FileStatGroup {
+    status: String,
+    target_type: String,
+    sync_result: Option<String>,
+    cnt: i64,
+    total_bytes: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct CheckpointDB {
-    pool: SqlitePool,
+    conn: DatabaseConnection,
 }
 
 impl CheckpointDB {
@@ -103,74 +154,53 @@ impl CheckpointDB {
             .connect_with(opts)
             .await?;
 
-        let db = Self { pool };
+        let conn = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+        let db = Self { conn };
         db.init_schema().await?;
         Ok(db)
     }
 
     async fn init_schema(&self) -> Result<()> {
-        sqlx::query("PRAGMA journal_mode=WAL;")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous=NORMAL;")
-            .execute(&self.pool)
-            .await?;
+        let builder = self.conn.get_database_backend();
+        let schema = Schema::new(builder);
 
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS folders (
-                source_type TEXT NOT NULL,
-                folder_id TEXT NOT NULL,
-                path TEXT NOT NULL,
-                last_cursor TEXT,
-                scan_status TEXT NOT NULL DEFAULT 'PENDING',
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (source_type, folder_id)
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+        let create_folders = builder.build(
+            schema
+                .create_table_from_entity(folder_entity::Entity)
+                .if_not_exists(),
+        );
+        self.conn.execute(create_folders).await?;
 
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS files (
-                source_type TEXT NOT NULL,
-                resource_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                parent_path TEXT NOT NULL,
-                size INTEGER NOT NULL DEFAULT 0,
-                created_time TEXT NOT NULL,
-                modified_time TEXT NOT NULL,
-                target_type TEXT NOT NULL,
-                sha1_hash TEXT,
-                remote_target_id TEXT,
-                sync_result TEXT,
-                status TEXT NOT NULL DEFAULT 'PENDING',
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                error_msg TEXT,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (source_type, resource_id)
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+        let create_files = builder.build(
+            schema
+                .create_table_from_entity(file_entity::Entity)
+                .if_not_exists(),
+        );
+        self.conn.execute(create_files).await?;
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_files_source_status ON files (source_type, status);",
-        )
-        .execute(&self.pool)
-        .await?;
+        let create_idx = builder.build(
+            Index::create()
+                .if_not_exists()
+                .name("idx_files_source_status")
+                .table(file_entity::Entity)
+                .col(file_entity::Column::SourceType)
+                .col(file_entity::Column::Status),
+        );
+        self.conn.execute(create_idx).await?;
 
         Ok(())
     }
 
     pub async fn get_journal_mode(&self) -> Result<String> {
-        let row = sqlx::query("PRAGMA journal_mode;")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.get::<String, _>(0))
+        let row = self
+            .conn
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA journal_mode;",
+            ))
+            .await?
+            .ok_or_else(|| anyhow!("Failed to query SQLite journal_mode"))?;
+        Ok(row.try_get_by_index::<String>(0)?)
     }
 
     pub async fn upsert_folder(
@@ -180,21 +210,30 @@ impl CheckpointDB {
         path: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            INSERT INTO folders (source_type, folder_id, path, scan_status, updated_at)
-            VALUES (?1, ?2, ?3, 'PENDING', ?4)
-            ON CONFLICT(source_type, folder_id) DO UPDATE SET
-                path = excluded.path,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(source_type)
-        .bind(folder_id)
-        .bind(path)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        let active = folder_entity::ActiveModel {
+            source_type: Set(source_type.to_string()),
+            folder_id: Set(folder_id.to_string()),
+            path: Set(path.to_string()),
+            last_cursor: Set(None),
+            scan_status: Set(SCAN_STATUS_PENDING.to_string()),
+            updated_at: Set(now),
+        };
+
+        folder_entity::Entity::insert(active)
+            .on_conflict(
+                OnConflict::columns([
+                    folder_entity::Column::SourceType,
+                    folder_entity::Column::FolderId,
+                ])
+                .update_columns([
+                    folder_entity::Column::Path,
+                    folder_entity::Column::UpdatedAt,
+                ])
+                .to_owned(),
+            )
+            .exec(&self.conn)
+            .await?;
+
         Ok(())
     }
 
@@ -205,106 +244,99 @@ impl CheckpointDB {
         cursor: Option<&str>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            UPDATE folders
-            SET last_cursor = ?1, updated_at = ?2
-            WHERE source_type = ?3 AND folder_id = ?4
-            "#,
-        )
-        .bind(cursor)
-        .bind(now)
-        .bind(source_type)
-        .bind(folder_id)
-        .execute(&self.pool)
-        .await?;
+        folder_entity::Entity::update_many()
+            .col_expr(
+                folder_entity::Column::LastCursor,
+                Expr::value(cursor.map(str::to_string)),
+            )
+            .col_expr(folder_entity::Column::UpdatedAt, Expr::value(now))
+            .filter(folder_entity::Column::SourceType.eq(source_type))
+            .filter(folder_entity::Column::FolderId.eq(folder_id))
+            .exec(&self.conn)
+            .await?;
         Ok(())
     }
 
     pub async fn mark_folder_scanned(&self, source_type: &str, folder_id: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            UPDATE folders
-            SET scan_status = 'SCANNED', last_cursor = NULL, updated_at = ?1
-            WHERE source_type = ?2 AND folder_id = ?3
-            "#,
-        )
-        .bind(now)
-        .bind(source_type)
-        .bind(folder_id)
-        .execute(&self.pool)
-        .await?;
+        folder_entity::Entity::update_many()
+            .col_expr(
+                folder_entity::Column::ScanStatus,
+                Expr::value(SCAN_STATUS_SCANNED),
+            )
+            .col_expr(
+                folder_entity::Column::LastCursor,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(folder_entity::Column::UpdatedAt, Expr::value(now))
+            .filter(folder_entity::Column::SourceType.eq(source_type))
+            .filter(folder_entity::Column::FolderId.eq(folder_id))
+            .exec(&self.conn)
+            .await?;
         Ok(())
     }
 
     pub async fn get_pending_folders(&self, source_type: &str) -> Result<Vec<FolderRecord>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT source_type, folder_id, path, last_cursor, scan_status, updated_at
-            FROM folders
-            WHERE source_type = ?1 AND scan_status = 'PENDING'
-            ORDER BY path ASC
-            "#,
-        )
-        .bind(source_type)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| FolderRecord {
-                source_type: r.get("source_type"),
-                folder_id: r.get("folder_id"),
-                path: r.get("path"),
-                last_cursor: r.get("last_cursor"),
-                scan_status: r.get("scan_status"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect())
+        let rows = folder_entity::Entity::find()
+            .filter(folder_entity::Column::SourceType.eq(source_type))
+            .filter(folder_entity::Column::ScanStatus.eq(SCAN_STATUS_PENDING))
+            .order_by_asc(folder_entity::Column::Path)
+            .all(&self.conn)
+            .await?;
+        Ok(rows)
     }
 
     pub async fn upsert_files(&self, files: &[FileUpsert]) -> Result<usize> {
-        let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
-        let mut count = 0;
-
-        for f in files {
-            sqlx::query(
-                r#"
-                INSERT INTO files (
-                    source_type, resource_id, name, parent_path, size,
-                    created_time, modified_time, target_type, sha1_hash,
-                    status, retry_count, updated_at
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'PENDING', 0, ?10)
-                ON CONFLICT(source_type, resource_id) DO UPDATE SET
-                    name = excluded.name,
-                    parent_path = excluded.parent_path,
-                    size = excluded.size,
-                    modified_time = excluded.modified_time,
-                    target_type = excluded.target_type,
-                    sha1_hash = COALESCE(excluded.sha1_hash, files.sha1_hash),
-                    updated_at = excluded.updated_at
-                "#,
-            )
-            .bind(&f.source_type)
-            .bind(&f.resource_id)
-            .bind(&f.name)
-            .bind(&f.parent_path)
-            .bind(f.size)
-            .bind(&f.created_time)
-            .bind(&f.modified_time)
-            .bind(&f.target_type)
-            .bind(&f.sha1_hash)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
-            count += 1;
+        if files.is_empty() {
+            return Ok(0);
         }
 
-        tx.commit().await?;
-        Ok(count)
+        let now = Utc::now().to_rfc3339();
+        let txn = self.conn.begin().await?;
+
+        for f in files {
+            let active = file_entity::ActiveModel {
+                source_type: Set(f.source_type.clone()),
+                resource_id: Set(f.resource_id.clone()),
+                name: Set(f.name.clone()),
+                parent_path: Set(f.parent_path.clone()),
+                size: Set(f.size),
+                created_time: Set(f.created_time.clone()),
+                modified_time: Set(f.modified_time.clone()),
+                target_type: Set(f.target_type.clone()),
+                sha1_hash: Set(f.sha1_hash.clone()),
+                remote_target_id: Set(None),
+                sync_result: Set(None),
+                status: Set(FileStatus::Pending.as_str().to_string()),
+                retry_count: Set(0),
+                error_msg: Set(None),
+                updated_at: Set(now.clone()),
+            };
+
+            let mut conflict = OnConflict::columns([
+                file_entity::Column::SourceType,
+                file_entity::Column::ResourceId,
+            ]);
+            conflict.update_columns([
+                file_entity::Column::Name,
+                file_entity::Column::ParentPath,
+                file_entity::Column::Size,
+                file_entity::Column::ModifiedTime,
+                file_entity::Column::TargetType,
+                file_entity::Column::UpdatedAt,
+            ]);
+            if f.sha1_hash.is_some() {
+                conflict.update_column(file_entity::Column::Sha1Hash);
+            }
+
+            file_entity::Entity::insert(active)
+                .on_conflict(conflict)
+                .exec(&txn)
+                .await?;
+        }
+
+        txn.commit().await?;
+        Ok(files.len())
     }
 
     pub async fn get_pending_files(
@@ -313,24 +345,16 @@ impl CheckpointDB {
         max_retries: i64,
         limit: i64,
     ) -> Result<Vec<FileRecord>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT source_type, resource_id, name, parent_path, size,
-                   created_time, modified_time, target_type, sha1_hash,
-                   remote_target_id, sync_result, status, retry_count, error_msg, updated_at
-            FROM files
-            WHERE source_type = ?1 AND status = 'PENDING' AND retry_count < ?2
-            ORDER BY parent_path ASC, name ASC
-            LIMIT ?3
-            "#,
-        )
-        .bind(source_type)
-        .bind(max_retries)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows.into_iter().map(Self::row_to_file_record).collect())
+        let rows = file_entity::Entity::find()
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .filter(file_entity::Column::Status.eq(FileStatus::Pending.as_str()))
+            .filter(file_entity::Column::RetryCount.lt(max_retries))
+            .order_by_asc(file_entity::Column::ParentPath)
+            .order_by_asc(file_entity::Column::Name)
+            .limit(Some(limit.max(0) as u64))
+            .all(&self.conn)
+            .await?;
+        Ok(rows)
     }
 
     pub async fn mark_file_uploaded(
@@ -342,26 +366,32 @@ impl CheckpointDB {
         sync_result: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            UPDATE files
-            SET status = 'UPLOADED',
-                sha1_hash = ?1,
-                remote_target_id = ?2,
-                sync_result = ?3,
-                error_msg = NULL,
-                updated_at = ?4
-            WHERE source_type = ?5 AND resource_id = ?6
-            "#,
-        )
-        .bind(sha1_hash)
-        .bind(remote_target_id)
-        .bind(sync_result)
-        .bind(now)
-        .bind(source_type)
-        .bind(resource_id)
-        .execute(&self.pool)
-        .await?;
+        file_entity::Entity::update_many()
+            .col_expr(
+                file_entity::Column::Status,
+                Expr::value(FileStatus::Uploaded.as_str()),
+            )
+            .col_expr(
+                file_entity::Column::Sha1Hash,
+                Expr::value(Some(sha1_hash.to_string())),
+            )
+            .col_expr(
+                file_entity::Column::RemoteTargetId,
+                Expr::value(Some(remote_target_id.to_string())),
+            )
+            .col_expr(
+                file_entity::Column::SyncResult,
+                Expr::value(Some(sync_result.to_string())),
+            )
+            .col_expr(
+                file_entity::Column::ErrorMsg,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now))
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .filter(file_entity::Column::ResourceId.eq(resource_id))
+            .exec(&self.conn)
+            .await?;
         Ok(())
     }
 
@@ -373,40 +403,46 @@ impl CheckpointDB {
         max_retries: i64,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            UPDATE files
-            SET retry_count = retry_count + 1,
-                status = CASE WHEN retry_count + 1 >= ?1 THEN 'FAILED' ELSE 'PENDING' END,
-                error_msg = ?2,
-                updated_at = ?3
-            WHERE source_type = ?4 AND resource_id = ?5
-            "#,
+        let next_retry = Expr::col(file_entity::Column::RetryCount).add(1);
+        let next_status = Expr::case(
+            next_retry.clone().gte(max_retries),
+            FileStatus::Failed.as_str(),
         )
-        .bind(max_retries)
-        .bind(error_msg)
-        .bind(now)
-        .bind(source_type)
-        .bind(resource_id)
-        .execute(&self.pool)
-        .await?;
+        .finally(FileStatus::Pending.as_str());
+
+        file_entity::Entity::update_many()
+            .col_expr(file_entity::Column::RetryCount, next_retry)
+            .col_expr(file_entity::Column::Status, next_status.into())
+            .col_expr(
+                file_entity::Column::ErrorMsg,
+                Expr::value(Some(error_msg.to_string())),
+            )
+            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now))
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .filter(file_entity::Column::ResourceId.eq(resource_id))
+            .exec(&self.conn)
+            .await?;
         Ok(())
     }
 
     pub async fn reset_failed_files(&self, source_type: &str) -> Result<u64> {
         let now = Utc::now().to_rfc3339();
-        let res = sqlx::query(
-            r#"
-            UPDATE files
-            SET status = 'PENDING', retry_count = 0, error_msg = NULL, updated_at = ?1
-            WHERE source_type = ?2 AND status = 'FAILED'
-            "#,
-        )
-        .bind(now)
-        .bind(source_type)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected())
+        let res = file_entity::Entity::update_many()
+            .col_expr(
+                file_entity::Column::Status,
+                Expr::value(FileStatus::Pending.as_str()),
+            )
+            .col_expr(file_entity::Column::RetryCount, Expr::value(0_i64))
+            .col_expr(
+                file_entity::Column::ErrorMsg,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now))
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .filter(file_entity::Column::Status.eq(FileStatus::Failed.as_str()))
+            .exec(&self.conn)
+            .await?;
+        Ok(res.rows_affected)
     }
 
     pub async fn get_uploaded_files_for_delete(
@@ -414,120 +450,91 @@ impl CheckpointDB {
         source_type: &str,
         limit: i64,
     ) -> Result<Vec<FileRecord>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT source_type, resource_id, name, parent_path, size,
-                   created_time, modified_time, target_type, sha1_hash,
-                   remote_target_id, sync_result, status, retry_count, error_msg, updated_at
-            FROM files
-            WHERE source_type = ?1 AND status = 'UPLOADED'
-            ORDER BY updated_at ASC
-            LIMIT ?2
-            "#,
-        )
-        .bind(source_type)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows.into_iter().map(Self::row_to_file_record).collect())
+        let rows = file_entity::Entity::find()
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .filter(file_entity::Column::Status.eq(FileStatus::Uploaded.as_str()))
+            .order_by_asc(file_entity::Column::UpdatedAt)
+            .order_by_asc(file_entity::Column::ResourceId)
+            .limit(Some(limit.max(0) as u64))
+            .all(&self.conn)
+            .await?;
+        Ok(rows)
     }
 
     pub async fn mark_file_deleted(&self, source_type: &str, resource_id: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            UPDATE files
-            SET status = 'DELETED', updated_at = ?1
-            WHERE source_type = ?2 AND resource_id = ?3
-            "#,
-        )
-        .bind(now)
-        .bind(source_type)
-        .bind(resource_id)
-        .execute(&self.pool)
-        .await?;
+        file_entity::Entity::update_many()
+            .col_expr(
+                file_entity::Column::Status,
+                Expr::value(FileStatus::Deleted.as_str()),
+            )
+            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now))
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .filter(file_entity::Column::ResourceId.eq(resource_id))
+            .exec(&self.conn)
+            .await?;
         Ok(())
     }
 
     pub async fn get_stats(&self, source_type: &str) -> Result<SyncStats> {
         let mut stats = SyncStats::default();
 
-        let folder_rows = sqlx::query(
-            r#"
-            SELECT scan_status, COUNT(*) as cnt
-            FROM folders
-            WHERE source_type = ?1
-            GROUP BY scan_status
-            "#,
-        )
-        .bind(source_type)
-        .fetch_all(&self.pool)
-        .await?;
+        let folder_groups = folder_entity::Entity::find()
+            .select_only()
+            .column(folder_entity::Column::ScanStatus)
+            .column_as(folder_entity::Column::FolderId.count(), "cnt")
+            .filter(folder_entity::Column::SourceType.eq(source_type))
+            .group_by(folder_entity::Column::ScanStatus)
+            .into_model::<FolderStatGroup>()
+            .all(&self.conn)
+            .await?;
 
-        for row in folder_rows {
-            let status: String = row.get("scan_status");
-            let cnt: i64 = row.get("cnt");
-            match status.as_str() {
-                "PENDING" => stats.pending_folders += cnt,
-                "SCANNED" => stats.scanned_folders += cnt,
+        for row in folder_groups {
+            match row.scan_status.as_str() {
+                SCAN_STATUS_PENDING => stats.pending_folders += row.cnt,
+                SCAN_STATUS_SCANNED => stats.scanned_folders += row.cnt,
                 _ => {}
             }
         }
 
-        let file_rows = sqlx::query(
-            r#"
-            SELECT status, target_type, COALESCE(sync_result, '') as sync_res,
-                   COUNT(*) as cnt, COALESCE(SUM(size), 0) as total_bytes
-            FROM files
-            WHERE source_type = ?1
-            GROUP BY status, target_type, sync_res
-            "#,
-        )
-        .bind(source_type)
-        .fetch_all(&self.pool)
-        .await?;
+        let file_groups = file_entity::Entity::find()
+            .select_only()
+            .column(file_entity::Column::Status)
+            .column(file_entity::Column::TargetType)
+            .column(file_entity::Column::SyncResult)
+            .column_as(file_entity::Column::ResourceId.count(), "cnt")
+            .column_as(file_entity::Column::Size.sum(), "total_bytes")
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .group_by(file_entity::Column::Status)
+            .group_by(file_entity::Column::TargetType)
+            .group_by(file_entity::Column::SyncResult)
+            .into_model::<FileStatGroup>()
+            .all(&self.conn)
+            .await?;
 
-        for row in file_rows {
-            let status: String = row.get("status");
-            let target: String = row.get("target_type");
-            let sync_res: String = row.get("sync_res");
-            let cnt: i64 = row.get("cnt");
-            let bytes: i64 = row.get("total_bytes");
+        for row in file_groups {
+            let cnt = row.cnt;
+            let bytes = row.total_bytes.unwrap_or(0);
+            let sync_res = row.sync_result.as_deref().unwrap_or("");
+            let target = TargetType::from_str_opt(&row.target_type);
 
             stats.total_files += cnt;
 
-            match status.as_str() {
-                "PENDING" => {
+            match row.status.as_str() {
+                s if s == FileStatus::Pending.as_str() => {
                     stats.pending_files += cnt;
                     stats.pending_bytes += bytes;
                 }
-                "UPLOADED" => {
+                s if s == FileStatus::Uploaded.as_str() => {
                     stats.uploaded_bytes += bytes;
-                    if target == "immich" {
-                        if sync_res == "duplicate" {
-                            stats.uploaded_immich_duplicate += cnt;
-                        } else {
-                            stats.uploaded_immich_created += cnt;
-                        }
-                    } else if target == "nextcloud" {
-                        stats.uploaded_nextcloud += cnt;
-                    }
+                    Self::accumulate_target_counts(&mut stats, target, sync_res, cnt);
                 }
-                "DELETED" => {
+                s if s == FileStatus::Deleted.as_str() => {
                     stats.deleted_files += cnt;
                     stats.deleted_bytes += bytes;
-                    if target == "immich" {
-                        if sync_res == "duplicate" {
-                            stats.uploaded_immich_duplicate += cnt;
-                        } else {
-                            stats.uploaded_immich_created += cnt;
-                        }
-                    } else if target == "nextcloud" {
-                        stats.uploaded_nextcloud += cnt;
-                    }
+                    Self::accumulate_target_counts(&mut stats, target, sync_res, cnt);
                 }
-                "FAILED" => {
+                s if s == FileStatus::Failed.as_str() => {
                     stats.failed_files += cnt;
                 }
                 _ => {}
@@ -537,58 +544,52 @@ impl CheckpointDB {
         Ok(stats)
     }
 
+    fn accumulate_target_counts(
+        stats: &mut SyncStats,
+        target: Option<TargetType>,
+        sync_res: &str,
+        cnt: i64,
+    ) {
+        match target {
+            Some(TargetType::Immich) => {
+                if sync_res == SyncResultKind::Duplicate.as_str() {
+                    stats.uploaded_immich_duplicate += cnt;
+                } else {
+                    stats.uploaded_immich_created += cnt;
+                }
+            }
+            Some(TargetType::Nextcloud) => {
+                stats.uploaded_nextcloud += cnt;
+            }
+            None => {}
+        }
+    }
+
     pub async fn get_recent_failures(
         &self,
         source_type: &str,
         limit: i64,
     ) -> Result<Vec<FailureRecord>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT source_type, resource_id, name, parent_path, target_type,
-                   retry_count, COALESCE(error_msg, 'Unknown error') as error_msg, updated_at
-            FROM files
-            WHERE source_type = ?1 AND status = 'FAILED'
-            ORDER BY updated_at DESC
-            LIMIT ?2
-            "#,
-        )
-        .bind(source_type)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = file_entity::Entity::find()
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .filter(file_entity::Column::Status.eq(FileStatus::Failed.as_str()))
+            .order_by_desc(file_entity::Column::UpdatedAt)
+            .limit(Some(limit.max(0) as u64))
+            .all(&self.conn)
+            .await?;
 
         Ok(rows
             .into_iter()
             .map(|r| FailureRecord {
-                source_type: r.get("source_type"),
-                resource_id: r.get("resource_id"),
-                name: r.get("name"),
-                parent_path: r.get("parent_path"),
-                target_type: r.get("target_type"),
-                retry_count: r.get("retry_count"),
-                error_msg: r.get("error_msg"),
-                updated_at: r.get("updated_at"),
+                source_type: r.source_type,
+                resource_id: r.resource_id,
+                name: r.name,
+                parent_path: r.parent_path,
+                target_type: r.target_type,
+                retry_count: r.retry_count,
+                error_msg: r.error_msg.unwrap_or_else(|| "알 수 없는 오류".to_string()),
+                updated_at: r.updated_at,
             })
             .collect())
-    }
-
-    fn row_to_file_record(r: sqlx::sqlite::SqliteRow) -> FileRecord {
-        FileRecord {
-            source_type: r.get("source_type"),
-            resource_id: r.get("resource_id"),
-            name: r.get("name"),
-            parent_path: r.get("parent_path"),
-            size: r.get("size"),
-            created_time: r.get("created_time"),
-            modified_time: r.get("modified_time"),
-            target_type: r.get("target_type"),
-            sha1_hash: r.get("sha1_hash"),
-            remote_target_id: r.get("remote_target_id"),
-            sync_result: r.get("sync_result"),
-            status: r.get("status"),
-            retry_count: r.get("retry_count"),
-            error_msg: r.get("error_msg"),
-            updated_at: r.get("updated_at"),
-        }
     }
 }

@@ -85,7 +85,7 @@
     .card-title { font-size: 0.85rem; color: var(--muted); margin-bottom: 8px; }
     .card-value { font-size: 1.65rem; font-weight: 700; margin-bottom: 4px; }
     .card-sub { font-size: 0.8rem; color: var(--muted); }
-    .progress-box, .env-panel {
+    .progress-box, .env-panel, .failure-panel {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 14px;
@@ -151,6 +151,18 @@
       background: #0f172a;
       border: 1px solid var(--border);
     }
+    .failure-list {
+      margin-top: 10px;
+      font-size: 0.82rem;
+      color: #fca5a5;
+      max-height: 140px;
+      overflow-y: auto;
+    }
+    .failure-item {
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .failure-item:last-child { border-bottom: none; }
     .console-box {
       background: #020617;
       border: 1px solid var(--border);
@@ -229,7 +241,7 @@
       <div class="card">
         <div class="card-title">스캔 / 대기 중 (PENDING)</div>
         <div id="statPending" class="card-value">0건</div>
-        <div id="statFolders" class="card-sub">스캔 완료 폴더: 0개</div>
+        <div id="statFolders" class="card-sub">스캔 완료 폴더: 0개 (0 B)</div>
       </div>
       <div class="card">
         <div class="card-title">📸 Immich 이주 완료 (UPLOADED)</div>
@@ -239,15 +251,21 @@
       <div class="card">
         <div class="card-title">📁 Nextcloud 이주 완료 (UPLOADED)</div>
         <div id="statNextcloud" class="card-value">0건</div>
-        <div class="card-sub">원본 폴더 트리 및 수정일 보존</div>
+        <div id="statNextcloudSub" class="card-sub">이주 용량 합계: 0 B</div>
       </div>
       <div class="card">
         <div class="card-title">🗑️ 원격 삭제 완료 & ⚠️ 실패</div>
         <div id="statDeletedFailed" class="card-value">0 / 0</div>
         <div class="card-sub">
+          <span id="statDeletedBytes" style="margin-right:6px;">절감: 0 B</span>
           <button class="btn" style="padding:3px 8px;font-size:0.75rem;margin-top:4px;" onclick="retryFailed()">🔄 실패 항목 재시도</button>
         </div>
       </div>
+    </div>
+
+    <div id="failurePanel" class="failure-panel" style="display:none;">
+      <strong style="font-size:0.9rem;color:#f87171;">⚠️ 최근 실패 파일 목록 (최대 20건)</strong>
+      <div id="failureList" class="failure-list"></div>
     </div>
 
     <div class="controls">
@@ -277,6 +295,26 @@
 
   <script>
     let currentSource = 'mybox';
+    let initialLogsLoaded = false;
+
+    function formatBytes(bytes) {
+      const b = Number(bytes) || 0;
+      if (b <= 0) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.min(units.length - 1, Math.floor(Math.log(b) / Math.log(1024)));
+      return `${(b / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+    }
+
+    function formatEta(processed, total, speedFps) {
+      const rem = (Number(total) || 0) - (Number(processed) || 0);
+      const spd = Number(speedFps) || 0;
+      if (rem <= 0 || spd <= 0.01) return '';
+      const secs = Math.round(rem / spd);
+      if (secs < 60) return ` · 남은 시간 약 ${secs}초`;
+      const mins = Math.floor(secs / 60);
+      const remSecs = secs % 60;
+      return ` · 남은 시간 약 ${mins}분 ${remSecs}초`;
+    }
 
     function selectSource(src, btn) {
       currentSource = src;
@@ -340,12 +378,34 @@
 
       const s = d.stats || {};
       document.getElementById('statPending').textContent = `${s.pending_files || 0}건`;
-      document.getElementById('statFolders').textContent = `스캔 완료 폴더: ${s.scanned_folders || 0}개 (대기: ${s.pending_folders || 0})`;
+      document.getElementById('statFolders').textContent = `폴더: ${s.scanned_folders || 0}개 완료 / 대기 용량: ${formatBytes(s.pending_bytes)}`;
       const immichTotal = (s.uploaded_immich_created || 0) + (s.uploaded_immich_duplicate || 0);
       document.getElementById('statImmich').textContent = `${immichTotal}건`;
       document.getElementById('statImmichSub').textContent = `신규: ${s.uploaded_immich_created || 0} / 중복 스킵: ${s.uploaded_immich_duplicate || 0}`;
       document.getElementById('statNextcloud').textContent = `${s.uploaded_nextcloud || 0}건`;
+      document.getElementById('statNextcloudSub').textContent = `이주 용량 합계: ${formatBytes(s.uploaded_bytes)}`;
       document.getElementById('statDeletedFailed').textContent = `${s.deleted_files || 0} / ${s.failed_files || 0}`;
+      document.getElementById('statDeletedBytes').textContent = `삭제 용량: ${formatBytes(s.deleted_bytes)}`;
+
+      const failures = d.recent_failures || [];
+      const failurePanel = document.getElementById('failurePanel');
+      const failureList = document.getElementById('failureList');
+      if (failures.length > 0) {
+        failurePanel.style.display = 'block';
+        failureList.innerHTML = failures.map(f =>
+          `<div class="failure-item">[${f.target_type}] ${f.parent_path}/${f.name} (재시도 ${f.retry_count}회): ${f.error_msg}</div>`
+        ).join('');
+      } else {
+        failurePanel.style.display = 'none';
+        failureList.innerHTML = '';
+      }
+
+      if (!initialLogsLoaded && Array.isArray(d.recent_logs)) {
+        initialLogsLoaded = true;
+        for (const ev of d.recent_logs) {
+          appendLog((ev.timestamp || '').slice(11, 19), ev.message || '');
+        }
+      }
     }
 
     async function startJob(mode, dryRun) {
@@ -387,8 +447,9 @@
           appendLog(ev.timestamp.slice(11, 19), ev.message);
           document.getElementById('currentFileLabel').textContent = ev.current_file ? `처리 중: ${ev.current_file}` : ev.message;
           const pct = ev.total_files > 0 ? Math.min(100, Math.round((ev.processed_files / ev.total_files) * 100)) : 0;
+          const eta = formatEta(ev.processed_files, ev.total_files, ev.speed_fps);
           document.getElementById('progressBar').style.width = `${pct}%`;
-          document.getElementById('progressMeta').textContent = `${pct}% (${(ev.speed_fps || 0).toFixed(1)} 파일/초)`;
+          document.getElementById('progressMeta').textContent = `${pct}% (${(ev.speed_fps || 0).toFixed(1)} 파일/초${eta})`;
           fetchStatus();
         } catch (_) {}
       };
