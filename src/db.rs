@@ -15,6 +15,25 @@ use std::str::FromStr;
 pub const SCAN_STATUS_PENDING: &str = "PENDING";
 pub const SCAN_STATUS_SCANNED: &str = "SCANNED";
 
+fn disambiguate_filename(filename: &str, resource_id: &str) -> String {
+    let safe_id: String = resource_id
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    match filename.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+            format!("{} ({}).{}", stem, safe_id, ext)
+        }
+        _ => format!("{} ({})", filename, safe_id),
+    }
+}
+
 pub mod folder_entity {
     use sea_orm::entity::prelude::*;
     use serde::{Deserialize, Serialize};
@@ -312,6 +331,20 @@ impl CheckpointDB {
         let txn = self.conn.begin().await?;
 
         for f in files {
+            let colliding = file_entity::Entity::find()
+                .filter(file_entity::Column::SourceType.eq(&f.source_type))
+                .filter(file_entity::Column::ParentPath.eq(&f.parent_path))
+                .filter(file_entity::Column::Name.eq(&f.name))
+                .filter(file_entity::Column::ResourceId.ne(&f.resource_id))
+                .one(&txn)
+                .await?;
+
+            let effective_name = if colliding.is_some() {
+                disambiguate_filename(&f.name, &f.resource_id)
+            } else {
+                f.name.clone()
+            };
+
             let existing =
                 file_entity::Entity::find_by_id((f.source_type.clone(), f.resource_id.clone()))
                     .one(&txn)
@@ -322,7 +355,7 @@ impl CheckpointDB {
                     let active = file_entity::ActiveModel {
                         source_type: Set(f.source_type.clone()),
                         resource_id: Set(f.resource_id.clone()),
-                        name: Set(f.name.clone()),
+                        name: Set(effective_name),
                         parent_path: Set(f.parent_path.clone()),
                         size: Set(f.size),
                         created_time: Set(f.created_time.clone()),
@@ -343,13 +376,16 @@ impl CheckpointDB {
                         (Some(new_h), Some(old_h)) => new_h != old_h,
                         _ => false,
                     };
-                    let content_changed =
-                        old.size != f.size || old.modified_time != f.modified_time || hash_changed;
+                    let content_changed = old.size != f.size
+                        || old.created_time != f.created_time
+                        || old.modified_time != f.modified_time
+                        || hash_changed;
 
                     let mut active: file_entity::ActiveModel = old.into();
-                    active.name = Set(f.name.clone());
+                    active.name = Set(effective_name);
                     active.parent_path = Set(f.parent_path.clone());
                     active.size = Set(f.size);
+                    active.created_time = Set(f.created_time.clone());
                     active.modified_time = Set(f.modified_time.clone());
                     active.target_type = Set(f.target_type.clone());
                     active.updated_at = Set(now.clone());
@@ -434,6 +470,7 @@ impl CheckpointDB {
             .filter(file_entity::Column::RetryCount.lt(max_retries))
             .order_by_asc(file_entity::Column::ParentPath)
             .order_by_asc(file_entity::Column::Name)
+            .order_by_asc(file_entity::Column::ResourceId)
             .limit(Some(limit.max(0) as u64))
             .all(&self.conn)
             .await?;
@@ -448,8 +485,28 @@ impl CheckpointDB {
         remote_target_id: &str,
         sync_result: &str,
     ) -> Result<()> {
+        self.mark_file_uploaded_with_size(
+            source_type,
+            resource_id,
+            sha1_hash,
+            remote_target_id,
+            sync_result,
+            None,
+        )
+        .await
+    }
+
+    pub async fn mark_file_uploaded_with_size(
+        &self,
+        source_type: &str,
+        resource_id: &str,
+        sha1_hash: &str,
+        remote_target_id: &str,
+        sync_result: &str,
+        actual_size: Option<i64>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        file_entity::Entity::update_many()
+        let mut update = file_entity::Entity::update_many()
             .col_expr(
                 file_entity::Column::Status,
                 Expr::value(FileStatus::Uploaded.as_str()),
@@ -470,7 +527,13 @@ impl CheckpointDB {
                 file_entity::Column::ErrorMsg,
                 Expr::value(Option::<String>::None),
             )
-            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now))
+            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now));
+
+        if let Some(sz) = actual_size.filter(|&s| s > 0) {
+            update = update.col_expr(file_entity::Column::Size, Expr::value(sz));
+        }
+
+        update
             .filter(file_entity::Column::SourceType.eq(source_type))
             .filter(file_entity::Column::ResourceId.eq(resource_id))
             .exec(&self.conn)

@@ -65,7 +65,7 @@
       font-size: 14px;
       line-height: 1.5;
       -webkit-font-smoothing: antialiased;
-      padding: 24px 20px 48px;
+      padding: 24px 20px 56px;
     }
 
     .mono, .num {
@@ -78,7 +78,7 @@
       margin: 0 auto;
     }
 
-    /* Top Navigation Bar */
+    /* Top Bar */
     .topbar {
       display: flex;
       justify-content: space-between;
@@ -129,10 +129,13 @@
       padding: 6px 13px;
       border-radius: 4px;
       cursor: pointer;
-      transition: color 0.12s, background 0.12s;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: color 0.12s, background 0.12s, opacity 0.12s;
     }
 
-    .tab-btn:hover {
+    .tab-btn:hover:not(:disabled) {
       color: var(--text);
     }
 
@@ -140,6 +143,24 @@
       background: var(--surface);
       color: var(--text);
       box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+    }
+
+    .tab-btn:disabled {
+      opacity: 0.42;
+      cursor: not-allowed;
+    }
+
+    .nav-pill {
+      font-size: 10.5px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: var(--surface-hover);
+      color: var(--muted);
+    }
+
+    .nav-pill.ready {
+      background: rgba(16, 185, 129, 0.16);
+      color: var(--ok);
     }
 
     .topbar-right {
@@ -167,6 +188,7 @@
       border-radius: 50%;
       background: var(--subtle);
       flex-shrink: 0;
+      display: inline-block;
     }
     .dot.ok { background: var(--ok); }
     .dot.warn { background: var(--warn); }
@@ -261,9 +283,8 @@
     }
 
     .input-text {
-      flex: 1;
-      min-width: 200px;
-      padding: 6px 10px;
+      width: 100%;
+      padding: 7px 10px;
       font-size: 12.5px;
       border-radius: 6px;
       border: 1px solid var(--border);
@@ -276,158 +297,22 @@
       border-color: var(--muted);
     }
 
-    /* Source Context Banner */
-    .source-context {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 16px;
-      flex-wrap: wrap;
-      padding: 14px 16px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      margin-bottom: 14px;
-    }
-
-    .source-context-title {
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--text);
-      margin-bottom: 3px;
-    }
-
-    .source-context-desc {
-      font-size: 12.5px;
-      color: var(--muted);
-    }
-
-    .source-auth-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 4px;
-      background: var(--surface-subtle);
-      border: 1px solid var(--border);
-      font-size: 12px;
-      color: var(--text);
-      white-space: nowrap;
-    }
-
-    /* Takeout-Specific Archive Panel */
-    .takeout-panel {
+    /* Views */
+    .tab-view {
       display: none;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 16px;
-      margin-bottom: 14px;
     }
 
-    .takeout-panel.active {
+    .tab-view.active {
       display: block;
     }
 
-    .takeout-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-      margin-bottom: 14px;
-    }
-
-    @media (max-width: 760px) {
-      .takeout-grid {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    .takeout-box {
-      background: var(--surface-subtle);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 12px 14px;
-    }
-
-    .box-label {
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--text);
-      margin-bottom: 4px;
-    }
-
-    .box-help {
-      font-size: 11.5px;
-      color: var(--muted);
-      margin-bottom: 10px;
-    }
-
-    .path-form {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    }
-
-    .upload-dropzone {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      padding: 8px 12px;
-      border: 1px dashed var(--border);
-      border-radius: 6px;
-      background: var(--bg);
-      cursor: pointer;
-      transition: border-color 0.12s;
-    }
-
-    .upload-dropzone:hover, .upload-dropzone.dragover {
-      border-color: var(--text);
-    }
-
-    .upload-status {
-      font-size: 12px;
-      color: var(--muted);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .archive-list-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: 12px;
-      color: var(--muted);
-      padding-bottom: 8px;
-      border-bottom: 1px solid var(--border);
-    }
-
-    .archive-list {
-      max-height: 130px;
-      overflow-y: auto;
-      font-size: 12.5px;
-    }
-
-    .archive-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 6px 0;
-      border-bottom: 1px solid var(--border);
-    }
-
-    .archive-row:last-child {
-      border-bottom: none;
-    }
-
-    /* Action & Progress Bar */
+    /* Control & Progress Panel */
     .control-panel {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 6px;
       overflow: hidden;
-      margin-bottom: 14px;
+      margin-bottom: 16px;
     }
 
     .control-row {
@@ -463,14 +348,8 @@
     .action-toolbar {
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 8px;
       flex-wrap: wrap;
-    }
-
-    .cloud-delete-group {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
     }
 
     .progress-track {
@@ -486,62 +365,283 @@
       transition: width 0.2s ease;
     }
 
-    /* 4-Column Inline Metric Strip */
-    .metric-strip {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
+    /* Verified Source Cards (Sync & Cleanup tabs) */
+    .source-card {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 6px;
-      margin-bottom: 14px;
+      margin-bottom: 12px;
       overflow: hidden;
     }
 
+    .source-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .source-card-title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .source-card-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .verified-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11.5px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+
+    .source-metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+    }
+
+    .source-metrics.cleanup-grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+
     @media (max-width: 720px) {
-      .metric-strip {
+      .source-metrics {
         grid-template-columns: repeat(2, 1fr);
+      }
+      .source-metrics.cleanup-grid {
+        grid-template-columns: 1fr;
       }
     }
 
-    .metric-cell {
-      padding: 14px 16px;
+    .s-metric {
+      padding: 12px 16px;
       border-right: 1px solid var(--border);
     }
 
-    .metric-cell:last-child {
+    .s-metric:last-child {
       border-right: none;
     }
 
-    .metric-label {
-      font-size: 12px;
+    .s-metric-label {
+      font-size: 11.5px;
       color: var(--muted);
-      margin-bottom: 6px;
+      margin-bottom: 4px;
     }
 
-    .metric-value {
-      font-size: 20px;
+    .s-metric-val {
+      font-size: 18px;
       font-weight: 600;
-      letter-spacing: -0.02em;
       color: var(--text);
       margin-bottom: 2px;
     }
 
-    .metric-sub {
+    .s-metric-sub {
+      font-size: 11.5px;
+      color: var(--subtle);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .section-hint {
       font-size: 12px;
       color: var(--subtle);
+      margin: 4px 0 18px;
+    }
+
+    /* Settings View — Scoped Independent Cards */
+    .readiness-banner {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 14px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 20px;
+    }
+
+    .settings-group-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      letter-spacing: 0.02em;
+      margin: 20px 0 8px;
+    }
+
+    .integration-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 12px;
+      overflow: hidden;
+    }
+
+    .integration-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 11px 16px;
+      background: var(--surface-subtle);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .integration-title-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .integration-title {
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .role-tag {
+      font-size: 11px;
+      font-weight: 500;
+      padding: 1px 7px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+    }
+
+    .role-tag.required {
+      color: var(--text);
+      border-color: var(--muted);
+    }
+
+    .integration-body {
+      padding: 14px 16px;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    @media (max-width: 720px) {
+      .form-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .form-field {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .field-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text);
+    }
+
+    .req-tag {
+      font-size: 10.5px;
+      color: var(--warn);
+      font-weight: 600;
+    }
+
+    .opt-tag {
+      font-size: 10.5px;
+      color: var(--subtle);
+      font-weight: 400;
+    }
+
+    .integration-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 10px 16px;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+    }
+
+    .conn-feedback {
+      font-size: 12px;
+      color: var(--muted);
+      flex: 1;
+      min-width: 200px;
+    }
+
+    /* Takeout Dropzone & Archive List inside Settings */
+    .upload-dropzone {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 8px;
-      flex-wrap: wrap;
+      gap: 10px;
+      padding: 8px 12px;
+      border: 1px dashed var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+      cursor: pointer;
+      transition: border-color 0.12s;
     }
 
-    /* Bottom Viewer (Logs & Failures) */
+    .upload-dropzone:hover, .upload-dropzone.dragover {
+      border-color: var(--text);
+    }
+
+    .archive-box {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border);
+    }
+
+    .archive-list {
+      max-height: 110px;
+      overflow-y: auto;
+      font-size: 12px;
+      margin-top: 6px;
+    }
+
+    .archive-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .archive-row:last-child {
+      border-bottom: none;
+    }
+
+    /* Shared Bottom Console */
     .viewer-panel {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 6px;
       overflow: hidden;
+      margin-top: 16px;
     }
 
     .viewer-header {
@@ -574,10 +674,6 @@
       gap: 6px;
     }
 
-    .vtab-btn:hover {
-      color: var(--text);
-    }
-
     .vtab-btn.active {
       background: var(--surface);
       color: var(--text);
@@ -598,7 +694,7 @@
     }
 
     .viewer-body {
-      height: 290px;
+      height: 260px;
       overflow-y: auto;
       padding: 12px 14px;
       font-size: 12.5px;
@@ -641,126 +737,11 @@
       font-size: 12px;
     }
 
-    .failure-meta {
-      color: var(--subtle);
-      font-size: 11.5px;
-      white-space: nowrap;
-    }
-
     .empty-state {
       color: var(--subtle);
-      padding: 20px 0;
+      padding: 18px 0;
       text-align: center;
       font-size: 12.5px;
-    }
-
-    /*환경 설정 전용 탭 뷰 (입력 및 저장 폼) */
-    .settings-view {
-      display: none;
-    }
-
-    .settings-view.active {
-      display: block;
-    }
-
-    .settings-toolbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
-      padding: 14px 16px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      margin-bottom: 16px;
-    }
-
-    .settings-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      margin-bottom: 16px;
-      overflow: hidden;
-    }
-
-    .settings-card-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 11px 16px;
-      border-bottom: 1px solid var(--border);
-      background: var(--surface-subtle);
-    }
-
-    .settings-card-title {
-      font-size: 13px;
-      font-weight: 600;
-      color: var(--text);
-    }
-
-    .settings-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-    }
-
-    .settings-table th,
-    .settings-table td {
-      text-align: left;
-      padding: 12px 16px;
-      border-bottom: 1px solid var(--border);
-      vertical-align: top;
-    }
-
-    .settings-table tr:last-child th,
-    .settings-table tr:last-child td {
-      border-bottom: none;
-    }
-
-    .settings-table th {
-      width: 220px;
-      color: var(--text);
-      font-weight: 500;
-      background: var(--surface);
-    }
-
-    .field-sub {
-      display: block;
-      font-size: 11.5px;
-      color: var(--muted);
-      font-weight: 400;
-      margin-top: 2px;
-    }
-
-    .form-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-
-    @media (max-width: 720px) {
-      .form-grid {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    .form-field {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-
-    .form-field label {
-      font-size: 11.5px;
-      color: var(--muted);
-      font-weight: 500;
-    }
-
-    .conn-result-line {
-      margin-top: 8px;
-      font-size: 12px;
-      color: var(--muted);
     }
 
     /* Modal */
@@ -811,10 +792,17 @@
         <span class="brand">Cloud Prism</span>
         <span class="divider-v"></span>
         <nav class="main-nav" aria-label="주요 메뉴">
-          <button class="tab-btn active" data-tab="mybox" onclick="selectMainTab('mybox', this)">네이버 MYBOX</button>
-          <button class="tab-btn" data-tab="gdrive" onclick="selectMainTab('gdrive', this)">Google Drive</button>
-          <button class="tab-btn" data-tab="takeout" onclick="selectMainTab('takeout', this)">Google Takeout</button>
-          <button class="tab-btn" data-tab="settings" onclick="selectMainTab('settings', this)">환경 설정</button>
+          <button id="navTabSync" class="tab-btn" data-tab="sync" onclick="selectMainTab('sync')" disabled title="타겟 서버 및 최소 1개 소스의 연결 확인이 필요합니다.">
+            동기화
+            <span id="navSyncBadge" class="nav-pill">잠김</span>
+          </button>
+          <button id="navTabCleanup" class="tab-btn" data-tab="cleanup" onclick="selectMainTab('cleanup')" disabled title="타겟 서버 및 클라우드 소스(MYBOX/GDrive) 연결 확인이 필요합니다.">
+            클라우드 정리
+            <span id="navCleanupBadge" class="nav-pill">잠김</span>
+          </button>
+          <button id="navTabSettings" class="tab-btn active" data-tab="settings" onclick="selectMainTab('settings')">
+            연동 설정
+          </button>
         </nav>
       </div>
       <div class="topbar-right">
@@ -826,58 +814,12 @@
       </div>
     </header>
 
-    <!-- 소스별 작업 워크스페이스 뷰 (MYBOX / Google Drive / Google Takeout) -->
-    <main id="workspaceView">
-      <section id="sourceContextPanel" class="source-context">
-        <div>
-          <div id="sourceContextTitle" class="source-context-title">네이버 MYBOX 원격 클라우드 동기화</div>
-          <div id="sourceContextDesc" class="source-context-desc">
-            MYBOX 폴더 트리를 증분 스캔하여 사진·영상은 Immich로, 일반 문서는 Nextcloud로 이주합니다.
-          </div>
-        </div>
-        <div id="sourceAuthBadge" class="source-auth-pill">
-          <span id="sourceAuthDot" class="dot"></span>
-          <span id="sourceAuthText">상태 확인 중...</span>
-        </div>
-      </section>
-
-      <!-- Google Takeout 탭 전용: 경로 지정 + ZIP 업로드 + 아카이브 목록 -->
-      <section id="takeoutArchivePanel" class="takeout-panel">
-        <div class="takeout-grid">
-          <div class="takeout-box">
-            <div class="box-label">1. 서버 내 Takeout 폴더 경로 지정</div>
-            <div class="box-help">NAS/서버에 이미 다운로드된 Google Takeout ZIP 폴더 경로를 입력합니다.</div>
-            <div class="path-form">
-              <input id="takeoutDirInput" type="text" class="input-text mono" placeholder="/data/takeout" />
-              <button class="btn" onclick="saveTakeoutPath()">경로 적용</button>
-            </div>
-          </div>
-          <div class="takeout-box">
-            <div class="box-label">2. 브라우저에서 Takeout ZIP 직접 업로드</div>
-            <div class="box-help">내 PC의 takeout-*.zip 파일을 선택하거나 끌어다 놓으면 위 경로로 즉시 업로드됩니다.</div>
-            <div id="zipDropzone" class="upload-dropzone" onclick="document.getElementById('zipFileInput').click()">
-              <span id="zipUploadStatus" class="upload-status">클릭하거나 .zip 파일을 이곳에 드롭하세요</span>
-              <span class="btn" style="padding:3px 8px;font-size:11.5px;">파일 선택</span>
-              <input id="zipFileInput" type="file" accept=".zip" multiple style="display:none;" onchange="handleZipFileSelect(this.files)" />
-            </div>
-          </div>
-        </div>
-        <div>
-          <div class="archive-list-header">
-            <span>인식된 Takeout ZIP 아카이브 목록</span>
-            <span id="takeoutArchiveSummary" class="num">0개 · 0 B</span>
-          </div>
-          <div id="takeoutArchiveList" class="archive-list mono">
-            <div class="empty-state">지정된 폴더에 인식된 .zip 아카이브가 없습니다.</div>
-          </div>
-        </div>
-      </section>
-
-      <!-- 명시적 작업 제어 바 (드롭다운 없이 소스 성격에 맞는 버튼 바로 노출) -->
+    <!-- 탭 1: 동기화 (연결 확인된 소스만 노출, 원격 삭제 기능 완전 배제) -->
+    <main id="syncView" class="tab-view">
       <section class="control-panel">
         <div class="control-row">
           <div class="status-info">
-            <div id="currentFileLabel" class="current-task">대기 중 — 실행할 작업을 선택하세요</div>
+            <div id="currentFileLabel" class="current-task">대기 중 — 동기화할 소스를 실행하세요</div>
             <div id="progressMeta" class="progress-meta num">0% · 0.0 파일/초</div>
           </div>
           <div class="action-toolbar">
@@ -888,14 +830,7 @@
               <option value="20">테스트: 20개만</option>
               <option value="100">테스트: 100개만</option>
             </select>
-            <button id="primaryActionBtn" class="btn btn-primary" onclick="handlePrimaryAction()">스캔 + 동기화 시작</button>
-            <button id="scanOnlyBtn" class="btn job-trigger" onclick="startJob('scan', false)">스캔만</button>
-            <button id="syncOnlyBtn" class="btn job-trigger" onclick="startJob('sync', false)">동기화만</button>
-            <div id="cloudDeleteGroup" class="cloud-delete-group">
-              <span class="divider-v" style="margin: 0 4px;"></span>
-              <button class="btn job-trigger" onclick="startJob('delete', true)">원격 삭제 Dry-run</button>
-              <button class="btn btn-danger-outline job-trigger" onclick="openDeleteModal()">휴지통 이동</button>
-            </div>
+            <button id="globalSyncBtn" class="btn btn-primary" onclick="handleGlobalSyncAction()">전체 순차 동기화</button>
           </div>
         </div>
         <div class="progress-track">
@@ -903,231 +838,278 @@
         </div>
       </section>
 
-      <!-- 4열 인라인 메트릭 스트립 -->
-      <section id="metricStrip" class="metric-strip">
-        <div class="metric-cell">
-          <div id="metricPendingLabel" class="metric-label">대기 중 (Pending)</div>
-          <div id="statPending" class="metric-value num">0</div>
-          <div class="metric-sub">
-            <span id="statFolders" class="num">폴더 0개 · 0 B</span>
-          </div>
-        </div>
-        <div class="metric-cell">
-          <div class="metric-label">Immich 완료</div>
-          <div id="statImmich" class="metric-value num">0</div>
-          <div class="metric-sub">
-            <span id="statImmichSub" class="num">신규 0 · 중복 0</span>
-          </div>
-        </div>
-        <div class="metric-cell">
-          <div class="metric-label">Nextcloud 완료</div>
-          <div id="statNextcloud" class="metric-value num">0</div>
-          <div class="metric-sub">
-            <span id="statNextcloudSub" class="num">누적 0 B</span>
-          </div>
-        </div>
-        <div class="metric-cell">
-          <div id="metricFourthLabel" class="metric-label">원격 삭제 · 실패</div>
-          <div id="statDeletedFailed" class="metric-value num">0 / 0</div>
-          <div class="metric-sub">
-            <span id="statDeletedBytes" class="num">절감 0 B</span>
-            <button id="inlineRetryBtn" class="link-btn" style="display:none;" onclick="retryFailed()">재시도</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- 하단 실시간 로그 / 실패 목록 탭 -->
-      <section class="viewer-panel">
-        <div class="viewer-header">
-          <div id="viewerTabs" class="viewer-tabs">
-            <button id="tabLogsBtn" class="vtab-btn active" onclick="switchViewerTab('logs')">실시간 로그</button>
-            <button id="tabFailuresBtn" class="vtab-btn" onclick="switchViewerTab('failures')">
-              실패 항목
-              <span id="failureCountBadge" class="count-pill num">0</span>
-            </button>
-          </div>
-          <div>
-            <button id="clearLogsBtn" class="btn btn-ghost" onclick="clearLogs()">로그 지우기</button>
-            <button id="retryAllBtn" class="btn btn-ghost" style="display:none;" onclick="retryFailed()">실패 항목 전체 재시도</button>
-          </div>
-        </div>
-        <div id="logConsole" class="viewer-body mono">
-          <div class="log-line"><span class="log-time">[시스템]</span>대시보드 연결됨. 실시간 이벤트 스트림 수신 대기 중.</div>
-        </div>
-        <div id="failureView" class="viewer-body" style="display:none;">
-          <div id="failureList"></div>
-        </div>
-      </section>
+      <div id="verifiedSourceList"></div>
+      <div class="section-hint">
+        연결 확인을 통과한 소스만 표시됩니다. 다른 데이터 소스를 추가하려면 <button class="link-btn" onclick="selectMainTab('settings')">연동 설정</button> 탭에서 연결을 확인하세요.
+      </div>
     </main>
 
-    <!-- 환경 설정 전용 탭 뷰 (웹 폼에서 직접 입력 및 /data/settings.json 영구 저장) -->
-    <section id="settingsView" class="settings-view">
-      <div class="settings-toolbar">
-        <div>
-          <div style="font-size:14px;font-weight:600;">초기 구성 및 연동 설정</div>
-          <div id="settingsSaveNotice" style="font-size:12px;color:var(--muted);">
-            입력한 설정은 서버의 <span class="mono">/data/settings.json</span>에 영구 저장되며 컨테이너 재시작 없이 즉시 적용됩니다.
+    <!-- 탭 2: 클라우드 정리 (연결 확인된 원격 클라우드 MYBOX / Google Drive 전용) -->
+    <section id="cleanupView" class="tab-view">
+      <div class="control-panel">
+        <div class="control-row">
+          <div class="status-info">
+            <div id="cleanupTaskLabel" class="current-task">타겟 서버(Immich · Nextcloud)에 백업 완료된 파일만 재검증 후 원격 클라우드 휴지통으로 이동합니다.</div>
+            <div id="cleanupProgressMeta" class="progress-meta num">안전 2단계 절차: 1) Dry-run 시뮬레이션 → 2) 재검증 후 휴지통 이동</div>
+          </div>
+          <div class="action-toolbar">
+            <button id="cleanupStopBtn" class="btn" style="display:none;" onclick="stopJob()">일시정지</button>
           </div>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn" onclick="testConnections()">연결 테스트만 실행</button>
-          <button class="btn btn-primary" onclick="saveSettings(true)">설정 저장 및 연결 테스트</button>
+        <div class="progress-track">
+          <div id="cleanupProgressBar" class="progress-fill"></div>
         </div>
       </div>
 
-      <div class="settings-card">
-        <div class="settings-card-header">
-          <span class="settings-card-title">1. 데이터 소스 (Cloud Sources)</span>
+      <div id="verifiedCleanupList"></div>
+      <div class="section-hint">
+        로컬 아카이브인 Google Takeout은 원격 삭제 대상에서 자동 제외됩니다.
+      </div>
+    </section>
+
+    <!-- 탭 3: 연동 설정 (독립된 개별 카드 단위 저장 + 개별 연결 확인 + 필수/선택 구분) -->
+    <section id="settingsView" class="tab-view active">
+      <div class="readiness-banner">
+        <div>
+          <div id="readinessHeadline" style="font-size:13.5px;font-weight:600;">연동 상태 확인이 필요합니다</div>
+          <div id="readinessSubline" style="font-size:12px;color:var(--muted);">
+            필수 타겟(Immich)과 최소 1개 이상의 데이터 소스가 연결 확인되면 상단 [동기화] 메뉴가 활성화됩니다.
+          </div>
         </div>
-        <table class="settings-table">
-          <tbody>
-            <tr>
-              <th>
-                네이버 MYBOX
-                <span id="cfgMyboxBadge" class="field-sub">확인 중...</span>
-              </th>
-              <td>
-                <div class="form-grid">
-                  <div class="form-field">
-                    <label for="cfgMyboxPat">개인 액세스 토큰 (MYBOX_PAT)</label>
-                    <input id="cfgMyboxPat" type="password" class="input-text mono" placeholder="토큰 입력 (비워두면 기존 값 유지)" autocomplete="off" />
-                  </div>
-                  <div class="form-field">
-                    <label for="cfgMyboxApiBase">API Base URL</label>
-                    <input id="cfgMyboxApiBase" type="text" class="input-text mono" placeholder="https://apis.naver.com/mybox" />
-                  </div>
-                </div>
-                <div id="connStatusMybox" class="conn-result-line mono"></div>
-              </td>
-            </tr>
-            <tr>
-              <th>
-                Google Drive
-                <span id="cfgGdriveBadge" class="field-sub">확인 중...</span>
-              </th>
-              <td>
-                <div class="form-grid">
-                  <div class="form-field">
-                    <label for="cfgGdriveToken">OAuth 액세스 토큰 (GDRIVE_ACCESS_TOKEN)</label>
-                    <input id="cfgGdriveToken" type="password" class="input-text mono" placeholder="토큰 입력 (비워두면 기존 값 유지)" autocomplete="off" />
-                  </div>
-                  <div class="form-field">
-                    <label for="cfgGdriveApiBase">API Base URL</label>
-                    <input id="cfgGdriveApiBase" type="text" class="input-text mono" placeholder="https://www.googleapis.com/drive/v3" />
-                  </div>
-                </div>
-                <div id="connStatusGdrive" class="conn-result-line mono"></div>
-              </td>
-            </tr>
-            <tr>
-              <th>
-                Google Takeout
-                <span id="cfgTakeoutBadge" class="field-sub">로컬 ZIP 폴더</span>
-              </th>
-              <td>
-                <div class="form-field">
-                  <label for="cfgTakeoutDir">서버 내 Takeout ZIP 폴더 경로 (TAKEOUT_DIR)</label>
-                  <input id="cfgTakeoutDir" type="text" class="input-text mono" placeholder="/data/takeout" />
-                </div>
-                <div id="connStatusTakeout" class="conn-result-line mono"></div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+        <button class="btn" onclick="verifyAllConnections()">설정된 항목 일괄 연결 확인</button>
       </div>
 
-      <div class="settings-card">
-        <div class="settings-card-header">
-          <span class="settings-card-title">2. 타겟 스토리지 서버 (Immich & Nextcloud)</span>
+      <div class="settings-group-label">타겟 스토리지 서버 (NAS)</div>
+
+      <!-- 카드: Immich (필수) -->
+      <div class="integration-card">
+        <div class="integration-header">
+          <div class="integration-title-group">
+            <span class="integration-title">Immich (사진·영상 스토리지)</span>
+            <span class="role-tag required">필수 타겟</span>
+          </div>
+          <span id="badgeImmich" class="verified-chip"><span class="dot"></span>미설정</span>
         </div>
-        <table class="settings-table">
-          <tbody>
-            <tr>
-              <th>
-                Immich (사진·영상)
-                <span id="cfgImmichBadge" class="field-sub">확인 중...</span>
-              </th>
-              <td>
-                <div class="form-grid">
-                  <div class="form-field">
-                    <label for="cfgImmichUrl">Immich 서버 URL (IMMICH_URL)</label>
-                    <input id="cfgImmichUrl" type="text" class="input-text mono" placeholder="http://192.168.0.10:2283" />
-                  </div>
-                  <div class="form-field">
-                    <label for="cfgImmichApiKey">Immich API Key (IMMICH_API_KEY)</label>
-                    <input id="cfgImmichApiKey" type="password" class="input-text mono" placeholder="API Key 입력 (비워두면 기존 값 유지)" autocomplete="off" />
-                  </div>
-                </div>
-                <div id="connStatusImmich" class="conn-result-line mono"></div>
-              </td>
-            </tr>
-            <tr>
-              <th>
-                Nextcloud (문서·일반 파일)
-                <span id="cfgNextcloudBadge" class="field-sub">확인 중...</span>
-              </th>
-              <td>
-                <div style="margin-bottom:10px;">
-                  <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px;cursor:pointer;">
-                    <input id="cfgEnableNextcloud" type="checkbox" checked />
-                    <span>Nextcloud 문서·일반 파일 이주 활성화</span>
-                  </label>
-                </div>
-                <div class="form-grid">
-                  <div class="form-field">
-                    <label for="cfgNextcloudUrl">Nextcloud 서버 URL</label>
-                    <input id="cfgNextcloudUrl" type="text" class="input-text mono" placeholder="http://192.168.0.10:8080" />
-                  </div>
-                  <div class="form-field">
-                    <label for="cfgNextcloudBaseDir">업로드 대상 폴더 경로</label>
-                    <input id="cfgNextcloudBaseDir" type="text" class="input-text mono" placeholder="/Cloud-Backup" />
-                  </div>
-                  <div class="form-field">
-                    <label for="cfgNextcloudUser">사용자 계정 ID (NEXTCLOUD_USER)</label>
-                    <input id="cfgNextcloudUser" type="text" class="input-text mono" placeholder="admin" />
-                  </div>
-                  <div class="form-field">
-                    <label for="cfgNextcloudPassword">앱 비밀번호 (NEXTCLOUD_APP_PASSWORD)</label>
-                    <input id="cfgNextcloudPassword" type="password" class="input-text mono" placeholder="비밀번호 입력 (비워두면 기존 값 유지)" autocomplete="off" />
-                  </div>
-                </div>
-                <div id="connStatusNextcloud" class="conn-result-line mono"></div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+        <div class="integration-body">
+          <div class="form-grid">
+            <div class="form-field">
+              <label class="field-label" for="cfgImmichUrl">서버 URL <span class="req-tag">필수</span></label>
+              <input id="cfgImmichUrl" type="text" class="input-text mono" placeholder="http://192.168.0.10:2283" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="cfgImmichApiKey">API Key <span class="req-tag">필수</span></label>
+              <input id="cfgImmichApiKey" type="password" class="input-text mono" placeholder="Immich API Key 입력" autocomplete="off" />
+            </div>
+          </div>
+        </div>
+        <div class="integration-footer">
+          <div id="connMsgImmich" class="conn-feedback mono"></div>
+          <button class="btn btn-primary" onclick="saveAndVerifyCard('immich')">저장 및 연결 확인</button>
+        </div>
       </div>
 
-      <div class="settings-card">
-        <div class="settings-card-header">
-          <span class="settings-card-title">3. 파이프라인 실행 옵션</span>
+      <!-- 카드: Nextcloud (선택) -->
+      <div class="integration-card">
+        <div class="integration-header">
+          <div class="integration-title-group">
+            <span class="integration-title">Nextcloud (문서·일반 파일 스토리지)</span>
+            <span class="role-tag">선택 타겟</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;">
+            <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+              <input id="cfgEnableNextcloud" type="checkbox" onchange="toggleNextcloudFields()" />
+              <span>사용함</span>
+            </label>
+            <span id="badgeNextcloud" class="verified-chip"><span class="dot"></span>비활성</span>
+          </div>
         </div>
-        <table class="settings-table">
-          <tbody>
-            <tr>
-              <th>
-                성능 및 스케줄링
-                <span class="field-sub">동시성 · 속도 제한 · 주기</span>
-              </th>
-              <td>
-                <div class="form-grid" style="grid-template-columns: repeat(3, 1fr);">
-                  <div class="form-field">
-                    <label for="cfgConcurrency">동시 처리 워커 수</label>
-                    <input id="cfgConcurrency" type="number" min="1" max="32" class="input-text mono" placeholder="3" />
-                  </div>
-                  <div class="form-field">
-                    <label for="cfgRateLimitRps">초당 API 요청 제한 (RPS)</label>
-                    <input id="cfgRateLimitRps" type="number" step="0.5" min="0.5" class="input-text mono" placeholder="5.0" />
-                  </div>
-                  <div class="form-field">
-                    <label for="cfgSyncInterval">자동 동기화 주기 (분, 0=수동)</label>
-                    <input id="cfgSyncInterval" type="number" min="0" class="input-text mono" placeholder="0" />
-                  </div>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+        <div id="nextcloudFieldsBody" class="integration-body" style="display:none;">
+          <div class="form-grid">
+            <div class="form-field">
+              <label class="field-label" for="cfgNextcloudUrl">서버 URL <span class="req-tag">필수 · 자체 서명 HTTPS 지원</span></label>
+              <input id="cfgNextcloudUrl" type="text" class="input-text mono" placeholder="https://192.168.0.10:9001" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="cfgNextcloudBaseDir">상위 루트 폴더 <span class="opt-tag">선택 · 기본 / → /MyBox, /GoogleDrive 자동 분리</span></label>
+              <input id="cfgNextcloudBaseDir" type="text" class="input-text mono" placeholder="/ (비워두면 최상위에 소스별 폴더 생성)" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="cfgNextcloudUser">사용자 계정 ID <span class="req-tag">필수</span></label>
+              <input id="cfgNextcloudUser" type="text" class="input-text mono" placeholder="admin" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="cfgNextcloudPassword">앱 비밀번호 <span class="req-tag">필수</span></label>
+              <input id="cfgNextcloudPassword" type="password" class="input-text mono" placeholder="Nextcloud 앱 비밀번호 입력" autocomplete="off" />
+            </div>
+          </div>
+        </div>
+        <div id="nextcloudDisabledNote" class="integration-body" style="color:var(--muted);font-size:12.5px;">
+          비활성화 상태입니다. 사진·영상(Immich)만 이주하며 일반 문서 파일은 건너뜁니다.
+        </div>
+        <div class="integration-footer">
+          <div id="connMsgNextcloud" class="conn-feedback mono"></div>
+          <button id="saveNextcloudBtn" class="btn" onclick="saveAndVerifyCard('nextcloud')">사용 안 함 저장</button>
+        </div>
+      </div>
+
+      <div class="settings-group-label">데이터 소스 (최소 1개 이상 연결 확인 필요)</div>
+
+      <!-- 카드: 네이버 MYBOX -->
+      <div class="integration-card">
+        <div class="integration-header">
+          <div class="integration-title-group">
+            <span class="integration-title">네이버 MYBOX</span>
+            <span class="role-tag">원격 클라우드</span>
+          </div>
+          <span id="badgeMybox" class="verified-chip"><span class="dot"></span>미설정</span>
+        </div>
+        <div class="integration-body">
+          <div class="form-grid">
+            <div class="form-field">
+              <label class="field-label" for="cfgMyboxPat">개인 액세스 토큰 (PAT) <span class="req-tag">필수</span></label>
+              <input id="cfgMyboxPat" type="password" class="input-text mono" placeholder="MYBOX PAT 토큰 입력" autocomplete="off" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="cfgMyboxApiBase">API Base URL <span class="opt-tag">선택 · 기본값 자동 적용</span></label>
+              <input id="cfgMyboxApiBase" type="text" class="input-text mono" placeholder="https://apis.naver.com/mybox" />
+            </div>
+          </div>
+        </div>
+        <div class="integration-footer">
+          <div id="connMsgMybox" class="conn-feedback mono"></div>
+          <button class="btn btn-primary" onclick="saveAndVerifyCard('mybox')">저장 및 연결 확인</button>
+        </div>
+      </div>
+
+      <!-- 카드: Google Drive -->
+      <div class="integration-card">
+        <div class="integration-header">
+          <div class="integration-title-group">
+            <span class="integration-title">Google Drive</span>
+            <span class="role-tag">원격 클라우드</span>
+          </div>
+          <span id="badgeGdrive" class="verified-chip"><span class="dot"></span>미설정</span>
+        </div>
+        <div class="integration-body">
+          <div class="form-grid">
+            <div class="form-field">
+              <label class="field-label" for="cfgGdriveToken">OAuth 액세스 토큰 <span class="req-tag">필수</span></label>
+              <input id="cfgGdriveToken" type="password" class="input-text mono" placeholder="Google Drive 액세스 토큰 입력" autocomplete="off" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="cfgGdriveApiBase">API Base URL <span class="opt-tag">선택 · 기본값 자동 적용</span></label>
+              <input id="cfgGdriveApiBase" type="text" class="input-text mono" placeholder="https://www.googleapis.com/drive/v3" />
+            </div>
+          </div>
+        </div>
+        <div class="integration-footer">
+          <div id="connMsgGdrive" class="conn-feedback mono"></div>
+          <button class="btn btn-primary" onclick="saveAndVerifyCard('gdrive')">저장 및 연결 확인</button>
+        </div>
+      </div>
+
+      <!-- 카드: Google Takeout -->
+      <div class="integration-card">
+        <div class="integration-header">
+          <div class="integration-title-group">
+            <span class="integration-title">Google Takeout</span>
+            <span class="role-tag">일회성 ZIP 다운로드 · 동기화 후 자동 삭제</span>
+          </div>
+          <span id="badgeTakeout" class="verified-chip"><span class="dot"></span>미설정</span>
+        </div>
+        <div class="integration-body">
+          <div class="form-field" style="margin-bottom:12px;">
+            <label class="field-label" for="cfgTakeoutUrl">Takeout ZIP 다운로드 링크 (URL) <span class="req-tag">권장 · NAS로 직접 다운로드</span></label>
+            <div style="display:flex;gap:8px;">
+              <input id="cfgTakeoutUrl" type="text" class="input-text mono" placeholder="https://...googleusercontent.com/... (브라우저 다운로드 목록 Ctrl+J → 링크 복사)" autocomplete="off" />
+              <button id="fetchTakeoutUrlBtn" class="btn btn-primary" onclick="fetchTakeoutFromUrl()">URL에서 NAS로 다운로드</button>
+            </div>
+            <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
+              이메일 버튼 주소는 로그인 화면을 거치므로, 브라우저에서 다운로드를 시작(즉시 일시정지 가능)한 뒤 다운로드 목록(<span class="mono">Ctrl+J</span>)에서 복사한 실제 스트림 주소를 붙여넣으세요.
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="form-field">
+              <label class="field-label" for="cfgTakeoutDir">NAS 임시 저장 폴더 <span class="opt-tag">선택 · 기본 /data/takeout (자동 생성)</span></label>
+              <input id="cfgTakeoutDir" type="text" class="input-text mono" placeholder="/data/takeout" />
+            </div>
+            <div class="form-field">
+              <label class="field-label">로컬 .zip 직접 업로드 <span class="opt-tag">선택 · 링크 만료/세션 제한 시 대체</span></label>
+              <div id="zipDropzone" class="upload-dropzone" onclick="document.getElementById('zipFileInput').click()">
+                <span id="zipUploadStatus" style="font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                  클릭하거나 .zip 파일을 이곳에 드롭하세요
+                </span>
+                <span class="btn" style="padding:2px 8px;font-size:11.5px;">파일 선택</span>
+                <input id="zipFileInput" type="file" accept=".zip" multiple style="display:none;" onchange="handleZipFileSelect(this.files)" />
+              </div>
+            </div>
+          </div>
+          <div class="archive-box">
+            <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);">
+              <span>대기 중인 Takeout ZIP 아카이브 (전체 동기화 및 타겟 검증 완료 시 자동 삭제)</span>
+              <span id="takeoutArchiveSummary" class="num">0개 · 0 B</span>
+            </div>
+            <div id="takeoutArchiveList" class="archive-list mono"></div>
+          </div>
+        </div>
+        <div class="integration-footer">
+          <div id="connMsgTakeout" class="conn-feedback mono"></div>
+          <button class="btn" onclick="saveAndVerifyCard('takeout')">폴더 경로 저장 및 ZIP 재확인</button>
+        </div>
+      </div>
+
+      <div class="settings-group-label">파이프라인 실행 엔진 옵션</div>
+
+      <!-- 카드: 엔진 옵션 -->
+      <div class="integration-card">
+        <div class="integration-header">
+          <div class="integration-title-group">
+            <span class="integration-title">동시성 · API 제한 · 자동 스케줄</span>
+            <span class="role-tag">선택 설정</span>
+          </div>
+        </div>
+        <div class="integration-body">
+          <div class="form-grid" style="grid-template-columns: repeat(3, 1fr);">
+            <div class="form-field">
+              <label class="field-label" for="cfgConcurrency">동시 워커 수 <span class="opt-tag">기본 3</span></label>
+              <input id="cfgConcurrency" type="number" min="1" max="32" class="input-text mono" placeholder="3" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="cfgRateLimitRps">요청 제한 (RPS) <span class="opt-tag">기본 5.0</span></label>
+              <input id="cfgRateLimitRps" type="number" step="0.5" min="0.5" class="input-text mono" placeholder="5.0" />
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="cfgSyncInterval">자동 주기 (분) <span class="opt-tag">0=수동</span></label>
+              <input id="cfgSyncInterval" type="number" min="0" class="input-text mono" placeholder="0" />
+            </div>
+          </div>
+        </div>
+        <div class="integration-footer">
+          <div id="connMsgEngine" class="conn-feedback mono"></div>
+          <button class="btn" onclick="saveEngineOptions()">옵션 저장</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 공통 하단 실시간 로그 & 실패 내역 콘솔 -->
+    <section id="sharedViewerPanel" class="viewer-panel">
+      <div class="viewer-header">
+        <div id="viewerTabs" class="viewer-tabs">
+          <button id="tabLogsBtn" class="vtab-btn active" onclick="switchViewerTab('logs')">실시간 로그</button>
+          <button id="tabFailuresBtn" class="vtab-btn" onclick="switchViewerTab('failures')">
+            실패 항목
+            <span id="failureCountBadge" class="count-pill num">0</span>
+          </button>
+        </div>
+        <div>
+          <button id="clearLogsBtn" class="btn btn-ghost" onclick="clearLogs()">로그 지우기</button>
+        </div>
+      </div>
+      <div id="logConsole" class="viewer-body mono">
+        <div class="log-line"><span class="log-time">[시스템]</span>대시보드 연결됨. 실시간 이벤트 스트림 수신 대기 중.</div>
+      </div>
+      <div id="failureView" class="viewer-body" style="display:none;">
+        <div id="failureList"></div>
       </div>
     </section>
   </div>
@@ -1135,8 +1117,8 @@
   <!-- 원격 삭제 확인 모달 -->
   <div class="modal-backdrop" id="deleteModal">
     <div class="modal">
-      <h3>완료 항목 원격 삭제 (휴지통 이동)</h3>
-      <p>Immich 또는 Nextcloud로 이주가 완료(UPLOADED)된 파일만 대상이 되며, 삭제 직전 타겟 서버에 파일이 존재하는지 재검증한 뒤 원격 클라우드 휴지통으로 이동합니다. 계속하시겠습니까?</p>
+      <h3 id="deleteModalTitle">완료 항목 원격 삭제 (휴지통 이동)</h3>
+      <p>Immich 또는 Nextcloud로 백업이 완료(UPLOADED)된 파일만 대상이 되며, 삭제 직전 타겟 서버에 파일 해시/크기가 존재하는지 100% 재검증한 뒤 원격 클라우드 휴지통으로 이동합니다. 계속하시겠습니까?</p>
       <div class="modal-actions">
         <button class="btn" onclick="closeDeleteModal()">취소</button>
         <button class="btn btn-danger" onclick="confirmDelete()">재검증 후 휴지통 이동 실행</button>
@@ -1145,35 +1127,24 @@
   </div>
 
   <script>
-    let currentTab = 'mybox';
-    let currentSource = 'mybox';
+    let currentTab = 'settings';
+    let initialRouteResolved = false;
+    let settingsFormInitialized = false;
     let currentJobState = 'idle';
     let initialLogsLoaded = false;
-    let lastStatusData = null;
-    let lastConnectionResults = {};
+    let pendingDeleteSource = null;
+    let latestReadiness = {
+      targets_ready: false,
+      sync_tab_enabled: false,
+      delete_tab_enabled: false,
+      verified_sources: [],
+      verified_cloud_sources: []
+    };
 
-    const SOURCE_META = {
-      mybox: {
-        title: '네이버 MYBOX 원격 클라우드 동기화',
-        desc: 'MYBOX 폴더 트리를 증분 스캔하여 사진·영상은 Immich로, 일반 문서는 Nextcloud로 이주합니다. 완료된 항목은 재검증 후 원격 휴지통으로 정리할 수 있습니다.',
-        primaryIdleLabel: '스캔 + 동기화 시작',
-        scanLabel: '스캔만',
-        supportsRemoteDelete: true
-      },
-      gdrive: {
-        title: 'Google Drive 클라우드 동기화',
-        desc: 'Google Drive v3 API를 통해 폴더 구조와 파일 체크섬을 스캔하고 Immich · Nextcloud로 이주합니다. 완료된 항목은 재검증 후 Drive 휴지통으로 이동할 수 있습니다.',
-        primaryIdleLabel: '스캔 + 동기화 시작',
-        scanLabel: '스캔만',
-        supportsRemoteDelete: true
-      },
-      takeout: {
-        title: 'Google Takeout ZIP 아카이브 추출 및 메타데이터 매칭',
-        desc: '지정된 폴더 또는 업로드된 Takeout .zip 압축파일 내부의 미디어와 동반 .json 메타데이터(photoTakenTime)를 매칭하여 원본 촬영일시를 보존한 채 이주합니다.',
-        primaryIdleLabel: 'ZIP 스캔 + 이주 시작',
-        scanLabel: 'ZIP 목록 스캔만',
-        supportsRemoteDelete: false
-      }
+    const SOURCE_NAMES = {
+      mybox: '네이버 MYBOX',
+      gdrive: 'Google Drive',
+      takeout: 'Google Takeout'
     };
 
     function updateThemeButtonLabel() {
@@ -1190,42 +1161,27 @@
       updateThemeButtonLabel();
     }
 
-    function selectMainTab(tab, btn) {
+    function selectMainTab(tab) {
+      if (tab === 'sync' && !latestReadiness.sync_tab_enabled) return;
+      if (tab === 'cleanup' && !latestReadiness.delete_tab_enabled) return;
+
       currentTab = tab;
-      document.querySelectorAll('.main-nav .tab-btn').forEach(b => b.classList.remove('active'));
-      if (btn) btn.classList.add('active');
+      document.getElementById('navTabSync').classList.toggle('active', tab === 'sync');
+      document.getElementById('navTabCleanup').classList.toggle('active', tab === 'cleanup');
+      document.getElementById('navTabSettings').classList.toggle('active', tab === 'settings');
 
-      const workspace = document.getElementById('workspaceView');
-      const settings = document.getElementById('settingsView');
-
-      if (tab === 'settings') {
-        workspace.style.display = 'none';
-        settings.classList.add('active');
-        fetchStatus();
-      } else {
-        currentSource = tab;
-        settings.classList.remove('active');
-        workspace.style.display = 'block';
-        applySourceLayout(currentSource);
-        fetchStatus();
-      }
+      document.getElementById('syncView').classList.toggle('active', tab === 'sync');
+      document.getElementById('cleanupView').classList.toggle('active', tab === 'cleanup');
+      document.getElementById('settingsView').classList.toggle('active', tab === 'settings');
     }
 
-    function applySourceLayout(src) {
-      const meta = SOURCE_META[src] || SOURCE_META.mybox;
-      document.getElementById('sourceContextTitle').textContent = meta.title;
-      document.getElementById('sourceContextDesc').textContent = meta.desc;
-      document.getElementById('scanOnlyBtn').textContent = meta.scanLabel;
-
-      const isTakeout = src === 'takeout';
-      document.getElementById('takeoutArchivePanel').classList.toggle('active', isTakeout);
-      document.getElementById('cloudDeleteGroup').style.display = meta.supportsRemoteDelete ? 'inline-flex' : 'none';
-      document.getElementById('metricPendingLabel').textContent = isTakeout ? '추출 대기 미디어 (Pending)' : '대기 중 (Pending)';
-      document.getElementById('metricFourthLabel').textContent = isTakeout ? '실패 항목 (원본 ZIP 보존)' : '원격 삭제 · 실패';
-
-      if (currentJobState === 'idle') {
-        document.getElementById('primaryActionBtn').textContent = meta.primaryIdleLabel;
-      }
+    function toggleNextcloudFields() {
+      const enabled = document.getElementById('cfgEnableNextcloud').checked;
+      document.getElementById('nextcloudFieldsBody').style.display = enabled ? 'block' : 'none';
+      document.getElementById('nextcloudDisabledNote').style.display = enabled ? 'none' : 'block';
+      const btn = document.getElementById('saveNextcloudBtn');
+      btn.textContent = enabled ? '저장 및 연결 확인' : '사용 안 함 저장';
+      btn.classList.toggle('btn-primary', enabled);
     }
 
     function switchViewerTab(tab) {
@@ -1235,7 +1191,6 @@
       document.getElementById('logConsole').style.display = isLogs ? 'block' : 'none';
       document.getElementById('failureView').style.display = isLogs ? 'none' : 'block';
       document.getElementById('clearLogsBtn').style.display = isLogs ? 'inline-flex' : 'none';
-      document.getElementById('retryAllBtn').style.display = !isLogs ? 'inline-flex' : 'none';
     }
 
     function clearLogs() {
@@ -1274,35 +1229,154 @@
       box.scrollTop = box.scrollHeight;
     }
 
-    async function testConnections() {
-      try {
-        const res = await fetch('/api/connections/test', { method: 'POST' });
-        const data = await res.json();
-        lastConnectionResults = data.results || {};
-        const parts = [];
-        for (const [k, v] of Object.entries(lastConnectionResults)) {
-          parts.push(`${k}: ${v.ok ? '정상' : '실패'} (${v.message})`);
-        }
-        appendLog(new Date().toLocaleTimeString(), '연결 테스트: ' + (parts.join(' · ') || '설정된 항목 없음'));
-        if (lastStatusData) renderSettingsTables(lastStatusData);
-      } catch (_) {}
+    async function verifyAllConnections() {
+      const res = await fetch('/api/connections/test', { method: 'POST' });
+      if (res.ok) {
+        await fetchStatus();
+      }
     }
 
-    async function saveTakeoutPath() {
-      const input = document.getElementById('takeoutDirInput');
-      const takeout_dir = (input.value || '').trim();
-      if (!takeout_dir) return;
-      const res = await fetch('/api/takeout/path', {
+    async function saveAndVerifyCard(service) {
+      let payload = { verify_service: service };
+      const msgElMap = {
+        immich: 'connMsgImmich',
+        nextcloud: 'connMsgNextcloud',
+        mybox: 'connMsgMybox',
+        gdrive: 'connMsgGdrive',
+        takeout: 'connMsgTakeout'
+      };
+      const msgEl = document.getElementById(msgElMap[service]);
+      if (msgEl) {
+        msgEl.style.color = 'var(--muted)';
+        msgEl.textContent = '저장 및 연결 확인 중...';
+      }
+
+      if (service === 'immich') {
+        payload.immich_url = document.getElementById('cfgImmichUrl').value;
+        payload.immich_api_key = document.getElementById('cfgImmichApiKey').value;
+      } else if (service === 'nextcloud') {
+        const enabled = document.getElementById('cfgEnableNextcloud').checked;
+        payload.enable_nextcloud = enabled;
+        if (enabled) {
+          payload.nextcloud_url = document.getElementById('cfgNextcloudUrl').value;
+          payload.nextcloud_user = document.getElementById('cfgNextcloudUser').value;
+          payload.nextcloud_app_password = document.getElementById('cfgNextcloudPassword').value;
+          payload.nextcloud_base_dir = document.getElementById('cfgNextcloudBaseDir').value;
+        }
+      } else if (service === 'mybox') {
+        payload.mybox_pat = document.getElementById('cfgMyboxPat').value;
+        payload.mybox_api_base = document.getElementById('cfgMyboxApiBase').value;
+      } else if (service === 'gdrive') {
+        payload.gdrive_access_token = document.getElementById('cfgGdriveToken').value;
+        payload.gdrive_api_base = document.getElementById('cfgGdriveApiBase').value;
+      } else if (service === 'takeout') {
+        const takeout_dir = (document.getElementById('cfgTakeoutDir').value || '').trim();
+        const res = await fetch('/api/takeout/path', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ takeout_dir })
+        });
+        const data = await res.json();
+        if (!res.ok && msgEl) {
+          msgEl.style.color = 'var(--err)';
+          msgEl.textContent = data.error || '경로 저장 실패';
+          return;
+        }
+        await fetchStatus();
+        return;
+      }
+
+      const res = await fetch('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ takeout_dir })
+        body: JSON.stringify(payload)
       });
       const data = await res.json();
       if (!res.ok) {
-        appendLog(new Date().toLocaleTimeString(), `Takeout 경로 오류: ${data.error || '변경 실패'}`);
+        if (msgEl) {
+          msgEl.style.color = 'var(--err)';
+          msgEl.textContent = data.error || '설정 저장 실패';
+        }
         return;
       }
-      fetchStatus();
+
+      const cs = data.config_summary || {};
+      if (service === 'immich') {
+        document.getElementById('cfgImmichApiKey').value = '';
+        if (cs.immich_url) document.getElementById('cfgImmichUrl').value = cs.immich_url;
+      }
+      if (service === 'nextcloud') {
+        document.getElementById('cfgNextcloudPassword').value = '';
+        if (cs.nextcloud_url) document.getElementById('cfgNextcloudUrl').value = cs.nextcloud_url;
+      }
+      if (service === 'mybox') document.getElementById('cfgMyboxPat').value = '';
+      if (service === 'gdrive') document.getElementById('cfgGdriveToken').value = '';
+
+      await fetchStatus();
+    }
+
+    async function saveEngineOptions() {
+      const msgEl = document.getElementById('connMsgEngine');
+      const payload = {
+        concurrency: Number(document.getElementById('cfgConcurrency').value) || 3,
+        rate_limit_rps: Number(document.getElementById('cfgRateLimitRps').value) || 5.0,
+        sync_interval_minutes: Number(document.getElementById('cfgSyncInterval').value) || 0
+      };
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (res.ok) {
+        msgEl.style.color = 'var(--ok)';
+        msgEl.textContent = '실행 옵션이 저장되었습니다.';
+        await fetchStatus();
+      } else {
+        msgEl.style.color = 'var(--err)';
+        msgEl.textContent = '옵션 저장 실패';
+      }
+    }
+
+    async function fetchTakeoutFromUrl() {
+      const urlInput = document.getElementById('cfgTakeoutUrl');
+      const dirInput = document.getElementById('cfgTakeoutDir');
+      const msgEl = document.getElementById('connMsgTakeout');
+      const btn = document.getElementById('fetchTakeoutUrlBtn');
+      const url = (urlInput.value || '').trim();
+      const takeout_dir = (dirInput.value || '').trim();
+
+      if (!url) {
+        msgEl.style.color = 'var(--err)';
+        msgEl.textContent = '다운로드할 Takeout ZIP 링크(URL)를 입력해 주세요.';
+        return;
+      }
+
+      btn.disabled = true;
+      msgEl.style.color = 'var(--muted)';
+      msgEl.textContent = 'URL 연결 및 ZIP 스트림 검증 중...';
+
+      try {
+        const res = await fetch('/api/takeout/fetch-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, takeout_dir })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          msgEl.style.color = 'var(--err)';
+          msgEl.textContent = data.error || 'URL 다운로드 시작 실패';
+          return;
+        }
+        urlInput.value = '';
+        msgEl.style.color = 'var(--ok)';
+        msgEl.textContent = `NAS로 직접 다운로드 중: ${data.filename} (완료 시 자동 연결 확인됨)`;
+        await fetchStatus();
+      } catch (_) {
+        msgEl.style.color = 'var(--err)';
+        msgEl.textContent = '서버 요청 중 오류가 발생했습니다.';
+      } finally {
+        btn.disabled = false;
+      }
     }
 
     async function handleZipFileSelect(fileList) {
@@ -1321,8 +1395,8 @@
             statusEl.textContent = `업로드 실패: ${data.error || file.name}`;
             return;
           }
-        } catch (err) {
-          statusEl.textContent = `업로드 중 네트워크 오류: ${file.name}`;
+        } catch (_) {
+          statusEl.textContent = `업로드 오류: ${file.name}`;
           return;
         }
       }
@@ -1349,74 +1423,12 @@
 
     async function fetchStatus() {
       try {
-        const res = await fetch(`/api/status?source=${currentSource}`);
+        const res = await fetch('/api/status');
         if (!res.ok) return;
         const d = await res.json();
-        lastStatusData = d;
         renderStatus(d);
       } catch (_) {}
     }
-
-    function renderSourceAuthBadge(d) {
-      const c = d.config_summary || {};
-      const t = d.takeout_info || {};
-      const dot = document.getElementById('sourceAuthDot');
-      const text = document.getElementById('sourceAuthText');
-      dot.className = 'dot';
-
-      if (currentSource === 'mybox') {
-        if (c.mybox_configured) {
-          dot.classList.add('ok');
-          text.textContent = 'MYBOX PAT 토큰 설정됨';
-        } else {
-          dot.classList.add('warn');
-          text.textContent = 'MYBOX PAT 미설정 (환경 설정 탭 확인)';
-        }
-      } else if (currentSource === 'gdrive') {
-        if (c.gdrive_configured) {
-          dot.classList.add('ok');
-          text.textContent = 'Google Drive 토큰 설정됨';
-        } else {
-          dot.classList.add('warn');
-          text.textContent = 'Google Drive 토큰 미설정 (환경 설정 탭 확인)';
-        }
-      } else if (currentSource === 'takeout') {
-        const archives = t.archives || [];
-        if (archives.length > 0) {
-          dot.classList.add('ok');
-          text.textContent = `ZIP 아카이브 ${archives.length}개 준비됨`;
-        } else {
-          dot.classList.add('warn');
-          text.textContent = '인식된 ZIP 파일 없음 (경로 지정 또는 업로드 필요)';
-        }
-      }
-    }
-
-    function renderTakeoutPanel(d) {
-      const t = d.takeout_info || {};
-      const dirInput = document.getElementById('takeoutDirInput');
-      if (dirInput && document.activeElement !== dirInput && t.dir) {
-        dirInput.value = t.dir;
-      }
-
-      const archives = t.archives || [];
-      const totalBytes = archives.reduce((acc, a) => acc + (Number(a.size_bytes) || 0), 0);
-      document.getElementById('takeoutArchiveSummary').textContent = `${archives.length}개 · ${formatBytes(totalBytes)}`;
-
-      const listEl = document.getElementById('takeoutArchiveList');
-      if (archives.length > 0) {
-        listEl.innerHTML = archives.map(a => `
-          <div class="archive-row">
-            <span>${a.name}</span>
-            <span class="num" style="color:var(--muted);">${formatBytes(a.size_bytes)}</span>
-          </div>
-        `).join('');
-      } else {
-        listEl.innerHTML = '<div class="empty-state">지정된 폴더에 인식된 .zip 아카이브가 없습니다.</div>';
-      }
-    }
-
-    let settingsFormInitialized = false;
 
     function setInputIfUntouched(id, val) {
       const el = document.getElementById(id);
@@ -1426,114 +1438,290 @@
       }
     }
 
-    function renderConnLine(elId, key) {
-      const el = document.getElementById(elId);
-      if (!el) return;
-      const r = lastConnectionResults[key];
-      if (!r) {
-        el.textContent = '';
+    function renderCardBadge(badgeId, msgId, configured, connObj, disabledMode) {
+      const badge = document.getElementById(badgeId);
+      const msgEl = document.getElementById(msgId);
+      if (!badge) return;
+
+      if (disabledMode) {
+        badge.innerHTML = '<span class="dot"></span>비활성 (미사용)';
+        if (msgEl) msgEl.textContent = '';
         return;
       }
-      el.style.color = r.ok ? 'var(--ok)' : 'var(--err)';
-      el.textContent = `${r.ok ? '연결 정상' : '연결 실패'}: ${r.message}`;
+
+      if (!configured) {
+        badge.innerHTML = '<span class="dot"></span>미설정';
+        if (msgEl && (!connObj || !connObj.verified)) msgEl.textContent = '';
+        if (msgEl && connObj && connObj.verified && !connObj.ok) {
+          msgEl.style.color = 'var(--err)';
+          msgEl.textContent = connObj.message;
+        }
+        return;
+      }
+
+      if (connObj && connObj.verified) {
+        if (connObj.ok) {
+          badge.innerHTML = '<span class="dot ok"></span>연결 확인됨';
+          if (msgEl) {
+            msgEl.style.color = 'var(--ok)';
+            msgEl.textContent = connObj.message;
+          }
+        } else {
+          badge.innerHTML = '<span class="dot err"></span>연결 실패';
+          if (msgEl) {
+            msgEl.style.color = 'var(--err)';
+            msgEl.textContent = connObj.message;
+          }
+        }
+      } else {
+        badge.innerHTML = '<span class="dot warn"></span>연결 확인 필요';
+        if (msgEl) {
+          msgEl.style.color = 'var(--muted)';
+          msgEl.textContent = '저장 및 연결 확인 버튼을 눌러 연결을 검증하세요.';
+        }
+      }
     }
 
-    function renderSettingsTables(d) {
+    function renderNavigationAndReadiness(d) {
+      const r = d.readiness || {};
+      latestReadiness = r;
+
+      const syncTab = document.getElementById('navTabSync');
+      const cleanupTab = document.getElementById('navTabCleanup');
+      const syncBadge = document.getElementById('navSyncBadge');
+      const cleanupBadge = document.getElementById('navCleanupBadge');
+
+      syncTab.disabled = !r.sync_tab_enabled;
+      cleanupTab.disabled = !r.delete_tab_enabled;
+
+      if (r.sync_tab_enabled) {
+        syncBadge.textContent = `${(r.verified_sources || []).length}개 활성`;
+        syncBadge.classList.add('ready');
+      } else {
+        syncBadge.textContent = '잠김';
+        syncBadge.classList.remove('ready');
+      }
+
+      if (r.delete_tab_enabled) {
+        cleanupBadge.textContent = `${(r.verified_cloud_sources || []).length}개 활성`;
+        cleanupBadge.classList.add('ready');
+      } else {
+        cleanupBadge.textContent = '잠김';
+        cleanupBadge.classList.remove('ready');
+      }
+
+      if (!initialRouteResolved) {
+        initialRouteResolved = true;
+        selectMainTab(r.sync_tab_enabled ? 'sync' : 'settings');
+      } else {
+        if (currentTab === 'sync' && !r.sync_tab_enabled) selectMainTab('settings');
+        if (currentTab === 'cleanup' && !r.delete_tab_enabled) selectMainTab('settings');
+      }
+
+      const headline = document.getElementById('readinessHeadline');
+      const subline = document.getElementById('readinessSubline');
+      if (r.sync_tab_enabled) {
+        const names = (r.verified_sources || []).map(s => SOURCE_NAMES[s] || s).join(', ');
+        headline.textContent = '연동 검증 완료 — 동기화 메뉴가 활성화되었습니다';
+        subline.textContent = `활성화된 데이터 소스: ${names}`;
+      } else if (!r.targets_ready) {
+        headline.textContent = '1단계: 타겟 스토리지(Immich / Nextcloud) 연결 확인이 필요합니다';
+        subline.textContent = '아래 타겟 카드에서 필수 항목을 입력하고 [저장 및 연결 확인]을 실행하세요.';
+      } else {
+        headline.textContent = '2단계: 최소 1개 이상의 데이터 소스 연결 확인이 필요합니다';
+        subline.textContent = '타겟 서버는 준비되었습니다. MYBOX, Google Drive, Google Takeout 중 사용할 소스의 연결을 확인하세요.';
+      }
+    }
+
+    function renderVerifiedSyncCards(d) {
+      const container = document.getElementById('verifiedSourceList');
+      const sources = (d.readiness && d.readiness.verified_sources) || [];
+      const allStats = d.all_stats || {};
+      const archivesCount = ((d.takeout_info || {}).archives || []).length;
+      const isIdle = (d.state || 'idle') === 'idle';
+      const disAttr = isIdle ? '' : 'disabled';
+
+      const globalBtn = document.getElementById('globalSyncBtn');
+      if (!isIdle) {
+        globalBtn.textContent = d.state === 'stopping' ? '정지 중...' : '일시정지';
+        globalBtn.disabled = d.state === 'stopping';
+      } else {
+        globalBtn.disabled = sources.length === 0;
+        globalBtn.textContent = sources.length > 1
+          ? `연동된 소스 전체 순차 동기화 (${sources.length}개)`
+          : '전체 스캔 + 동기화 시작';
+      }
+
+      if (sources.length === 0) {
+        container.innerHTML = '<div class="empty-state">연결 확인된 데이터 소스가 없습니다.</div>';
+        return;
+      }
+
+      container.innerHTML = sources.map(src => {
+        const s = allStats[src] || {};
+        const immichDone = (s.uploaded_immich_created || 0) + (s.uploaded_immich_duplicate || 0);
+        const totalBackedBytes = (s.uploaded_bytes || 0) + (s.deleted_bytes || 0);
+        const failed = s.failed_files || 0;
+        const subInfo = src === 'takeout'
+          ? `ZIP ${archivesCount}개 · 완료·검증 시 ZIP 자동 삭제`
+          : `폴더 ${s.scanned_folders || 0}개 · ${formatBytes(s.pending_bytes)}`;
+
+        return `
+          <div class="source-card">
+            <div class="source-card-header">
+              <div class="source-card-title-wrap">
+                <span class="source-card-title">${SOURCE_NAMES[src] || src}</span>
+                <span class="verified-chip"><span class="dot ok"></span>연결 확인됨</span>
+              </div>
+              <div class="action-toolbar">
+                <button class="btn btn-primary" ${disAttr} onclick="startSingleJob('${src}', 'auto', false)">스캔 + 동기화</button>
+                <button class="btn" ${disAttr} onclick="startSingleJob('${src}', 'scan', false)">스캔만</button>
+                <button class="btn" ${disAttr} onclick="startSingleJob('${src}', 'sync', false)">동기화만</button>
+              </div>
+            </div>
+            <div class="source-metrics">
+              <div class="s-metric">
+                <div class="s-metric-label">대기 중 (Pending)</div>
+                <div class="s-metric-val num">${(s.pending_files || 0).toLocaleString()}</div>
+                <div class="s-metric-sub num">${subInfo}</div>
+              </div>
+              <div class="s-metric">
+                <div class="s-metric-label">Immich 완료</div>
+                <div class="s-metric-val num">${immichDone.toLocaleString()}</div>
+                <div class="s-metric-sub num">신규 ${s.uploaded_immich_created || 0} · 중복 ${s.uploaded_immich_duplicate || 0}</div>
+              </div>
+              <div class="s-metric">
+                <div class="s-metric-label">Nextcloud 완료</div>
+                <div class="s-metric-val num">${(s.uploaded_nextcloud || 0).toLocaleString()}</div>
+                <div class="s-metric-sub num">누적 ${formatBytes(totalBackedBytes)}</div>
+              </div>
+              <div class="s-metric">
+                <div class="s-metric-label">실패 항목</div>
+                <div class="s-metric-val num">${failed}</div>
+                <div class="s-metric-sub">
+                  <span>재시도 대기</span>
+                  ${failed > 0 ? `<button class="link-btn" onclick="retryFailed('${src}')">재시도</button>` : ''}
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderVerifiedCleanupCards(d) {
+      const container = document.getElementById('verifiedCleanupList');
+      const cloudSources = (d.readiness && d.readiness.verified_cloud_sources) || [];
+      const allStats = d.all_stats || {};
+      const isIdle = (d.state || 'idle') === 'idle';
+      const disAttr = isIdle ? '' : 'disabled';
+
+      document.getElementById('cleanupStopBtn').style.display = isIdle ? 'none' : 'inline-flex';
+
+      if (cloudSources.length === 0) {
+        container.innerHTML = '<div class="empty-state">원격 정리가 가능한 클라우드 소스가 없습니다.</div>';
+        return;
+      }
+
+      container.innerHTML = cloudSources.map(src => {
+        const s = allStats[src] || {};
+        const backedUpCount = (s.uploaded_immich_created || 0) + (s.uploaded_immich_duplicate || 0) + (s.uploaded_nextcloud || 0);
+
+        return `
+          <div class="source-card">
+            <div class="source-card-header">
+              <div class="source-card-title-wrap">
+                <span class="source-card-title">${SOURCE_NAMES[src] || src}</span>
+                <span class="verified-chip"><span class="dot ok"></span>연결 확인됨</span>
+              </div>
+              <div class="action-toolbar">
+                <button class="btn" ${disAttr} onclick="startSingleJob('${src}', 'delete', true)">1단계: 삭제 Dry-run</button>
+                <button class="btn btn-danger-outline" ${disAttr} onclick="openDeleteModal('${src}')">2단계: 재검증 후 휴지통 이동</button>
+              </div>
+            </div>
+            <div class="source-metrics cleanup-grid">
+              <div class="s-metric">
+                <div class="s-metric-label">정리 가능 대상 (NAS 백업 완료 파일)</div>
+                <div class="s-metric-val num">${backedUpCount.toLocaleString()}건</div>
+                <div class="s-metric-sub num">백업 누적 용량: ${formatBytes(s.uploaded_bytes)}</div>
+              </div>
+              <div class="s-metric">
+                <div class="s-metric-label">누적 원격 휴지통 이동 완료</div>
+                <div class="s-metric-val num">${(s.deleted_files || 0).toLocaleString()}건</div>
+                <div class="s-metric-sub num">확보된 클라우드 용량: ${formatBytes(s.deleted_bytes)}</div>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderSettingsCards(d) {
       const c = d.config_summary || {};
+      const conn = d.connections || {};
       const t = d.takeout_info || {};
       const archives = t.archives || [];
 
-      document.getElementById('cfgMyboxBadge').innerHTML =
-        `<span class="dot ${c.mybox_configured ? 'ok' : 'warn'}"></span> ${c.mybox_configured ? '토큰 저장됨' : '미설정'}`;
-      document.getElementById('cfgGdriveBadge').innerHTML =
-        `<span class="dot ${c.gdrive_configured ? 'ok' : 'warn'}"></span> ${c.gdrive_configured ? '토큰 저장됨' : '미설정'}`;
-      document.getElementById('cfgTakeoutBadge').innerHTML =
-        `<span class="dot ${archives.length > 0 ? 'ok' : ''}"></span> ZIP ${archives.length}개 인식`;
-      document.getElementById('cfgImmichBadge').innerHTML =
-        `<span class="dot ${c.immich_configured ? 'ok' : 'warn'}"></span> ${c.immich_configured ? '설정됨' : '미설정'}`;
-      document.getElementById('cfgNextcloudBadge').innerHTML = !c.enable_nextcloud
-        ? '<span class="dot"></span> 비활성'
-        : `<span class="dot ${c.nextcloud_configured ? 'ok' : 'warn'}"></span> ${c.nextcloud_configured ? '설정됨' : '인증 누락'}`;
+      if (!settingsFormInitialized) {
+        document.getElementById('cfgEnableNextcloud').checked = Boolean(c.enable_nextcloud);
+        toggleNextcloudFields();
+      }
 
-      document.getElementById('cfgMyboxPat').placeholder = c.mybox_configured
-        ? '•••••••• (저장됨 — 변경 시에만 새 토큰 입력)'
-        : 'MYBOX PAT 토큰 입력';
-      document.getElementById('cfgGdriveToken').placeholder = c.gdrive_configured
-        ? '•••••••• (저장됨 — 변경 시에만 새 토큰 입력)'
-        : 'Google Drive OAuth 토큰 입력';
+      renderCardBadge('badgeImmich', 'connMsgImmich', c.immich_configured, conn.immich, false);
+      renderCardBadge('badgeNextcloud', 'connMsgNextcloud', c.nextcloud_configured, conn.nextcloud, !c.enable_nextcloud);
+      renderCardBadge('badgeMybox', 'connMsgMybox', c.mybox_configured, conn.mybox, false);
+      renderCardBadge('badgeGdrive', 'connMsgGdrive', c.gdrive_configured, conn.gdrive, false);
+      const takeoutCleanedCount = ((d.all_stats && d.all_stats.takeout && d.all_stats.takeout.deleted_files) || 0);
+      if (archives.length === 0 && takeoutCleanedCount > 0) {
+        const tBadge = document.getElementById('badgeTakeout');
+        const tMsg = document.getElementById('connMsgTakeout');
+        if (tBadge) tBadge.innerHTML = '<span class="dot ok"></span>정리 완료 (새 ZIP 대기)';
+        if (tMsg) {
+          tMsg.style.color = 'var(--ok)';
+          tMsg.textContent = (conn.takeout && conn.takeout.message) || `동기화 완료 후 로컬 ZIP 자동 삭제됨 (누적 ${takeoutCleanedCount}건 이주 완료)`;
+        }
+      } else {
+        renderCardBadge('badgeTakeout', 'connMsgTakeout', archives.length > 0, conn.takeout, false);
+      }
+
       document.getElementById('cfgImmichApiKey').placeholder = c.immich_configured
-        ? '•••••••• (저장됨 — 변경 시에만 새 API Key 입력)'
+        ? '•••••••• (저장됨 — 변경 시에만 입력)'
         : 'Immich API Key 입력';
       document.getElementById('cfgNextcloudPassword').placeholder = c.nextcloud_configured
-        ? '•••••••• (저장됨 — 변경 시에만 새 비밀번호 입력)'
+        ? '•••••••• (저장됨 — 변경 시에만 입력)'
         : 'Nextcloud 앱 비밀번호 입력';
+      document.getElementById('cfgMyboxPat').placeholder = c.mybox_configured
+        ? '•••••••• (저장됨 — 변경 시에만 입력)'
+        : 'MYBOX PAT 토큰 입력';
+      document.getElementById('cfgGdriveToken').placeholder = c.gdrive_configured
+        ? '•••••••• (저장됨 — 변경 시에만 입력)'
+        : 'Google Drive 액세스 토큰 입력';
 
+      setInputIfUntouched('cfgImmichUrl', c.immich_url || '');
+      setInputIfUntouched('cfgNextcloudUrl', c.nextcloud_url || '');
+      setInputIfUntouched('cfgNextcloudBaseDir', c.nextcloud_base_dir || '/');
+      setInputIfUntouched('cfgNextcloudUser', c.nextcloud_user || '');
       setInputIfUntouched('cfgMyboxApiBase', c.mybox_api_base || 'https://apis.naver.com/mybox');
       setInputIfUntouched('cfgGdriveApiBase', c.gdrive_api_base || 'https://www.googleapis.com/drive/v3');
       setInputIfUntouched('cfgTakeoutDir', t.dir || c.takeout_dir || '/data/takeout');
-      setInputIfUntouched('cfgImmichUrl', c.immich_url || '');
-      setInputIfUntouched('cfgNextcloudUrl', c.nextcloud_url || '');
-      setInputIfUntouched('cfgNextcloudBaseDir', c.nextcloud_base_dir || '/Cloud-Backup');
-      setInputIfUntouched('cfgNextcloudUser', c.nextcloud_user || '');
       setInputIfUntouched('cfgConcurrency', c.concurrency || 3);
       setInputIfUntouched('cfgRateLimitRps', c.rate_limit_rps || 5);
       setInputIfUntouched('cfgSyncInterval', c.sync_interval_minutes ?? 0);
 
-      if (!settingsFormInitialized) {
-        const ncCheck = document.getElementById('cfgEnableNextcloud');
-        if (ncCheck) ncCheck.checked = Boolean(c.enable_nextcloud);
-        settingsFormInitialized = true;
-      }
+      settingsFormInitialized = true;
 
-      renderConnLine('connStatusMybox', 'mybox');
-      renderConnLine('connStatusGdrive', 'gdrive');
-      renderConnLine('connStatusTakeout', 'takeout');
-      renderConnLine('connStatusImmich', 'immich');
-      renderConnLine('connStatusNextcloud', 'nextcloud');
-    }
-
-    async function saveSettings(runTestAfter) {
-      const notice = document.getElementById('settingsSaveNotice');
-      const payload = {
-        mybox_pat: document.getElementById('cfgMyboxPat').value,
-        mybox_api_base: document.getElementById('cfgMyboxApiBase').value,
-        gdrive_access_token: document.getElementById('cfgGdriveToken').value,
-        gdrive_api_base: document.getElementById('cfgGdriveApiBase').value,
-        takeout_dir: document.getElementById('cfgTakeoutDir').value,
-        immich_url: document.getElementById('cfgImmichUrl').value,
-        immich_api_key: document.getElementById('cfgImmichApiKey').value,
-        enable_nextcloud: document.getElementById('cfgEnableNextcloud').checked,
-        nextcloud_url: document.getElementById('cfgNextcloudUrl').value,
-        nextcloud_user: document.getElementById('cfgNextcloudUser').value,
-        nextcloud_app_password: document.getElementById('cfgNextcloudPassword').value,
-        nextcloud_base_dir: document.getElementById('cfgNextcloudBaseDir').value,
-        concurrency: Number(document.getElementById('cfgConcurrency').value) || 3,
-        rate_limit_rps: Number(document.getElementById('cfgRateLimitRps').value) || 5.0,
-        sync_interval_minutes: Number(document.getElementById('cfgSyncInterval').value) || 0
-      };
-
-      const res = await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        notice.style.color = 'var(--err)';
-        notice.textContent = `설정 저장 실패: ${data.error || '오류 발생'}`;
-        return;
-      }
-
-      document.getElementById('cfgMyboxPat').value = '';
-      document.getElementById('cfgGdriveToken').value = '';
-      document.getElementById('cfgImmichApiKey').value = '';
-      document.getElementById('cfgNextcloudPassword').value = '';
-
-      notice.style.color = 'var(--ok)';
-      notice.textContent = '설정이 저장되었습니다 (/data/settings.json).';
-      await fetchStatus();
-      if (runTestAfter) {
-        await testConnections();
+      const totalZipBytes = archives.reduce((acc, a) => acc + (Number(a.size_bytes) || 0), 0);
+      document.getElementById('takeoutArchiveSummary').textContent = `${archives.length}개 · ${formatBytes(totalZipBytes)}`;
+      const archiveListEl = document.getElementById('takeoutArchiveList');
+      if (archives.length > 0) {
+        archiveListEl.innerHTML = archives.map(a => `
+          <div class="archive-row">
+            <span>${a.name}</span>
+            <span class="num" style="color:var(--muted);">${formatBytes(a.size_bytes)}</span>
+          </div>
+        `).join('');
+      } else {
+        archiveListEl.innerHTML = '<div style="color:var(--subtle);padding:6px 0;">지정된 경로에 .zip 파일이 없습니다.</div>';
       }
     }
 
@@ -1543,88 +1731,44 @@
 
       const dot = document.getElementById('jobStatusDot');
       const text = document.getElementById('jobStatusText');
-      const primaryBtn = document.getElementById('primaryActionBtn');
-      const triggers = document.querySelectorAll('.job-trigger');
-      const meta = SOURCE_META[currentSource] || SOURCE_META.mybox;
-
       dot.className = 'dot';
-      const activeSrc = d.active_source || currentSource;
+      const activeSrc = SOURCE_NAMES[d.active_source] || d.active_source || '';
 
       if (st === 'idle') {
         text.textContent = '대기 중';
-        primaryBtn.textContent = meta.primaryIdleLabel;
-        primaryBtn.disabled = false;
-        triggers.forEach(b => b.disabled = false);
       } else if (st === 'scanning') {
         dot.classList.add('ok');
         text.textContent = `${activeSrc} · 스캔 중`;
-        primaryBtn.textContent = '일시정지';
-        primaryBtn.disabled = false;
-        triggers.forEach(b => b.disabled = true);
       } else if (st === 'syncing') {
         dot.classList.add('ok');
         text.textContent = `${activeSrc} · 동기화 중`;
-        primaryBtn.textContent = '일시정지';
-        primaryBtn.disabled = false;
-        triggers.forEach(b => b.disabled = true);
       } else if (st === 'deleting') {
         dot.classList.add('warn');
-        text.textContent = `${activeSrc} · 삭제 중`;
-        primaryBtn.textContent = '일시정지';
-        primaryBtn.disabled = false;
-        triggers.forEach(b => b.disabled = true);
+        text.textContent = `${activeSrc} · 정리 중`;
       } else if (st === 'stopping') {
         dot.classList.add('warn');
         text.textContent = '안전 정지 중';
-        primaryBtn.textContent = '정지 중...';
-        primaryBtn.disabled = true;
-        triggers.forEach(b => b.disabled = true);
       }
 
-      renderSourceAuthBadge(d);
-      renderTakeoutPanel(d);
-      renderSettingsTables(d);
+      renderNavigationAndReadiness(d);
+      renderVerifiedSyncCards(d);
+      renderVerifiedCleanupCards(d);
+      renderSettingsCards(d);
 
-      const s = d.stats || {};
-      const failedCount = s.failed_files || 0;
-      const isTakeout = currentSource === 'takeout';
-      const archivesCount = ((d.takeout_info || {}).archives || []).length;
-
-      document.getElementById('statPending').textContent = (s.pending_files || 0).toLocaleString();
-      document.getElementById('statFolders').textContent = isTakeout
-        ? `ZIP ${archivesCount}개 · 대기 ${formatBytes(s.pending_bytes)}`
-        : `폴더 ${s.scanned_folders || 0}개 · ${formatBytes(s.pending_bytes)}`;
-
-      const immichTotal = (s.uploaded_immich_created || 0) + (s.uploaded_immich_duplicate || 0);
-      document.getElementById('statImmich').textContent = immichTotal.toLocaleString();
-      document.getElementById('statImmichSub').textContent = `신규 ${s.uploaded_immich_created || 0} · 중복 ${s.uploaded_immich_duplicate || 0}`;
-
-      document.getElementById('statNextcloud').textContent = (s.uploaded_nextcloud || 0).toLocaleString();
-      document.getElementById('statNextcloudSub').textContent = `누적 ${formatBytes(s.uploaded_bytes)}`;
-
-      if (isTakeout) {
-        document.getElementById('statDeletedFailed').textContent = `${failedCount}`;
-        document.getElementById('statDeletedBytes').textContent = '로컬 ZIP 아카이브 유지';
-      } else {
-        document.getElementById('statDeletedFailed').textContent = `${s.deleted_files || 0} / ${failedCount}`;
-        document.getElementById('statDeletedBytes').textContent = `절감 ${formatBytes(s.deleted_bytes)}`;
-      }
-      document.getElementById('inlineRetryBtn').style.display = failedCount > 0 ? 'inline' : 'none';
-
-      const failures = d.recent_failures || [];
+      const allFailures = d.all_failures || [];
       const badge = document.getElementById('failureCountBadge');
-      badge.textContent = failedCount;
-      badge.classList.toggle('has-error', failedCount > 0);
+      badge.textContent = allFailures.length;
+      badge.classList.toggle('has-error', allFailures.length > 0);
 
       const failureList = document.getElementById('failureList');
-      if (failures.length > 0) {
-        failureList.innerHTML = failures.map(f => `
+      if (allFailures.length > 0) {
+        failureList.innerHTML = allFailures.map(f => `
           <div class="failure-row">
             <div>
-              <div class="failure-path mono">[${f.target_type}] ${f.parent_path}/${f.name}</div>
+              <div class="failure-path mono">[${f.source} → ${f.target_type}] ${f.parent_path}/${f.name}</div>
               <div class="failure-err mono">${f.error_msg}</div>
             </div>
-            <div class="failure-meta num">재시도 ${f.retry_count}회</div>
+            <div class="num" style="color:var(--subtle);font-size:11.5px;white-space:nowrap;">재시도 ${f.retry_count}회</div>
           </div>
         `).join('');
       } else {
@@ -1639,23 +1783,32 @@
       }
     }
 
-    function handlePrimaryAction() {
-      if (currentJobState === 'idle') {
-        startJob('auto', false);
-      } else {
-        stopJob();
-      }
-    }
-
-    async function startJob(mode, dryRun) {
+    function getSelectedSampleLimit() {
       const limitSelect = document.getElementById('sampleLimitSelect');
       const rawLimit = limitSelect ? Number(limitSelect.value) : 0;
-      const limit = rawLimit > 0 ? rawLimit : null;
+      return rawLimit > 0 ? rawLimit : null;
+    }
 
+    function handleGlobalSyncAction() {
+      if (currentJobState !== 'idle') {
+        stopJob();
+        return;
+      }
+      const sources = latestReadiness.verified_sources || [];
+      if (sources.length === 0) return;
+      startBatchJob(sources, 'auto', false);
+    }
+
+    async function startSingleJob(source, mode, dryRun) {
+      await startBatchJob([source], mode, dryRun);
+    }
+
+    async function startBatchJob(sources, mode, dryRun) {
+      const limit = mode === 'delete' ? null : getSelectedSampleLimit();
       const res = await fetch('/api/jobs/start', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ source: currentSource, mode, dry_run: dryRun, limit })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sources, mode, dry_run: dryRun, limit })
       });
       if (res.status === 409) {
         appendLog(new Date().toLocaleTimeString(), '이미 실행 중인 작업이 있습니다.');
@@ -1669,26 +1822,31 @@
       fetchStatus();
     }
 
-    async function retryFailed() {
+    async function retryFailed(source) {
       await fetch('/api/jobs/retry-failed', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ source: currentSource })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source })
       });
       fetchStatus();
     }
 
-    function openDeleteModal() {
+    function openDeleteModal(source) {
+      pendingDeleteSource = source;
+      const name = SOURCE_NAMES[source] || source;
+      document.getElementById('deleteModalTitle').textContent = `${name} 완료 항목 휴지통 이동`;
       document.getElementById('deleteModal').style.display = 'flex';
     }
 
     function closeDeleteModal() {
+      pendingDeleteSource = null;
       document.getElementById('deleteModal').style.display = 'none';
     }
 
     function confirmDelete() {
+      const src = pendingDeleteSource;
       closeDeleteModal();
-      startJob('delete', false);
+      if (src) startSingleJob(src, 'delete', false);
     }
 
     function connectSSE() {
@@ -1697,14 +1855,17 @@
         try {
           const ev = JSON.parse(e.data);
           appendLog((ev.timestamp || '').slice(11, 19), ev.message || '');
-          document.getElementById('currentFileLabel').textContent = ev.current_file
-            ? `${ev.current_file}`
-            : (ev.message || '대기 중');
+          const labelText = ev.current_file ? `${ev.current_file}` : (ev.message || '대기 중');
+          document.getElementById('currentFileLabel').textContent = labelText;
+          if (ev.state === 'deleting') {
+            document.getElementById('cleanupTaskLabel').textContent = labelText;
+          }
           const pct = ev.total_files > 0
             ? Math.min(100, Math.round((ev.processed_files / ev.total_files) * 100))
             : 0;
           const eta = formatEta(ev.processed_files, ev.total_files, ev.speed_fps);
           document.getElementById('progressBar').style.width = `${pct}%`;
+          document.getElementById('cleanupProgressBar').style.width = `${pct}%`;
           document.getElementById('progressMeta').textContent = `${pct}% · ${(ev.speed_fps || 0).toFixed(1)} 파일/초${eta}`;
           fetchStatus();
         } catch (_) {}
@@ -1712,7 +1873,6 @@
     }
 
     updateThemeButtonLabel();
-    applySourceLayout(currentSource);
     fetchStatus();
     connectSSE();
     setInterval(fetchStatus, 3000);

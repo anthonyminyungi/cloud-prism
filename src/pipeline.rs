@@ -4,7 +4,7 @@ use crate::limiter::RateLimiter;
 use crate::router::{SourceType, SyncResultKind, TargetRouter, TargetType};
 use crate::sources::gdrive::GoogleDriveProvider;
 use crate::sources::mybox::MyboxProvider;
-use crate::sources::takeout::GoogleTakeoutProvider;
+use crate::sources::takeout::{list_takeout_archives, GoogleTakeoutProvider};
 use crate::sources::SourceProvider;
 use crate::state::{AppState, JobState};
 use crate::targets::immich::ImmichTarget;
@@ -336,6 +336,10 @@ impl SyncPipeline {
                 .await;
         }
 
+        if self.source_type == SourceType::Takeout {
+            self.cleanup_takeout_archives_after_sync().await?;
+        }
+
         let stats = self.state.db.get_stats(src).await?;
         self.state
             .finish_job(
@@ -351,6 +355,166 @@ impl SyncPipeline {
             )
             .await;
         Ok(stats)
+    }
+
+    async fn cleanup_takeout_archives_after_sync(&self) -> Result<()> {
+        let src = self.source_key();
+        let archives = list_takeout_archives(&self.config.takeout_dir);
+        if archives.is_empty() || self.state.is_stopping() {
+            return Ok(());
+        }
+
+        if let Some(limit) = self.limit_files {
+            self.state
+                .emit_event(
+                    src,
+                    JobState::Syncing,
+                    None,
+                    format!(
+                        "[{}] 테스트 건수 제한({}건) 실행이므로 로컬 ZIP 아카이브 자동 삭제를 건너뜁니다.",
+                        src, limit
+                    ),
+                )
+                .await;
+            return Ok(());
+        }
+
+        let stats = self.state.db.get_stats(src).await?;
+        if stats.scanned_folders == 0 || stats.pending_folders > 0 {
+            self.state
+                .emit_event(
+                    src,
+                    JobState::Syncing,
+                    None,
+                    format!(
+                        "[{}] 전체 ZIP 스캔이 완료되지 않아 로컬 ZIP 아카이브를 보존합니다.",
+                        src
+                    ),
+                )
+                .await;
+            return Ok(());
+        }
+
+        if stats.total_files == 0 || stats.pending_files > 0 || stats.failed_files > 0 {
+            self.state
+                .emit_event(
+                    src,
+                    JobState::Syncing,
+                    None,
+                    format!(
+                        "[{}] 미완료 항목(전체 {}, 대기 {}, 실패 {})이 있어 로컬 ZIP 아카이브를 보존합니다.",
+                        src, stats.total_files, stats.pending_files, stats.failed_files
+                    ),
+                )
+                .await;
+            return Ok(());
+        }
+
+        let fetch_limit = stats.total_files.max(DELETE_BATCH_LIMIT);
+        let uploaded = self
+            .state
+            .db
+            .get_uploaded_files_for_delete(src, fetch_limit)
+            .await?;
+
+        self.state
+            .emit_event(
+                src,
+                JobState::Syncing,
+                None,
+                format!(
+                    "[{}] 로컬 ZIP 자동 정리 전 타겟 존재 재검증 중 ({}건)...",
+                    src,
+                    uploaded.len()
+                ),
+            )
+            .await;
+
+        for file in &uploaded {
+            if self.state.is_stopping() {
+                return Ok(());
+            }
+            let verified = match file.target_type.parse::<TargetType>() {
+                Ok(t) => match self.targets.get(&t) {
+                    Some(target) => target.verify_exists(file).await.unwrap_or(false),
+                    None => false,
+                },
+                Err(_) => false,
+            };
+            if !verified {
+                self.state
+                    .emit_event(
+                        src,
+                        JobState::Syncing,
+                        Some(file.name.clone()),
+                        format!(
+                            "[{}] 타겟 재검증 실패 항목이 있어 로컬 ZIP 삭제를 중단합니다: {} ({})",
+                            src, file.name, file.target_type
+                        ),
+                    )
+                    .await;
+                return Ok(());
+            }
+        }
+
+        for file in &uploaded {
+            self.state
+                .db
+                .mark_file_deleted(src, &file.resource_id)
+                .await?;
+        }
+
+        let dir_path = Path::new(&self.config.takeout_dir);
+        let mut removed_count = 0usize;
+        let mut freed_bytes = 0u64;
+        for arch in &archives {
+            let zip_path = dir_path.join(&arch.name);
+            match tokio::fs::remove_file(&zip_path).await {
+                Ok(()) => {
+                    removed_count += 1;
+                    freed_bytes += arch.size_bytes;
+                }
+                Err(err) => {
+                    self.state
+                        .emit_event(
+                            src,
+                            JobState::Syncing,
+                            Some(arch.name.clone()),
+                            format!("[{}] 로컬 ZIP 삭제 실패 ({}): {}", src, arch.name, err),
+                        )
+                        .await;
+                }
+            }
+        }
+
+        if removed_count > 0 {
+            let remaining = list_takeout_archives(&self.config.takeout_dir);
+            if remaining.is_empty() {
+                self.state
+                    .record_connection_result(
+                        "takeout",
+                        false,
+                        format!(
+                            "동기화 및 검증 완료 후 ZIP {}개 자동 삭제됨 (새 ZIP 업로드 대기)",
+                            removed_count
+                        ),
+                    )
+                    .await;
+            }
+            self.state
+                .emit_event(
+                    src,
+                    JobState::Syncing,
+                    None,
+                    format!(
+                        "[{}] 타겟 재검증 통과 — 로컬 Takeout ZIP {}개 자동 삭제 완료 ({} bytes 회수)",
+                        src, removed_count, freed_bytes
+                    ),
+                )
+                .await;
+        }
+
+        Ok(())
     }
 
     async fn sync_single_file(&self, file: FileRecord) {
@@ -371,17 +535,18 @@ impl SyncPipeline {
             .await;
 
         match self.transfer_file(&file).await {
-            Ok((sha1, outcome)) => {
+            Ok((sha1, actual_size, outcome)) => {
                 let result_str = outcome.sync_result.as_str();
                 let _ = self
                     .state
                     .db
-                    .mark_file_uploaded(
+                    .mark_file_uploaded_with_size(
                         src,
                         &file.resource_id,
                         &sha1,
                         &outcome.remote_target_id,
                         result_str,
+                        actual_size,
                     )
                     .await;
                 self.state.processed_files.fetch_add(1, Ordering::SeqCst);
@@ -416,7 +581,7 @@ impl SyncPipeline {
         }
     }
 
-    async fn transfer_file(&self, file: &FileRecord) -> Result<(String, UploadOutcome)> {
+    async fn transfer_file(&self, file: &FileRecord) -> Result<(String, Option<i64>, UploadOutcome)> {
         let target_type: TargetType = file.target_type.parse()?;
         let target = self
             .targets
@@ -431,6 +596,7 @@ impl SyncPipeline {
             {
                 return Ok((
                     existing_sha1.clone(),
+                    None,
                     UploadOutcome {
                         remote_target_id: existing_asset_id,
                         sync_result: SyncResultKind::Duplicate,
@@ -459,6 +625,7 @@ impl SyncPipeline {
 
         let outcome = target
             .upload(UploadContext {
+                source_type: self.source_type,
                 file_path: downloaded.temp_guard.path(),
                 resource_id: &file.resource_id,
                 filename: &file.name,
@@ -469,7 +636,11 @@ impl SyncPipeline {
             })
             .await?;
 
-        Ok((downloaded.sha1_hash.clone(), outcome))
+        Ok((
+            downloaded.sha1_hash.clone(),
+            Some(downloaded.size as i64),
+            outcome,
+        ))
     }
 
     pub async fn run_delete(&self, dry_run: bool) -> Result<SyncStats> {

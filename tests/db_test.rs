@@ -270,3 +270,63 @@ async fn test_incremental_scan_modification_and_remote_direct_delete_reconciliat
     let stats = db.get_stats("mybox").await.unwrap();
     assert_eq!(stats.uploaded_nextcloud, 1);
 }
+
+#[tokio::test]
+async fn test_upsert_files_heals_fallback_created_time_and_updates_exported_size() {
+    let db = CheckpointDB::connect(":memory:").await.unwrap();
+
+    // Simulate legacy gdrive row scanned without `fields` (1970 fallback timestamps & size 0)
+    db.upsert_files(&[FileUpsert {
+        source_type: "gdrive".to_string(),
+        resource_id: "gdoc_legacy".to_string(),
+        name: "회의록".to_string(),
+        parent_path: "/".to_string(),
+        size: 0,
+        created_time: "1970-01-01T00:00:00Z".to_string(),
+        modified_time: "1970-01-01T00:00:00Z".to_string(),
+        target_type: "nextcloud".to_string(),
+        sha1_hash: None,
+    }])
+    .await
+    .unwrap();
+
+    // Re-scan with proper Google Drive metadata & exported extension
+    db.upsert_files(&[FileUpsert {
+        source_type: "gdrive".to_string(),
+        resource_id: "gdoc_legacy".to_string(),
+        name: "회의록.docx".to_string(),
+        parent_path: "/".to_string(),
+        size: 0,
+        created_time: "2025-06-15T09:30:00Z".to_string(),
+        modified_time: "2025-06-16T10:00:00Z".to_string(),
+        target_type: "nextcloud".to_string(),
+        sha1_hash: None,
+    }])
+    .await
+    .unwrap();
+
+    let pending = db.get_pending_files("gdrive", 3, 10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].name, "회의록.docx");
+    assert_eq!(pending[0].created_time, "2025-06-15T09:30:00Z");
+    assert_eq!(pending[0].modified_time, "2025-06-16T10:00:00Z");
+
+    // Mark uploaded with actual exported byte size -> must persist size for Nextcloud HEAD verification
+    db.mark_file_uploaded_with_size(
+        "gdrive",
+        "gdoc_legacy",
+        "abcd",
+        "/GoogleDrive/회의록.docx",
+        "created",
+        Some(12345),
+    )
+    .await
+    .unwrap();
+
+    let deletable = db
+        .get_uploaded_files_for_delete("gdrive", 10)
+        .await
+        .unwrap();
+    assert_eq!(deletable.len(), 1);
+    assert_eq!(deletable[0].size, 12345);
+}

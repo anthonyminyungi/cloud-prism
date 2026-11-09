@@ -1,6 +1,8 @@
-use mybox_immich_sync::config::AppConfig;
+use mybox_immich_sync::config::{normalize_base_url, normalize_nextcloud_url, AppConfig};
 use mybox_immich_sync::limiter::RateLimiter;
-use mybox_immich_sync::router::{TargetRouter, TargetType};
+use mybox_immich_sync::router::{SourceType, TargetRouter, TargetType};
+use mybox_immich_sync::targets::nextcloud::NextcloudTarget;
+use mybox_immich_sync::targets::TargetProvider;
 use std::collections::HashMap;
 use std::time::Instant;
 use wiremock::matchers::{method, path};
@@ -60,6 +62,20 @@ fn test_config_env_map_parsing_and_url_normalization() {
     assert!(cfg.summary().mybox_configured);
     assert_eq!(cfg.summary().sync_interval_minutes, 180);
     assert_eq!(cfg.configured_sources().len(), 1);
+
+    // Verify scheme auto-prefix and Nextcloud WebDAV suffix stripping
+    assert_eq!(
+        normalize_base_url("192.168.0.10:2283/"),
+        "http://192.168.0.10:2283"
+    );
+    assert_eq!(
+        normalize_nextcloud_url("https://192.168.0.10:9001/remote.php/dav/files/admin/"),
+        "https://192.168.0.10:9001"
+    );
+    assert_eq!(
+        normalize_nextcloud_url("https://nas.local/nextcloud/remote.php/dav/files/user"),
+        "https://nas.local/nextcloud"
+    );
 }
 
 #[tokio::test]
@@ -104,4 +120,56 @@ async fn test_rate_limiter_pacing_and_429_retry() {
         "Expected >= 150ms for 3 acquisitions at 10 RPS, got {:?}",
         elapsed
     );
+
+    // Verify Nextcloud WebDAV test_connection strips /remote.php suffix and sends PROPFIND with trailing slash
+    Mock::given(method("PROPFIND"))
+        .and(path("/remote.php/dav/files/user@nas.local/"))
+        .respond_with(ResponseTemplate::new(207))
+        .mount(&mock_server)
+        .await;
+
+    let nc = NextcloudTarget::new(
+        format!("{}/remote.php/dav/files/user@nas.local", mock_server.uri()),
+        "user@nas.local".to_string(),
+        "app_pass_123".to_string(),
+        "/".to_string(),
+        RateLimiter::new(50.0, 1),
+    );
+    let nc_msg = nc
+        .test_connection()
+        .await
+        .expect("PROPFIND 207 should succeed");
+    assert!(nc_msg.contains("Nextcloud WebDAV 연결 성공"));
+
+    // Verify dynamic top-level folder mapping per SourceType (/MyBox, /GoogleDrive) when base_dir is "/"
+    Mock::given(method("MKCOL"))
+        .and(path("/remote.php/dav/files/user@nas.local/MyBox"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("MKCOL"))
+        .and(path("/remote.php/dav/files/user@nas.local/MyBox/docs"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("MKCOL"))
+        .and(path("/remote.php/dav/files/user@nas.local/GoogleDrive"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mybox_dir = nc
+        .ensure_folder_tree(SourceType::Mybox, "/docs")
+        .await
+        .unwrap();
+    assert_eq!(mybox_dir, "/MyBox/docs");
+
+    let gdrive_dir = nc
+        .ensure_folder_tree(SourceType::Gdrive, "/")
+        .await
+        .unwrap();
+    assert_eq!(gdrive_dir, "/GoogleDrive");
 }

@@ -1,9 +1,10 @@
 use crate::config::{AppConfig, SettingsUpdateRequest};
 use crate::db::CheckpointDB;
+use crate::sources::takeout::list_takeout_archives;
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -34,6 +35,25 @@ impl JobState {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServiceConnectionStatus {
+    pub verified: bool,
+    pub ok: bool,
+    pub message: String,
+    pub checked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReadinessSummary {
+    pub immich_verified: bool,
+    pub nextcloud_verified: bool,
+    pub targets_ready: bool,
+    pub sync_tab_enabled: bool,
+    pub delete_tab_enabled: bool,
+    pub verified_sources: Vec<String>,
+    pub verified_cloud_sources: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressEvent {
     pub timestamp: String,
@@ -50,6 +70,7 @@ pub struct AppState {
     pub db: CheckpointDB,
     pub config: AppConfig,
     pub runtime_config: RwLock<AppConfig>,
+    pub connection_status: RwLock<HashMap<String, ServiceConnectionStatus>>,
     pub job_state: RwLock<JobState>,
     pub active_source: RwLock<Option<String>>,
     pub current_file: RwLock<Option<String>>,
@@ -57,6 +78,7 @@ pub struct AppState {
     pub total_files: AtomicU64,
     pub job_started_at: RwLock<Option<Instant>>,
     pub stop_flag: Arc<AtomicBool>,
+    pub batch_active: AtomicBool,
     pub recent_logs: RwLock<VecDeque<ProgressEvent>>,
     pub event_tx: broadcast::Sender<ProgressEvent>,
     pub job_handle: Mutex<Option<JoinHandle<()>>>,
@@ -71,6 +93,7 @@ impl AppState {
             db,
             config,
             runtime_config: RwLock::new(initial_runtime),
+            connection_status: RwLock::new(HashMap::new()),
             job_state: RwLock::new(JobState::Idle),
             active_source: RwLock::new(None),
             current_file: RwLock::new(None),
@@ -78,6 +101,7 @@ impl AppState {
             total_files: AtomicU64::new(0),
             job_started_at: RwLock::new(None),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            batch_active: AtomicBool::new(false),
             recent_logs: RwLock::new(VecDeque::with_capacity(MAX_RECENT_LOGS)),
             event_tx,
             job_handle: Mutex::new(None),
@@ -89,16 +113,113 @@ impl AppState {
     }
 
     pub async fn set_takeout_dir(&self, dir: String) {
-        let mut cfg = self.runtime_config.write().await;
-        cfg.takeout_dir = dir;
-        let _ = cfg.save_persisted();
+        {
+            let mut cfg = self.runtime_config.write().await;
+            if cfg.takeout_dir != dir {
+                self.connection_status.write().await.remove("takeout");
+            }
+            cfg.takeout_dir = dir;
+            let _ = cfg.save_persisted();
+        }
     }
 
     pub async fn update_settings(&self, req: &SettingsUpdateRequest) -> Result<AppConfig> {
         let mut cfg = self.runtime_config.write().await;
+        let before = cfg.clone();
         cfg.apply_settings_update(req);
         cfg.save_persisted()?;
+
+        let mut conn = self.connection_status.write().await;
+        if before.mybox_pat != cfg.mybox_pat || before.mybox_api_base != cfg.mybox_api_base {
+            conn.remove("mybox");
+        }
+        if before.gdrive_access_token != cfg.gdrive_access_token
+            || before.gdrive_api_base != cfg.gdrive_api_base
+        {
+            conn.remove("gdrive");
+        }
+        if before.takeout_dir != cfg.takeout_dir {
+            conn.remove("takeout");
+        }
+        if before.immich_url != cfg.immich_url || before.immich_api_key != cfg.immich_api_key {
+            conn.remove("immich");
+        }
+        if before.enable_nextcloud != cfg.enable_nextcloud
+            || before.nextcloud_url != cfg.nextcloud_url
+            || before.nextcloud_user != cfg.nextcloud_user
+            || before.nextcloud_app_password != cfg.nextcloud_app_password
+            || before.nextcloud_base_dir != cfg.nextcloud_base_dir
+        {
+            conn.remove("nextcloud");
+        }
+
         Ok(cfg.clone())
+    }
+
+    pub async fn record_connection_result(
+        &self,
+        service: &str,
+        ok: bool,
+        message: impl Into<String>,
+    ) -> ServiceConnectionStatus {
+        let status = ServiceConnectionStatus {
+            verified: true,
+            ok,
+            message: message.into(),
+            checked_at: Some(Utc::now().to_rfc3339()),
+        };
+        self.connection_status
+            .write()
+            .await
+            .insert(service.to_string(), status.clone());
+        status
+    }
+
+    pub async fn readiness_summary(&self) -> ReadinessSummary {
+        let cfg = self.runtime_config.read().await.clone();
+        let summary = cfg.summary();
+        let conn = self.connection_status.read().await;
+
+        let is_ok = |key: &str| conn.get(key).map(|s| s.verified && s.ok).unwrap_or(false);
+
+        let immich_verified = summary.immich_configured && is_ok("immich");
+        let nextcloud_verified = if !summary.enable_nextcloud {
+            true
+        } else {
+            summary.nextcloud_configured && is_ok("nextcloud")
+        };
+        let targets_ready = immich_verified && nextcloud_verified;
+
+        let mut verified_sources = Vec::new();
+        if summary.mybox_configured && is_ok("mybox") {
+            verified_sources.push("mybox".to_string());
+        }
+        if summary.gdrive_configured && is_ok("gdrive") {
+            verified_sources.push("gdrive".to_string());
+        }
+        let has_takeout_zips = !list_takeout_archives(&cfg.takeout_dir).is_empty();
+        if has_takeout_zips && is_ok("takeout") {
+            verified_sources.push("takeout".to_string());
+        }
+
+        let verified_cloud_sources: Vec<String> = verified_sources
+            .iter()
+            .filter(|s| s.as_str() == "mybox" || s.as_str() == "gdrive")
+            .cloned()
+            .collect();
+
+        let sync_tab_enabled = targets_ready && !verified_sources.is_empty();
+        let delete_tab_enabled = targets_ready && !verified_cloud_sources.is_empty();
+
+        ReadinessSummary {
+            immich_verified,
+            nextcloud_verified,
+            targets_ready,
+            sync_tab_enabled,
+            delete_tab_enabled,
+            verified_sources,
+            verified_cloud_sources,
+        }
     }
 
     pub fn is_stopping(&self) -> bool {
@@ -116,10 +237,12 @@ impl AppState {
     }
 
     pub async fn finish_job(&self, source: &str, message: impl Into<String>) {
-        *self.job_state.write().await = JobState::Idle;
+        if !self.batch_active.load(Ordering::SeqCst) {
+            *self.job_state.write().await = JobState::Idle;
+        }
         *self.current_file.write().await = None;
-        self.stop_flag.store(false, Ordering::SeqCst);
-        self.emit_event(source, JobState::Idle, None, message).await;
+        let current = *self.job_state.read().await;
+        self.emit_event(source, current, None, message).await;
     }
 
     pub async fn request_stop(&self) -> bool {

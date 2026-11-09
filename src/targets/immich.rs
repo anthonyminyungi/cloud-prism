@@ -1,7 +1,8 @@
+use crate::config::normalize_base_url;
 use crate::db::FileRecord;
-use crate::limiter::RateLimiter;
+use crate::limiter::{format_error_chain, RateLimiter};
 use crate::router::{SyncResultKind, TargetType};
-use crate::sources::build_http_client;
+use crate::sources::build_target_http_client;
 use crate::targets::{TargetProvider, UploadContext, UploadOutcome};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -62,9 +63,9 @@ pub struct ImmichTarget {
 impl ImmichTarget {
     pub fn new(base_url: String, api_key: String, limiter: RateLimiter) -> Self {
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: normalize_base_url(&base_url),
             api_key,
-            client: build_http_client(),
+            client: build_target_http_client(true),
             limiter,
         }
     }
@@ -158,7 +159,8 @@ impl ImmichTarget {
             .header(HEADER_API_KEY, &self.api_key)
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(|e| anyhow!("Immich 업로드 전송 오류: {}", format_error_chain(&e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();

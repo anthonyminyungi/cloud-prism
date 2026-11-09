@@ -23,6 +23,14 @@ impl SourceType {
             SourceType::Takeout => "takeout",
         }
     }
+
+    pub fn nextcloud_folder_name(&self) -> &'static str {
+        match self {
+            SourceType::Mybox => "MyBox",
+            SourceType::Gdrive => "GoogleDrive",
+            SourceType::Takeout => "GoogleTakeout",
+        }
+    }
 }
 
 impl fmt::Display for SourceType {

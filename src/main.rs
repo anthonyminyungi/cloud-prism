@@ -5,7 +5,7 @@ use mybox_immich_sync::config::AppConfig;
 use mybox_immich_sync::db::CheckpointDB;
 use mybox_immich_sync::pipeline::{spawn_auto_sync_scheduler, SyncPipeline};
 use mybox_immich_sync::state::AppState;
-use mybox_immich_sync::web::build_router;
+use mybox_immich_sync::web::{build_router, verify_all_configured};
 use std::net::SocketAddr;
 
 #[derive(Parser, Debug)]
@@ -69,6 +69,10 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Commands::Serve { port: cfg.port }) {
         Commands::Serve { port } => {
+            let boot_state = state.clone();
+            tokio::spawn(async move {
+                let _ = verify_all_configured(&boot_state).await;
+            });
             spawn_auto_sync_scheduler(state.clone());
             let app = build_router(state);
             let addr = SocketAddr::from(([0, 0, 0, 0], port));

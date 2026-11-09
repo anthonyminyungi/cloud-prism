@@ -82,10 +82,21 @@ impl RateLimiter {
                     return Err(anyhow!(
                         "HTTP request failed after {} retries: {}",
                         attempt,
-                        err
+                        format_error_chain(&err)
                     ));
                 }
             }
         }
     }
+}
+
+pub fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(" -> ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }

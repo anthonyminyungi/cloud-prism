@@ -94,6 +94,22 @@ pub fn build_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Builds an HTTP client for self-hosted LAN/NAS targets (Immich, Nextcloud),
+/// accepting self-signed or private CA TLS certificates on internal IPs/domains.
+pub fn build_target_http_client(follow_redirects: bool) -> reqwest::Client {
+    let redirect_policy = if follow_redirects {
+        reqwest::redirect::Policy::default()
+    } else {
+        reqwest::redirect::Policy::none()
+    };
+    reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .redirect(redirect_policy)
+        .build()
+        .unwrap_or_else(|_| build_http_client())
+}
+
 /// Streams an HTTP response body to a temporary file guarded by `TempFileGuard`
 /// while computing its SHA-1 checksum in a single pass.
 pub async fn stream_response_to_temp(

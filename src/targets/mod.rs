@@ -2,12 +2,13 @@ pub mod immich;
 pub mod nextcloud;
 
 use crate::db::FileRecord;
-use crate::router::{SyncResultKind, TargetType};
+use crate::router::{SourceType, SyncResultKind, TargetType};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
 
 pub struct UploadContext<'a> {
+    pub source_type: SourceType,
     pub file_path: &'a Path,
     pub resource_id: &'a str,
     pub filename: &'a str,

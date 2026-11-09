@@ -89,21 +89,27 @@ async fn test_full_pipeline_scan_sync_and_verified_delete() {
         .mount(&mock_server)
         .await;
 
-    // 5. Mock Nextcloud WebDAV MKCOL, PUT, and HEAD verification
+    // 5. Mock Nextcloud WebDAV MKCOL, PUT, and HEAD verification (with dynamic /MyBox subfolder)
     Mock::given(method("MKCOL"))
         .and(path("/remote.php/dav/files/ncuser/Cloud-Backup"))
         .respond_with(ResponseTemplate::new(201))
         .mount(&mock_server)
         .await;
 
+    Mock::given(method("MKCOL"))
+        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/MyBox"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock_server)
+        .await;
+
     Mock::given(method("PUT"))
-        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/manual.pdf"))
+        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/manual.pdf"))
         .respond_with(ResponseTemplate::new(201))
         .mount(&mock_server)
         .await;
 
     Mock::given(method("HEAD"))
-        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/manual.pdf"))
+        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/manual.pdf"))
         .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "11"))
         .mount(&mock_server)
         .await;
@@ -288,8 +294,14 @@ async fn test_incremental_rescan_and_remote_direct_deletion_excludes_from_sync()
         .mount(&mock_server)
         .await;
 
+    Mock::given(method("MKCOL"))
+        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/MyBox"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock_server)
+        .await;
+
     Mock::given(method("PUT"))
-        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/manual.pdf"))
+        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/manual.pdf"))
         .respond_with(ResponseTemplate::new(201))
         .mount(&mock_server)
         .await;
@@ -334,3 +346,444 @@ async fn test_incremental_rescan_and_remote_direct_deletion_excludes_from_sync()
     assert_eq!(stats_sync2.uploaded_nextcloud, 1);
     assert_eq!(stats_sync2.pending_files, 0);
 }
+
+#[tokio::test]
+async fn test_takeout_sync_preserves_zip_on_sample_limit_and_auto_deletes_after_full_verified_sync()
+{
+    use std::fs::File;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_takeout_cleanup.db");
+    let tmp_download_dir = temp_dir.path().join("tmp_takeout_sync");
+    let takeout_dir = temp_dir.path().join("takeout_staging");
+    std::fs::create_dir_all(&takeout_dir).unwrap();
+
+    let zip_path = takeout_dir.join("takeout-2026-001.zip");
+    {
+        let file = File::create(&zip_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip.start_file("Takeout/Photos/a.jpg", opts).unwrap();
+        zip.write_all(b"jpeg_content_alpha").unwrap();
+        zip.start_file("Takeout/Photos/b.jpg", opts).unwrap();
+        zip.write_all(b"jpeg_content_bravo").unwrap();
+        zip.finish().unwrap();
+    }
+
+    // First 2 bulk-upload-check calls happen during upload of a.jpg and b.jpg -> "accept"
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "Takeout/Photos/a.jpg", "action": "accept" },
+                { "id": "Takeout/Photos/b.jpg", "action": "accept" }
+            ]
+        })))
+        .up_to_n_times(2)
+        .mount(&mock_server)
+        .await;
+
+    // Subsequent bulk-upload-check calls happen during post-sync target verification -> "reject" (exists!)
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "Takeout/Photos/a.jpg", "action": "reject", "assetId": "immich_a" },
+                { "id": "Takeout/Photos/b.jpg", "action": "reject", "assetId": "immich_b" }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "immich_takeout_asset",
+            "status": "created"
+        })))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: tmp_download_dir.to_str().unwrap().to_string(),
+        takeout_dir: takeout_dir.to_str().unwrap().to_string(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_immich_key".to_string(),
+        enable_nextcloud: false,
+        rate_limit_rps: 100.0,
+        concurrency: 1,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    let state = AppState::new(db, cfg.clone());
+
+    // 1. Sample-limited test run (limit = 1): syncs 1 photo and MUST preserve takeout-2026-001.zip
+    let limited_pipeline = SyncPipeline::from_config(state.clone(), cfg.clone(), "takeout")
+        .unwrap()
+        .with_limit(Some(1));
+    let stats_limited = limited_pipeline.run_auto().await.unwrap();
+    assert_eq!(stats_limited.uploaded_immich_created, 1);
+    assert!(
+        zip_path.exists(),
+        "Sample-limited test run must NOT delete local Takeout ZIP"
+    );
+
+    // 2. Running sync-only while scan was incomplete (pending_folders > 0) MUST also preserve ZIP
+    let full_pipeline = SyncPipeline::from_config(state.clone(), cfg, "takeout").unwrap();
+    let _ = full_pipeline.run_sync().await.unwrap();
+    assert!(
+        zip_path.exists(),
+        "Sync before full archive scan completes must NOT delete local Takeout ZIP"
+    );
+
+    // 3. Full auto run (limit = None): scans remaining b.jpg, uploads it, verifies BOTH on Immich, and deletes ZIP
+    let stats_full = full_pipeline.run_auto().await.unwrap();
+    assert_eq!(stats_full.uploaded_immich_created, 2);
+    assert_eq!(stats_full.pending_files, 0);
+    assert_eq!(stats_full.failed_files, 0);
+    assert_eq!(stats_full.deleted_files, 2);
+    assert!(
+        !zip_path.exists(),
+        "Local Takeout ZIP must be automatically deleted after full sync and Immich verification"
+    );
+    assert_eq!(state.readiness_summary().await.sync_tab_enabled, false);
+}
+
+#[tokio::test]
+async fn test_gdrive_owned_quota_filtering_workspace_export_and_concurrent_nextcloud_sync() {
+    use wiremock::matchers::body_string_contains;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_gdrive_pipeline.db");
+    let tmp_download_dir = temp_dir.path().join("tmp_gdrive_sync");
+
+    let expected_root_q = "'root' in parents and 'me' in owners and trashed = false and mimeType != 'application/vnd.google-apps.shortcut'";
+    let expected_sub_q = "'folder_sub_1' in parents and 'me' in owners and trashed = false and mimeType != 'application/vnd.google-apps.shortcut'";
+
+    // 1. Root folder list_page: mixes owned photo, shared file, zero-quota file, Google Form,
+    //    two identically-named Google Docs, and a subfolder containing `/` in its Drive title.
+    Mock::given(method("GET"))
+        .and(path("/files"))
+        .and(query_param("q", expected_root_q))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "files": [
+                {
+                    "id": "photo_owned_1",
+                    "name": "family_trip.jpg",
+                    "mimeType": "image/jpeg",
+                    "size": "18",
+                    "quotaBytesUsed": "18",
+                    "ownedByMe": true,
+                    "createdTime": "2025-06-15T09:30:00Z",
+                    "modifiedTime": "2025-06-15T09:30:00Z"
+                },
+                {
+                    "id": "shared_pdf_ignore",
+                    "name": "shared_lecture.pdf",
+                    "mimeType": "application/pdf",
+                    "size": "99999",
+                    "quotaBytesUsed": "0",
+                    "ownedByMe": false,
+                    "createdTime": "2025-06-10T00:00:00Z",
+                    "modifiedTime": "2025-06-10T00:00:00Z"
+                },
+                {
+                    "id": "zero_quota_bin_ignore",
+                    "name": "free_legacy.jpg",
+                    "mimeType": "image/jpeg",
+                    "size": "5000",
+                    "quotaBytesUsed": "0",
+                    "ownedByMe": true,
+                    "createdTime": "2019-01-01T00:00:00Z",
+                    "modifiedTime": "2019-01-01T00:00:00Z"
+                },
+                {
+                    "id": "gform_ignore",
+                    "name": "설문조사",
+                    "mimeType": "application/vnd.google-apps.form",
+                    "size": "0",
+                    "quotaBytesUsed": "0",
+                    "ownedByMe": true,
+                    "createdTime": "2025-07-01T00:00:00Z",
+                    "modifiedTime": "2025-07-01T00:00:00Z"
+                },
+                {
+                    "id": "gdoc_1",
+                    "name": "제목 없는 문서",
+                    "mimeType": "application/vnd.google-apps.document",
+                    "size": "0",
+                    "quotaBytesUsed": "0",
+                    "ownedByMe": true,
+                    "createdTime": "2025-08-01T12:00:00Z",
+                    "modifiedTime": "2025-08-01T12:00:00Z"
+                },
+                {
+                    "id": "gdoc_2",
+                    "name": "제목 없는 문서",
+                    "mimeType": "application/vnd.google-apps.document",
+                    "size": "0",
+                    "quotaBytesUsed": "0",
+                    "ownedByMe": true,
+                    "createdTime": "2025-08-02T12:00:00Z",
+                    "modifiedTime": "2025-08-02T12:00:00Z"
+                },
+                {
+                    "id": "folder_sub_1",
+                    "name": "2025/09 정산",
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "size": "0",
+                    "quotaBytesUsed": "0",
+                    "ownedByMe": true
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // 2. Subfolder list_page: contains 1 Google Sheet with `/` in filename
+    Mock::given(method("GET"))
+        .and(path("/files"))
+        .and(query_param("q", expected_sub_q))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "files": [
+                {
+                    "id": "gsheet_1",
+                    "name": "Q3/Q4 가계부",
+                    "mimeType": "application/vnd.google-apps.spreadsheet",
+                    "size": "0",
+                    "quotaBytesUsed": "0",
+                    "ownedByMe": true,
+                    "createdTime": "2025-09-10T08:00:00Z",
+                    "modifiedTime": "2025-09-10T08:00:00Z"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // 3. Binary photo download (?alt=media)
+    Mock::given(method("GET"))
+        .and(path("/files/photo_owned_1"))
+        .and(query_param("alt", "media"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(b"owned_jpeg_payload".as_slice()),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 4. Google Workspace exports (/files/{id}/export?mimeType=...)
+    Mock::given(method("GET"))
+        .and(path("/files/gdoc_1/export"))
+        .and(query_param(
+            "mimeType",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"docx_bytes_alpha_19".as_slice()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/files/gdoc_2/export"))
+        .and(query_param(
+            "mimeType",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"docx_bytes_bravo_19".as_slice()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/files/gsheet_1/export"))
+        .and(query_param(
+            "mimeType",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"xlsx_bytes_13".as_slice()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 5. Immich check & upload: MUST receive real createdTime ("2025-06-15T09:30:00Z"), NOT 1970!
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "photo_owned_1", "action": "accept" }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "photo_owned_1", "action": "reject", "assetId": "immich_gdrive_1" }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets"))
+        .and(body_string_contains("2025-06-15T09:30:00Z"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "immich_gdrive_1",
+            "status": "created"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 6. Nextcloud MKCOL: even with concurrency = 4, /GoogleDrive MUST only be MKCOL'd ONCE!
+    let enc_sub_dir = percent_encoding::utf8_percent_encode(
+        "2025_09 정산",
+        percent_encoding::NON_ALPHANUMERIC,
+    );
+    // Match exact WebDAV percent-encoding used on HTTP wire (spaces & UTF-8 bytes encoded)
+    let dav_encode_seg = |s: &str| -> String {
+        use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+        const SET: &AsciiSet = &CONTROLS
+            .add(b' ')
+            .add(b'"')
+            .add(b'#')
+            .add(b'%')
+            .add(b'?')
+            .add(b'<')
+            .add(b'>')
+            .add(b'`')
+            .add(b'{')
+            .add(b'}');
+        utf8_percent_encode(s, SET).to_string()
+    };
+    let _ = enc_sub_dir;
+
+    let sub_folder_wire = format!(
+        "/remote.php/dav/files/ncuser/GoogleDrive/{}",
+        dav_encode_seg("2025_09 정산")
+    );
+    let doc1_wire = format!(
+        "/remote.php/dav/files/ncuser/GoogleDrive/{}",
+        dav_encode_seg("제목 없는 문서.docx")
+    );
+    let doc2_wire = format!(
+        "/remote.php/dav/files/ncuser/GoogleDrive/{}",
+        dav_encode_seg("제목 없는 문서 (gdoc_2).docx")
+    );
+    let sheet_wire = format!(
+        "{}/{}",
+        sub_folder_wire,
+        dav_encode_seg("Q3_Q4 가계부.xlsx")
+    );
+
+    Mock::given(method("MKCOL"))
+        .and(path("/remote.php/dav/files/ncuser/GoogleDrive"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("MKCOL"))
+        .and(path(sub_folder_wire.as_str()))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Nextcloud PUTs: two identically-named docs must NOT collide on the same path!
+    Mock::given(method("PUT"))
+        .and(path(doc1_wire.as_str()))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path(doc2_wire.as_str()))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path(sheet_wire.as_str()))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Nextcloud HEAD verification with actual exported sizes (19 bytes for docx, 13 bytes for xlsx)
+    Mock::given(method("HEAD"))
+        .and(path(doc1_wire.as_str()))
+        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "19"))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path(doc2_wire.as_str()))
+        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "19"))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path(sheet_wire.as_str()))
+        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "13"))
+        .mount(&mock_server)
+        .await;
+
+    // 7. Google Drive Trash PATCH for the 4 synced owned items
+    for id in ["photo_owned_1", "gdoc_1", "gdoc_2", "gsheet_1"] {
+        Mock::given(method("PATCH"))
+            .and(path(format!("/files/{}", id)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": id, "trashed": true})))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+    }
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: tmp_download_dir.to_str().unwrap().to_string(),
+        gdrive_access_token: "test_gdrive_oauth_token".to_string(),
+        gdrive_api_base: mock_server.uri(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_immich_key".to_string(),
+        enable_nextcloud: true,
+        nextcloud_url: mock_server.uri(),
+        nextcloud_user: "ncuser".to_string(),
+        nextcloud_app_password: "ncpassword".to_string(),
+        nextcloud_base_dir: "/".to_string(),
+        rate_limit_rps: 200.0,
+        concurrency: 4,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    let state = AppState::new(db, cfg.clone());
+    let pipeline = SyncPipeline::from_config(state, cfg, "gdrive").unwrap();
+
+    // Scan + Sync
+    let sync_stats = pipeline.run_auto().await.unwrap();
+    assert_eq!(sync_stats.scanned_folders, 2); // root + folder_sub_1
+    assert_eq!(sync_stats.total_files, 4); // photo_owned_1 + gdoc_1 + gdoc_2 + gsheet_1 (shared, 0-quota, form excluded!)
+    assert_eq!(sync_stats.uploaded_immich_created, 1);
+    assert_eq!(sync_stats.uploaded_nextcloud, 3);
+    assert_eq!(sync_stats.failed_files, 0);
+
+    // Verified remote delete (confirms exported sizes match Nextcloud HEAD Content-Length)
+    let del_stats = pipeline.run_delete(false).await.unwrap();
+    assert_eq!(del_stats.deleted_files, 4);
+}
+

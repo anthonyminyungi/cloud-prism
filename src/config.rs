@@ -12,7 +12,7 @@ pub const DEFAULT_TMP_DIR: &str = "/tmp/mybox_sync";
 pub const DEFAULT_MYBOX_API_BASE: &str = "https://apis.naver.com/mybox";
 pub const DEFAULT_GDRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
 pub const DEFAULT_TAKEOUT_DIR: &str = "/data/takeout";
-pub const DEFAULT_NEXTCLOUD_BASE_DIR: &str = "/Cloud-Backup";
+pub const DEFAULT_NEXTCLOUD_BASE_DIR: &str = "/";
 pub const DEFAULT_CONCURRENCY: usize = 3;
 pub const DEFAULT_RATE_LIMIT_RPS: f64 = 5.0;
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
@@ -24,6 +24,28 @@ const URL_KEYS: &[&str] = &[
     "immich_url",
     "nextcloud_url",
 ];
+
+pub fn normalize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    }
+}
+
+pub fn normalize_nextcloud_url(raw: &str) -> String {
+    let mut url = normalize_base_url(raw);
+    for marker in ["/remote.php", "/index.php", "/apps/", "/login"] {
+        if let Some((prefix, _)) = url.split_once(marker) {
+            url = prefix.trim_end_matches('/').to_string();
+        }
+    }
+    url
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
@@ -87,6 +109,8 @@ pub struct SettingsUpdateRequest {
     pub rate_limit_rps: Option<f64>,
     pub max_retries: Option<u32>,
     pub sync_interval_minutes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_service: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -102,7 +126,7 @@ impl Default for AppConfig {
             takeout_dir: DEFAULT_TAKEOUT_DIR.to_string(),
             immich_url: String::new(),
             immich_api_key: String::new(),
-            enable_nextcloud: true,
+            enable_nextcloud: false,
             nextcloud_url: String::new(),
             nextcloud_user: String::new(),
             nextcloud_app_password: String::new(),
@@ -143,7 +167,11 @@ impl AppConfig {
 
             match current_val {
                 Value::String(_) => {
-                    let normalized = if URL_KEYS.contains(&key.as_str()) {
+                    let normalized = if key == "nextcloud_url" {
+                        normalize_nextcloud_url(raw)
+                    } else if key == "immich_url" {
+                        normalize_base_url(raw)
+                    } else if URL_KEYS.contains(&key.as_str()) {
                         raw.trim_end_matches('/').to_string()
                     } else {
                         raw.to_string()
@@ -244,6 +272,7 @@ impl AppConfig {
             rate_limit_rps: Some(self.rate_limit_rps),
             max_retries: Some(self.max_retries),
             sync_interval_minutes: Some(self.sync_interval_minutes),
+            verify_service: None,
         };
         let json_bytes = serde_json::to_vec_pretty(&persisted)?;
         std::fs::write(path, json_bytes)?;
@@ -282,7 +311,7 @@ impl AppConfig {
             }
         }
         if let Some(ref v) = req.immich_url {
-            self.immich_url = v.trim().trim_end_matches('/').to_string();
+            self.immich_url = normalize_base_url(v);
         }
         if let Some(ref v) = req.immich_api_key {
             let trimmed = v.trim();
@@ -294,7 +323,7 @@ impl AppConfig {
             self.enable_nextcloud = enable;
         }
         if let Some(ref v) = req.nextcloud_url {
-            self.nextcloud_url = v.trim().trim_end_matches('/').to_string();
+            self.nextcloud_url = normalize_nextcloud_url(v);
         }
         if let Some(ref v) = req.nextcloud_user {
             self.nextcloud_user = v.trim().to_string();
@@ -306,13 +335,13 @@ impl AppConfig {
             }
         }
         if let Some(ref v) = req.nextcloud_base_dir {
-            let trimmed = v.trim();
-            if !trimmed.is_empty() {
-                self.nextcloud_base_dir = if trimmed.starts_with('/') {
-                    trimmed.to_string()
-                } else {
-                    format!("/{}", trimmed)
-                };
+            let trimmed = v.trim().trim_end_matches('/');
+            if trimmed.is_empty() {
+                self.nextcloud_base_dir = "/".to_string();
+            } else if trimmed.starts_with('/') {
+                self.nextcloud_base_dir = trimmed.to_string();
+            } else {
+                self.nextcloud_base_dir = format!("/{}", trimmed);
             }
         }
         if let Some(c) = req.concurrency {
