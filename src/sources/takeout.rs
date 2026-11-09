@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,25 @@ impl GoogleTakeoutProvider {
         }
     }
 
+    fn list_zip_paths(&self) -> Result<Vec<PathBuf>> {
+        if !self.takeout_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.takeout_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("zip"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+        Ok(paths)
+    }
+
     fn parse_sidecar_timestamp(json_bytes: &[u8]) -> Option<String> {
         let meta: TakeoutSidecarMetadata = serde_json::from_slice(json_bytes).ok()?;
         let ts_str = meta
@@ -46,6 +66,102 @@ impl GoogleTakeoutProvider {
         Utc.timestamp_opt(secs, 0)
             .single()
             .map(|dt| dt.to_rfc3339())
+    }
+
+    fn sidecar_candidates(entry_name: &str) -> Vec<String> {
+        let mut candidates = vec![
+            format!("{}.json", entry_name),
+            format!("{}.supplemental-metadata.json", entry_name),
+        ];
+        if let Some((stem, _ext)) = entry_name.rsplit_once('.') {
+            candidates.push(format!("{}.json", stem));
+        }
+        candidates
+    }
+
+    fn read_sidecar_from_archive(
+        archive: &mut ZipArchive<File>,
+        candidates: &[String],
+    ) -> Option<String> {
+        candidates.iter().find_map(|cand| {
+            let mut sidecar = archive.by_name(cand).ok()?;
+            let mut json_buf = Vec::new();
+            sidecar.read_to_end(&mut json_buf).ok()?;
+            Self::parse_sidecar_timestamp(&json_buf)
+        })
+    }
+
+    fn find_sidecar_timestamp(
+        &self,
+        primary_zip_path: &Path,
+        primary_archive: &mut ZipArchive<File>,
+        entry_name: &str,
+    ) -> Option<String> {
+        let candidates = Self::sidecar_candidates(entry_name);
+
+        // 1. Fast path: look inside the same ZIP archive first
+        if let Some(ts) = Self::read_sidecar_from_archive(primary_archive, &candidates) {
+            return Some(ts);
+        }
+
+        // 2. Split-ZIP fallback: when Google Takeout places the media file in 001.zip
+        //    and its .json sidecar in 002.zip, search sibling ZIP archives.
+        let zip_paths = self.list_zip_paths().ok()?;
+        for zip_path in zip_paths {
+            if zip_path == primary_zip_path {
+                continue;
+            }
+            let Ok(file) = File::open(&zip_path) else {
+                continue;
+            };
+            let Ok(mut sibling_archive) = ZipArchive::new(file) else {
+                continue;
+            };
+            if let Some(ts) = Self::read_sidecar_from_archive(&mut sibling_archive, &candidates) {
+                return Some(ts);
+            }
+        }
+
+        None
+    }
+
+    fn locate_entry_archive(
+        &self,
+        resource_id: &str,
+    ) -> Result<(PathBuf, ZipArchive<File>, String)> {
+        // Support legacy "zip_name::entry_name" format if present, otherwise treat resource_id as canonical entry_name
+        if let Some((zip_name, entry_name)) = resource_id.split_once("::") {
+            let candidate_path = self.takeout_dir.join(zip_name);
+            if candidate_path.exists() {
+                let file = File::open(&candidate_path)?;
+                let mut archive = ZipArchive::new(file)?;
+                if archive.by_name(entry_name).is_ok() {
+                    return Ok((candidate_path, archive, entry_name.to_string()));
+                }
+            }
+        }
+
+        let entry_name = resource_id
+            .split_once("::")
+            .map(|(_, e)| e)
+            .unwrap_or(resource_id);
+
+        for zip_path in self.list_zip_paths()? {
+            let Ok(file) = File::open(&zip_path) else {
+                continue;
+            };
+            let Ok(mut archive) = ZipArchive::new(file) else {
+                continue;
+            };
+            if archive.by_name(entry_name).is_ok() {
+                return Ok((zip_path, archive, entry_name.to_string()));
+            }
+        }
+
+        Err(anyhow!(
+            "Takeout ZIP 아카이브에서 항목을 찾을 수 없습니다: {}",
+            resource_id
+        ))
     }
 }
 
@@ -63,16 +179,7 @@ impl SourceProvider for GoogleTakeoutProvider {
             ));
         }
 
-        let zip_count = std::fs::read_dir(&self.takeout_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| ext.eq_ignore_ascii_case("zip"))
-                    .unwrap_or(false)
-            })
-            .count();
+        let zip_count = self.list_zip_paths()?.len();
 
         Ok(format!(
             "Google Takeout 경로 확인 성공 (ZIP 아카이브 {}개 발견)",
@@ -91,24 +198,9 @@ impl SourceProvider for GoogleTakeoutProvider {
             return Ok(page);
         }
 
-        for entry in std::fs::read_dir(&self.takeout_dir)? {
-            let entry = entry?;
-            let zip_path = entry.path();
-            if !zip_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("zip"))
-                .unwrap_or(false)
-            {
-                continue;
-            }
+        let mut seen_entries = HashSet::new();
 
-            let zip_name = zip_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("takeout.zip")
-                .to_string();
-
+        for zip_path in self.list_zip_paths()? {
             let file = File::open(&zip_path)?;
             let mut archive = ZipArchive::new(file)?;
 
@@ -119,6 +211,9 @@ impl SourceProvider for GoogleTakeoutProvider {
                 }
                 let entry_name = zf.name().to_string();
                 if entry_name.to_ascii_lowercase().ends_with(".json") {
+                    continue;
+                }
+                if !seen_entries.insert(entry_name.clone()) {
                     continue;
                 }
 
@@ -135,7 +230,7 @@ impl SourceProvider for GoogleTakeoutProvider {
                     .unwrap_or_else(|| "/".to_string());
 
                 page.files.push(RemoteFile {
-                    resource_id: format!("{}::{}", zip_name, entry_name),
+                    resource_id: entry_name,
                     name: filename,
                     parent_path: parent,
                     size: zf.size() as i64,
@@ -155,22 +250,16 @@ impl SourceProvider for GoogleTakeoutProvider {
         filename: &str,
         tmp_dir: &Path,
     ) -> Result<DownloadedSourceFile> {
-        let (zip_name, entry_name) = resource_id
-            .split_once("::")
-            .ok_or_else(|| anyhow!("잘못된 Takeout resource_id 형식: {}", resource_id))?;
+        let (zip_path, mut archive, entry_name) = self.locate_entry_archive(resource_id)?;
 
-        let zip_path = self.takeout_dir.join(zip_name);
         tokio::fs::create_dir_all(tmp_dir).await?;
         let temp_path = tmp_dir.join(format!("takeout_{}", sanitize_filename(filename)));
         let temp_guard = TempFileGuard::new(temp_path);
 
-        let file = File::open(&zip_path)?;
-        let mut archive = ZipArchive::new(file)?;
-
         let mut hasher = Sha1::new();
         let mut total_bytes: u64 = 0;
         {
-            let mut zf = archive.by_name(entry_name)?;
+            let mut zf = archive.by_name(&entry_name)?;
             let mut out = File::create(temp_guard.path())?;
             let mut buf = [0u8; 64 * 1024];
             loop {
@@ -185,16 +274,7 @@ impl SourceProvider for GoogleTakeoutProvider {
             out.flush()?;
         }
 
-        let sidecar_candidates = [
-            format!("{}.json", entry_name),
-            format!("{}.supplemental-metadata.json", entry_name),
-        ];
-        let created_override = sidecar_candidates.iter().find_map(|cand| {
-            let mut sidecar = archive.by_name(cand).ok()?;
-            let mut json_buf = Vec::new();
-            sidecar.read_to_end(&mut json_buf).ok()?;
-            Self::parse_sidecar_timestamp(&json_buf)
-        });
+        let created_override = self.find_sidecar_timestamp(&zip_path, &mut archive, &entry_name);
 
         Ok(DownloadedSourceFile {
             temp_guard,
@@ -245,6 +325,10 @@ mod tests {
         let page = provider.list_page("root", "/", None).await.unwrap();
         assert_eq!(page.files.len(), 1);
         assert_eq!(page.files[0].name, "beach.jpg");
+        assert_eq!(
+            page.files[0].resource_id,
+            "Takeout/Google Photos/2026/beach.jpg"
+        );
 
         let tmp_dir = TempDir::new().unwrap();
         let downloaded = provider
@@ -258,5 +342,60 @@ mod tests {
         assert!(temp_file_path.exists());
         drop(downloaded);
         assert!(!temp_file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_takeout_cross_zip_sidecar_and_canonical_id_dedup() {
+        let dir = TempDir::new().unwrap();
+        let opts = SimpleFileOptions::default();
+
+        // 001.zip contains the photo itself
+        {
+            let file = File::create(dir.path().join("takeout-202605-001.zip")).unwrap();
+            let mut zip = ZipWriter::new(file);
+            zip.start_file("Takeout/Google Photos/Photos from 2025/sunset.jpg", opts)
+                .unwrap();
+            zip.write_all(b"sunset_image_payload").unwrap();
+            zip.finish().unwrap();
+        }
+
+        // 002.zip contains the photo's .supplemental-metadata.json sidecar (split across archives!)
+        // AND a duplicate copy of sunset.jpg (e.g. from a later export dropped in the same folder)
+        {
+            let file = File::create(dir.path().join("takeout-202606-002.zip")).unwrap();
+            let mut zip = ZipWriter::new(file);
+            zip.start_file(
+                "Takeout/Google Photos/Photos from 2025/sunset.jpg.supplemental-metadata.json",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(br#"{"photoTakenTime": {"timestamp": "1740000000"}}"#)
+                .unwrap();
+
+            zip.start_file("Takeout/Google Photos/Photos from 2025/sunset.jpg", opts)
+                .unwrap();
+            zip.write_all(b"sunset_image_payload").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let provider = GoogleTakeoutProvider::new(dir.path());
+        let page = provider.list_page("root", "/", None).await.unwrap();
+
+        // Must deduplicate across ZIP filenames using the canonical internal entry path
+        assert_eq!(page.files.len(), 1);
+        assert_eq!(
+            page.files[0].resource_id,
+            "Takeout/Google Photos/Photos from 2025/sunset.jpg"
+        );
+
+        let tmp_dir = TempDir::new().unwrap();
+        let downloaded = provider
+            .download_to_temp(&page.files[0].resource_id, "sunset.jpg", tmp_dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(downloaded.size, 20);
+        // Must have resolved the timestamp from sibling archive 002.zip!
+        assert!(downloaded.created_time_override.is_some());
     }
 }
