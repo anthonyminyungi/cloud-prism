@@ -349,6 +349,12 @@ impl SourceProvider for GoogleTakeoutProvider {
             }
         }
 
+        page.files.sort_by(|a, b| {
+            a.created_time
+                .cmp(&b.created_time)
+                .then_with(|| a.modified_time.cmp(&b.modified_time))
+        });
+
         Ok(page)
     }
 
@@ -545,7 +551,9 @@ mod tests {
         assert_eq!(page.files.len(), 3);
         assert_eq!(page.files[0].name, "이력서.pdf");
         assert_eq!(page.files[0].parent_path, "/");
-        assert!(page.files[0].modified_time.starts_with("2025-08-15T14:30:00"));
+        assert!(page.files[0]
+            .modified_time
+            .starts_with("2025-08-15T14:30:00"));
 
         assert_eq!(page.files[1].name, "보고서.docx");
         assert_eq!(page.files[1].parent_path, "/업무/2026");

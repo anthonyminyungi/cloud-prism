@@ -468,6 +468,8 @@ impl CheckpointDB {
             .filter(file_entity::Column::SourceType.eq(source_type))
             .filter(file_entity::Column::Status.eq(FileStatus::Pending.as_str()))
             .filter(file_entity::Column::RetryCount.lt(max_retries))
+            .order_by_asc(file_entity::Column::CreatedTime)
+            .order_by_asc(file_entity::Column::ModifiedTime)
             .order_by_asc(file_entity::Column::ParentPath)
             .order_by_asc(file_entity::Column::Name)
             .order_by_asc(file_entity::Column::ResourceId)

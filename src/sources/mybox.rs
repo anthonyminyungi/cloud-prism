@@ -15,6 +15,7 @@ const ENDPOINT_STORAGE: &str = "/v1/drive/storage";
 const ENDPOINT_RESOURCES: &str = "/v1/drive/resources";
 const ENDPOINT_FOLDERS_PREFIX: &str = "/v1/drive/folders";
 const ENDPOINT_FILES_PREFIX: &str = "/v1/drive/files";
+const DEFAULT_SORT_OLDEST: &str = "createdAt,asc";
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MAX_ERR_BODY_CHARS: usize = 240;
 
@@ -246,6 +247,14 @@ fn parse_list_response(raw_json: &str, folder_path: &str) -> Result<ListPage> {
         }
     }
 
+    page.files.sort_by(|a, b| {
+        a.created_time
+            .cmp(&b.created_time)
+            .then_with(|| a.modified_time.cmp(&b.modified_time))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.resource_id.cmp(&b.resource_id))
+    });
+
     Ok(page)
 }
 
@@ -323,7 +332,7 @@ impl SourceProvider for MyboxProvider {
         cursor: Option<&str>,
     ) -> Result<ListPage> {
         let url = self.endpoint(&list_resources_path(folder_id));
-        let mut query_params: Vec<(&str, &str)> = Vec::new();
+        let mut query_params: Vec<(&str, &str)> = vec![("sort", DEFAULT_SORT_OLDEST)];
         if let Some(c) = cursor.filter(|c| !c.is_empty()) {
             query_params.push(("cursor", c));
         }
@@ -331,12 +340,10 @@ impl SourceProvider for MyboxProvider {
         let resp = self
             .limiter
             .send_with_retry(|| {
-                let req = self.client.get(&url).bearer_auth(&self.pat);
-                if query_params.is_empty() {
-                    req
-                } else {
-                    req.query(&query_params)
-                }
+                self.client
+                    .get(&url)
+                    .bearer_auth(&self.pat)
+                    .query(&query_params)
             })
             .await?;
 
@@ -434,7 +441,11 @@ impl SourceProvider for MyboxProvider {
     }
 
     async fn delete_resource(&self, resource_id: &str) -> Result<()> {
-        let path = format!("{}/{}", ENDPOINT_RESOURCES, encode_path_segment(resource_id));
+        let path = format!(
+            "{}/{}",
+            ENDPOINT_RESOURCES,
+            encode_path_segment(resource_id)
+        );
         let url = self.endpoint(&path);
         let resp = self
             .limiter

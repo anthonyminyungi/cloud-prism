@@ -599,10 +599,7 @@ fn derive_takeout_zip_filename(
         }
     }
 
-    format!(
-        "takeout-{}.zip",
-        chrono::Utc::now().format("%Y%m%d-%H%M%S")
-    )
+    format!("takeout-{}.zip", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
 }
 
 async fn fetch_takeout_url(
@@ -815,7 +812,12 @@ async fn fetch_takeout_url(
                             format!("[takeout] ZIP 수신 중: {} ({:.1} MB)", name_for_task, mb)
                         };
                         state_clone
-                            .emit_event("takeout", JobState::Scanning, Some(name_for_task.clone()), msg)
+                            .emit_event(
+                                "takeout",
+                                JobState::Scanning,
+                                Some(name_for_task.clone()),
+                                msg,
+                            )
                             .await;
                     }
                 }

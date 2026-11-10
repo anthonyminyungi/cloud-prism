@@ -250,13 +250,14 @@ async fn test_incremental_scan_modification_and_remote_direct_delete_reconciliat
     assert_eq!(removed_unbacked, 1); // f_remote_del_pending removed
     assert_eq!(excluded_uploaded, 1); // f_remote_del_uploaded marked DELETED (excluded from sync/delete)
 
-    // Only f_modified and f_new should be in the pending sync queue!
+    // Only f_modified (2026-01-01) and f_new (2026-02-01) should be in the pending sync queue,
+    // ordered oldest created_time first!
     let pending_queue = db.get_pending_files("mybox", 3, 100).await.unwrap();
     let pending_ids: Vec<&str> = pending_queue
         .iter()
         .map(|f| f.resource_id.as_str())
         .collect();
-    assert_eq!(pending_ids, vec!["f_new", "f_modified"]);
+    assert_eq!(pending_ids, vec!["f_modified", "f_new"]);
 
     // Only f_unchanged should be in the remote-trash delete queue (f_remote_del_uploaded is already deleted remotely)
     let delete_queue = db
