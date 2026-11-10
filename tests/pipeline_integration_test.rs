@@ -787,3 +787,164 @@ async fn test_gdrive_owned_quota_filtering_workspace_export_and_concurrent_nextc
     assert_eq!(del_stats.deleted_files, 4);
 }
 
+#[tokio::test]
+async fn test_takeout_combined_photos_and_drive_routes_photos_to_immich_and_docs_to_nextcloud_google_drive(
+) {
+    use std::fs::File;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_takeout_combined.db");
+    let tmp_download_dir = temp_dir.path().join("tmp_takeout_combined");
+    let takeout_dir = temp_dir.path().join("takeout_combined_staging");
+    std::fs::create_dir_all(&takeout_dir).unwrap();
+
+    let zip_path = takeout_dir.join("takeout-combined-001.zip");
+    {
+        let file = File::create(&zip_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let dt = zip::DateTime::from_date_and_time(2025, 10, 20, 11, 0, 0).unwrap();
+        let opts = SimpleFileOptions::default().last_modified_time(dt);
+
+        // 0. Takeout index HTML -> must be skipped
+        zip.start_file("Takeout/archive_browser.html", opts)
+            .unwrap();
+        zip.write_all(b"<html>Takeout</html>").unwrap();
+
+        // 1. Google Photos image + JSON sidecar -> Immich
+        zip.start_file("Takeout/Google 포토/Photos from 2025/family.jpg", opts)
+            .unwrap();
+        zip.write_all(b"family_photo_bytes").unwrap();
+        zip.start_file("Takeout/Google 포토/Photos from 2025/family.jpg.json", opts)
+            .unwrap();
+        zip.write_all(br#"{"photoTakenTime": {"timestamp": "1750000000"}}"#)
+            .unwrap();
+
+        // 2. Google Drive image inside folder -> MUST ALSO go to Immich
+        zip.start_file("Takeout/드라이브/여행사진/jeju_trip.png", opts)
+            .unwrap();
+        zip.write_all(b"jeju_png_bytes").unwrap();
+
+        // 3. Google Drive root document -> Nextcloud /GoogleDrive/contract.pdf
+        zip.start_file("Takeout/드라이브/contract.pdf", opts)
+            .unwrap();
+        zip.write_all(b"pdf_bytes_12").unwrap();
+
+        // 4. Google Drive nested folder document -> Nextcloud /GoogleDrive/Work/plan.docx
+        zip.start_file("Takeout/드라이브/Work/plan.docx", opts)
+            .unwrap();
+        zip.write_all(b"docx_bytes_13").unwrap();
+
+        zip.finish().unwrap();
+    }
+
+    // Immich bulk-upload-check: first 2 calls during sync -> accept, next 2 calls during post-sync verify -> reject
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "Takeout/Google 포토/Photos from 2025/family.jpg", "action": "accept" },
+                { "id": "Takeout/드라이브/여행사진/jeju_trip.png", "action": "accept" }
+            ]
+        })))
+        .up_to_n_times(2)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "Takeout/Google 포토/Photos from 2025/family.jpg", "action": "reject", "assetId": "imm_1" },
+                { "id": "Takeout/드라이브/여행사진/jeju_trip.png", "action": "reject", "assetId": "imm_2" }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "immich_combined_asset",
+            "status": "created"
+        })))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    // Nextcloud WebDAV MKCOL, PUT, and HEAD under /GoogleDrive (with Takeout/드라이브 stripped!)
+    Mock::given(method("MKCOL"))
+        .and(path("/remote.php/dav/files/ncuser/GoogleDrive"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("MKCOL"))
+        .and(path("/remote.php/dav/files/ncuser/GoogleDrive/Work"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/remote.php/dav/files/ncuser/GoogleDrive/contract.pdf"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/remote.php/dav/files/ncuser/GoogleDrive/Work/plan.docx"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/remote.php/dav/files/ncuser/GoogleDrive/contract.pdf"))
+        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "12"))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/remote.php/dav/files/ncuser/GoogleDrive/Work/plan.docx"))
+        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "13"))
+        .mount(&mock_server)
+        .await;
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: tmp_download_dir.to_str().unwrap().to_string(),
+        takeout_dir: takeout_dir.to_str().unwrap().to_string(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_immich_key".to_string(),
+        enable_nextcloud: true,
+        nextcloud_url: mock_server.uri(),
+        nextcloud_user: "ncuser".to_string(),
+        nextcloud_app_password: "ncpassword".to_string(),
+        nextcloud_base_dir: "/".to_string(),
+        rate_limit_rps: 200.0,
+        concurrency: 2,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    let state = AppState::new(db, cfg.clone());
+    let pipeline = SyncPipeline::from_config(state, cfg, "takeout").unwrap();
+
+    let stats = pipeline.run_auto().await.unwrap();
+    assert_eq!(stats.total_files, 4); // 2 photos + 2 docs (archive_browser.html & .json skipped)
+    assert_eq!(stats.uploaded_immich_created, 2); // Both Photos photo AND Drive photo went to Immich
+    assert_eq!(stats.uploaded_nextcloud, 2); // Both Drive docs went to Nextcloud /GoogleDrive/...
+    assert_eq!(stats.failed_files, 0);
+    assert_eq!(stats.deleted_files, 4);
+    assert!(
+        !zip_path.exists(),
+        "Combined Takeout ZIP must be deleted after both Immich and Nextcloud verify all 4 files"
+    );
+}
+

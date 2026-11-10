@@ -796,7 +796,7 @@
             동기화
             <span id="navSyncBadge" class="nav-pill">잠김</span>
           </button>
-          <button id="navTabCleanup" class="tab-btn" data-tab="cleanup" onclick="selectMainTab('cleanup')" disabled title="타겟 서버 및 클라우드 소스(MYBOX/GDrive) 연결 확인이 필요합니다.">
+          <button id="navTabCleanup" class="tab-btn" data-tab="cleanup" onclick="selectMainTab('cleanup')" disabled title="타겟 서버 및 원격 클라우드 소스(MYBOX) 연결 확인이 필요합니다.">
             클라우드 정리
             <span id="navCleanupBadge" class="nav-pill">잠김</span>
           </button>
@@ -981,43 +981,19 @@
         </div>
       </div>
 
-      <!-- 카드: Google Drive -->
+      <!-- 카드: Google Takeout (Google 포토 · 드라이브 통합) -->
       <div class="integration-card">
         <div class="integration-header">
           <div class="integration-title-group">
-            <span class="integration-title">Google Drive</span>
-            <span class="role-tag">원격 클라우드</span>
-          </div>
-          <span id="badgeGdrive" class="verified-chip"><span class="dot"></span>미설정</span>
-        </div>
-        <div class="integration-body">
-          <div class="form-grid">
-            <div class="form-field">
-              <label class="field-label" for="cfgGdriveToken">OAuth 액세스 토큰 <span class="req-tag">필수</span></label>
-              <input id="cfgGdriveToken" type="password" class="input-text mono" placeholder="Google Drive 액세스 토큰 입력" autocomplete="off" />
-            </div>
-            <div class="form-field">
-              <label class="field-label" for="cfgGdriveApiBase">API Base URL <span class="opt-tag">선택 · 기본값 자동 적용</span></label>
-              <input id="cfgGdriveApiBase" type="text" class="input-text mono" placeholder="https://www.googleapis.com/drive/v3" />
-            </div>
-          </div>
-        </div>
-        <div class="integration-footer">
-          <div id="connMsgGdrive" class="conn-feedback mono"></div>
-          <button class="btn btn-primary" onclick="saveAndVerifyCard('gdrive')">저장 및 연결 확인</button>
-        </div>
-      </div>
-
-      <!-- 카드: Google Takeout -->
-      <div class="integration-card">
-        <div class="integration-header">
-          <div class="integration-title-group">
-            <span class="integration-title">Google Takeout</span>
+            <span class="integration-title">Google 포토 · 드라이브 (Google Takeout)</span>
             <span class="role-tag">일회성 ZIP 다운로드 · 동기화 후 자동 삭제</span>
           </div>
           <span id="badgeTakeout" class="verified-chip"><span class="dot"></span>미설정</span>
         </div>
         <div class="integration-body">
+          <div style="font-size:12px;color:var(--muted);margin-bottom:12px;padding:8px 10px;background:var(--surface-subtle);border:1px solid var(--border);border-radius:6px;">
+            Google Takeout에서 <strong>[모두 선택 해제]</strong> 후 <strong>[Google 포토]</strong>와 <strong>[드라이브]</strong>만 체크(<span class="mono">.zip · 50GB</span> 권장)하여 내보내세요. 사진·영상은 모두 <strong>Immich</strong>로, 드라이브 일반 문서는 폴더 구조를 유지한 채 <strong>Nextcloud(<span class="mono">/GoogleDrive</span>)</strong>로 자동 분류됩니다.
+          </div>
           <div class="form-field" style="margin-bottom:12px;">
             <label class="field-label" for="cfgTakeoutUrl">Takeout ZIP 다운로드 링크 (URL) <span class="req-tag">권장 · NAS로 직접 다운로드</span></label>
             <div style="display:flex;gap:8px;">
@@ -1144,7 +1120,7 @@
     const SOURCE_NAMES = {
       mybox: '네이버 MYBOX',
       gdrive: 'Google Drive',
-      takeout: 'Google Takeout'
+      takeout: 'Google 포토 · 드라이브 (Takeout)'
     };
 
     function updateThemeButtonLabel() {
@@ -1242,7 +1218,6 @@
         immich: 'connMsgImmich',
         nextcloud: 'connMsgNextcloud',
         mybox: 'connMsgMybox',
-        gdrive: 'connMsgGdrive',
         takeout: 'connMsgTakeout'
       };
       const msgEl = document.getElementById(msgElMap[service]);
@@ -1266,9 +1241,6 @@
       } else if (service === 'mybox') {
         payload.mybox_pat = document.getElementById('cfgMyboxPat').value;
         payload.mybox_api_base = document.getElementById('cfgMyboxApiBase').value;
-      } else if (service === 'gdrive') {
-        payload.gdrive_access_token = document.getElementById('cfgGdriveToken').value;
-        payload.gdrive_api_base = document.getElementById('cfgGdriveApiBase').value;
       } else if (service === 'takeout') {
         const takeout_dir = (document.getElementById('cfgTakeoutDir').value || '').trim();
         const res = await fetch('/api/takeout/path', {
@@ -1310,7 +1282,6 @@
         if (cs.nextcloud_url) document.getElementById('cfgNextcloudUrl').value = cs.nextcloud_url;
       }
       if (service === 'mybox') document.getElementById('cfgMyboxPat').value = '';
-      if (service === 'gdrive') document.getElementById('cfgGdriveToken').value = '';
 
       await fetchStatus();
     }
@@ -1529,7 +1500,7 @@
         subline.textContent = '아래 타겟 카드에서 필수 항목을 입력하고 [저장 및 연결 확인]을 실행하세요.';
       } else {
         headline.textContent = '2단계: 최소 1개 이상의 데이터 소스 연결 확인이 필요합니다';
-        subline.textContent = '타겟 서버는 준비되었습니다. MYBOX, Google Drive, Google Takeout 중 사용할 소스의 연결을 확인하세요.';
+        subline.textContent = '타겟 서버는 준비되었습니다. 네이버 MYBOX 또는 Google Takeout(포토·드라이브)의 연결을 확인하세요.';
       }
     }
 
@@ -1670,7 +1641,6 @@
       renderCardBadge('badgeImmich', 'connMsgImmich', c.immich_configured, conn.immich, false);
       renderCardBadge('badgeNextcloud', 'connMsgNextcloud', c.nextcloud_configured, conn.nextcloud, !c.enable_nextcloud);
       renderCardBadge('badgeMybox', 'connMsgMybox', c.mybox_configured, conn.mybox, false);
-      renderCardBadge('badgeGdrive', 'connMsgGdrive', c.gdrive_configured, conn.gdrive, false);
       const takeoutCleanedCount = ((d.all_stats && d.all_stats.takeout && d.all_stats.takeout.deleted_files) || 0);
       if (archives.length === 0 && takeoutCleanedCount > 0) {
         const tBadge = document.getElementById('badgeTakeout');
@@ -1693,16 +1663,12 @@
       document.getElementById('cfgMyboxPat').placeholder = c.mybox_configured
         ? '•••••••• (저장됨 — 변경 시에만 입력)'
         : 'MYBOX PAT 토큰 입력';
-      document.getElementById('cfgGdriveToken').placeholder = c.gdrive_configured
-        ? '•••••••• (저장됨 — 변경 시에만 입력)'
-        : 'Google Drive 액세스 토큰 입력';
 
       setInputIfUntouched('cfgImmichUrl', c.immich_url || '');
       setInputIfUntouched('cfgNextcloudUrl', c.nextcloud_url || '');
       setInputIfUntouched('cfgNextcloudBaseDir', c.nextcloud_base_dir || '/');
       setInputIfUntouched('cfgNextcloudUser', c.nextcloud_user || '');
       setInputIfUntouched('cfgMyboxApiBase', c.mybox_api_base || 'https://apis.naver.com/mybox');
-      setInputIfUntouched('cfgGdriveApiBase', c.gdrive_api_base || 'https://www.googleapis.com/drive/v3');
       setInputIfUntouched('cfgTakeoutDir', t.dir || c.takeout_dir || '/data/takeout');
       setInputIfUntouched('cfgConcurrency', c.concurrency || 3);
       setInputIfUntouched('cfgRateLimitRps', c.rate_limit_rps || 5);

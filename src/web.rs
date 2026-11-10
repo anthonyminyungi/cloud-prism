@@ -186,7 +186,6 @@ pub async fn verify_all_configured(
 
     let candidates = [
         ("mybox", !cfg.mybox_pat.is_empty()),
-        ("gdrive", !cfg.gdrive_access_token.is_empty()),
         ("takeout", Path::new(&cfg.takeout_dir).exists()),
         ("immich", !cfg.immich_url.is_empty()),
         (

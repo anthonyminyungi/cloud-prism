@@ -244,9 +244,11 @@ impl AppConfig {
         let Ok(bytes) = std::fs::read(&path) else {
             return;
         };
-        let Ok(req) = serde_json::from_slice::<SettingsUpdateRequest>(&bytes) else {
+        let Ok(mut req) = serde_json::from_slice::<SettingsUpdateRequest>(&bytes) else {
             return;
         };
+        // Google Drive migration now uses Google Takeout ZIP archives instead of short-lived OAuth tokens
+        req.gdrive_access_token = None;
         self.apply_settings_update(&req);
     }
 

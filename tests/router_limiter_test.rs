@@ -172,4 +172,10 @@ async fn test_rate_limiter_pacing_and_429_retry() {
         .await
         .unwrap();
     assert_eq!(gdrive_dir, "/GoogleDrive");
+
+    let takeout_dir = nc
+        .ensure_folder_tree(SourceType::Takeout, "/")
+        .await
+        .unwrap();
+    assert_eq!(takeout_dir, "/GoogleDrive");
 }

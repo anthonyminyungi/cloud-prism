@@ -194,9 +194,6 @@ impl AppState {
         if summary.mybox_configured && is_ok("mybox") {
             verified_sources.push("mybox".to_string());
         }
-        if summary.gdrive_configured && is_ok("gdrive") {
-            verified_sources.push("gdrive".to_string());
-        }
         let has_takeout_zips = !list_takeout_archives(&cfg.takeout_dir).is_empty();
         if has_takeout_zips && is_ok("takeout") {
             verified_sources.push("takeout".to_string());
@@ -204,7 +201,7 @@ impl AppState {
 
         let verified_cloud_sources: Vec<String> = verified_sources
             .iter()
-            .filter(|s| s.as_str() == "mybox" || s.as_str() == "gdrive")
+            .filter(|s| s.as_str() == "mybox")
             .cloned()
             .collect();
 

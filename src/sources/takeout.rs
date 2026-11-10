@@ -5,7 +5,7 @@ use crate::sources::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
@@ -13,6 +13,79 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
+
+/// Strips the outer `Takeout/` wrapper and service root folder (`드라이브`, `Drive`, `Google 포토`, etc.)
+/// so Google Drive folder structures inside a Takeout ZIP map cleanly under `/GoogleDrive/...` in Nextcloud.
+pub fn normalize_takeout_parent_path(raw_parent: &str) -> String {
+    let mut segments: Vec<&str> = raw_parent
+        .split(['/', '\\'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if segments
+        .first()
+        .map(|s| s.eq_ignore_ascii_case("takeout"))
+        .unwrap_or(false)
+    {
+        segments.remove(0);
+    }
+
+    if let Some(&first) = segments.first() {
+        let lower = first.to_lowercase();
+        if matches!(
+            lower.as_str(),
+            "드라이브"
+                | "drive"
+                | "내 드라이브"
+                | "my drive"
+                | "google 드라이브"
+                | "google drive"
+                | "google 포토"
+                | "google photos"
+        ) {
+            segments.remove(0);
+        }
+    }
+
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
+}
+
+fn is_takeout_system_entry(entry_name: &str, filename: &str) -> bool {
+    let lower_entry = entry_name.to_ascii_lowercase();
+    if lower_entry.ends_with(".json") {
+        return true;
+    }
+    let lower_name = filename.to_lowercase();
+    matches!(
+        lower_name.as_str(),
+        "archive_browser.html" | "아카이브_브라우저.html"
+    )
+}
+
+fn zip_datetime_to_rfc3339(dt: Option<zip::DateTime>) -> String {
+    let Some(dt) = dt else {
+        return DEFAULT_FALLBACK_TIMESTAMP.to_string();
+    };
+    // Unset MS-DOS ZIP timestamps default to 1980-01-01 00:00:00
+    if dt.year() <= 1980
+        && dt.month() == 1
+        && dt.day() == 1
+        && dt.hour() == 0
+        && dt.minute() == 0
+        && dt.second() == 0
+    {
+        return DEFAULT_FALLBACK_TIMESTAMP.to_string();
+    }
+    NaiveDate::from_ymd_opt(dt.year() as i32, dt.month() as u32, dt.day() as u32)
+        .and_then(|d| d.and_hms_opt(dt.hour() as u32, dt.minute() as u32, dt.second() as u32))
+        .map(|naive| Utc.from_utc_datetime(&naive).to_rfc3339())
+        .unwrap_or_else(|| DEFAULT_FALLBACK_TIMESTAMP.to_string())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TakeoutArchiveInfo {
@@ -107,6 +180,7 @@ impl GoogleTakeoutProvider {
         ];
         if let Some((stem, _ext)) = entry_name.rsplit_once('.') {
             candidates.push(format!("{}.json", stem));
+            candidates.push(format!("{}.supplemental-metadata.json", stem));
         }
         candidates
     }
@@ -242,32 +316,34 @@ impl SourceProvider for GoogleTakeoutProvider {
                     continue;
                 }
                 let entry_name = zf.name().to_string();
-                if entry_name.to_ascii_lowercase().ends_with(".json") {
-                    continue;
-                }
-                if !seen_entries.insert(entry_name.clone()) {
-                    continue;
-                }
-
                 let path_obj = Path::new(&entry_name);
                 let filename = path_obj
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or(&entry_name)
                     .to_string();
+
+                if is_takeout_system_entry(&entry_name, &filename) {
+                    continue;
+                }
+                if !seen_entries.insert(entry_name.clone()) {
+                    continue;
+                }
+
                 let parent = path_obj
                     .parent()
                     .and_then(|p| p.to_str())
-                    .map(|p| format!("/{}", p.trim_matches('/')))
+                    .map(normalize_takeout_parent_path)
                     .unwrap_or_else(|| "/".to_string());
+                let entry_timestamp = zip_datetime_to_rfc3339(zf.last_modified());
 
                 page.files.push(RemoteFile {
                     resource_id: entry_name,
                     name: filename,
                     parent_path: parent,
                     size: zf.size() as i64,
-                    created_time: DEFAULT_FALLBACK_TIMESTAMP.to_string(),
-                    modified_time: DEFAULT_FALLBACK_TIMESTAMP.to_string(),
+                    created_time: entry_timestamp.clone(),
+                    modified_time: entry_timestamp,
                     sha1_hash: None,
                 });
             }
@@ -429,5 +505,52 @@ mod tests {
         assert_eq!(downloaded.size, 20);
         // Must have resolved the timestamp from sibling archive 002.zip!
         assert!(downloaded.created_time_override.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_takeout_drive_path_normalization_and_zip_header_timestamp() {
+        let dir = TempDir::new().unwrap();
+        let zip_path = dir.path().join("takeout-drive-photos.zip");
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut zip = ZipWriter::new(file);
+            let dt = zip::DateTime::from_date_and_time(2025, 8, 15, 14, 30, 0).unwrap();
+            let opts = SimpleFileOptions::default().last_modified_time(dt);
+
+            // Boilerplate Takeout index file must be ignored
+            zip.start_file("Takeout/archive_browser.html", opts)
+                .unwrap();
+            zip.write_all(b"<html>Takeout Index</html>").unwrap();
+
+            // Drive root document -> parent_path "/"
+            zip.start_file("Takeout/드라이브/이력서.pdf", opts).unwrap();
+            zip.write_all(b"pdf_resume").unwrap();
+
+            // Drive subfolder document -> parent_path "/업무/2026"
+            zip.start_file("Takeout/드라이브/업무/2026/보고서.docx", opts)
+                .unwrap();
+            zip.write_all(b"docx_report").unwrap();
+
+            // English Drive subfolder photo -> parent_path "/Trips"
+            zip.start_file("Takeout/Drive/Trips/jeju.jpg", opts)
+                .unwrap();
+            zip.write_all(b"jpg_jeju").unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let provider = GoogleTakeoutProvider::new(dir.path());
+        let page = provider.list_page("root", "/", None).await.unwrap();
+
+        assert_eq!(page.files.len(), 3);
+        assert_eq!(page.files[0].name, "이력서.pdf");
+        assert_eq!(page.files[0].parent_path, "/");
+        assert!(page.files[0].modified_time.starts_with("2025-08-15T14:30:00"));
+
+        assert_eq!(page.files[1].name, "보고서.docx");
+        assert_eq!(page.files[1].parent_path, "/업무/2026");
+
+        assert_eq!(page.files[2].name, "jeju.jpg");
+        assert_eq!(page.files[2].parent_path, "/Trips");
     }
 }
