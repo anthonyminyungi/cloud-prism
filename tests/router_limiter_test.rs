@@ -63,6 +63,7 @@ fn test_config_env_map_parsing_and_url_normalization() {
     assert_eq!(cfg.sync_interval_minutes, 180);
     assert!(cfg.summary().mybox_configured);
     assert_eq!(cfg.summary().sync_interval_minutes, 180);
+    cfg.takeout_dir = "/nonexistent_takeout_dir_for_unit_test".to_string();
     assert_eq!(cfg.configured_sources().len(), 1);
 
     // Verify scheme auto-prefix and Nextcloud WebDAV suffix stripping
@@ -188,4 +189,39 @@ async fn test_rate_limiter_pacing_and_429_retry() {
         .await
         .unwrap();
     assert_eq!(takeout_dir, "/GoogleDrive");
+}
+
+#[test]
+fn test_hybrid_temp_dir_selection_and_cleanup() {
+    use mybox_immich_sync::sources::{
+        cleanup_temp_dir, resolve_temp_dir, LARGE_FILE_DISK_FALLBACK_THRESHOLD,
+    };
+    use tempfile::TempDir;
+
+    let ram_tmp = TempDir::new().unwrap();
+    let disk_tmp = TempDir::new().unwrap();
+
+    // Small file (< 256 MB) uses preferred tmpfs directory
+    let chosen_small = resolve_temp_dir(
+        ram_tmp.path(),
+        Some(disk_tmp.path()),
+        Some(10 * 1024 * 1024),
+    );
+    assert_eq!(chosen_small, ram_tmp.path());
+
+    // Large file (>= 256 MB) automatically falls back to disk temp directory
+    let chosen_large = resolve_temp_dir(
+        ram_tmp.path(),
+        Some(disk_tmp.path()),
+        Some(LARGE_FILE_DISK_FALLBACK_THRESHOLD + 1),
+    );
+    assert_eq!(chosen_large, disk_tmp.path());
+
+    // Stale file cleanup removes leftover files without deleting the directory itself
+    let stale_file = ram_tmp.path().join("mybox_stale_123.tmp");
+    std::fs::write(&stale_file, b"leftover").unwrap();
+    assert!(stale_file.exists());
+    cleanup_temp_dir(ram_tmp.path());
+    assert!(!stale_file.exists());
+    assert!(ram_tmp.path().exists());
 }

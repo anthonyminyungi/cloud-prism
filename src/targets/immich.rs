@@ -1,6 +1,6 @@
 use crate::config::normalize_base_url;
 use crate::db::FileRecord;
-use crate::limiter::{format_error_chain, RateLimiter};
+use crate::limiter::RateLimiter;
 use crate::router::{SyncResultKind, TargetType};
 use crate::sources::build_target_http_client;
 use crate::targets::{TargetProvider, UploadContext, UploadOutcome};
@@ -142,25 +142,30 @@ impl ImmichTarget {
         modified_at: &str,
     ) -> Result<(String, SyncResultKind)> {
         let url = self.endpoint(ENDPOINT_ASSETS);
-        let bytes = tokio::fs::read(file_path).await?;
-
-        self.limiter.acquire().await;
-        let part = Part::bytes(bytes).file_name(filename.to_string());
-        let form = Form::new()
-            .text("deviceAssetId", device_asset_id.to_string())
-            .text("deviceId", DEVICE_ID)
-            .text("fileCreatedAt", created_at.to_string())
-            .text("fileModifiedAt", modified_at.to_string())
-            .part("assetData", part);
+        let file_len = tokio::fs::metadata(file_path).await?.len();
 
         let resp = self
-            .client
-            .post(&url)
-            .header(HEADER_API_KEY, &self.api_key)
-            .multipart(form)
-            .send()
+            .limiter
+            .send_with_retry(|| {
+                let std_file =
+                    std::fs::File::open(file_path).expect("temp file must exist during upload");
+                let async_file = tokio::fs::File::from_std(std_file);
+                let reader_stream = tokio_util::io::ReaderStream::new(async_file);
+                let body = reqwest::Body::wrap_stream(reader_stream);
+                let part = Part::stream_with_length(body, file_len).file_name(filename.to_string());
+                let form = Form::new()
+                    .text("deviceAssetId", device_asset_id.to_string())
+                    .text("deviceId", DEVICE_ID)
+                    .text("fileCreatedAt", created_at.to_string())
+                    .text("fileModifiedAt", modified_at.to_string())
+                    .part("assetData", part);
+                self.client
+                    .post(&url)
+                    .header(HEADER_API_KEY, &self.api_key)
+                    .multipart(form)
+            })
             .await
-            .map_err(|e| anyhow!("Immich 업로드 전송 오류: {}", format_error_chain(&e)))?;
+            .map_err(|e| anyhow!("Immich 업로드 전송 오류: {}", e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -251,5 +256,25 @@ impl TargetProvider for ImmichTarget {
             return Ok(false);
         };
         self.verify_hash_exists(&file.resource_id, sha1).await
+    }
+
+    async fn verify_exists_batch(&self, files: &[FileRecord]) -> Result<HashMap<String, bool>> {
+        let mut out = HashMap::with_capacity(files.len());
+        let mut check_items = Vec::new();
+        for f in files {
+            if let Some(ref sha1) = f.sha1_hash {
+                check_items.push((f.resource_id.clone(), sha1.clone()));
+            } else {
+                out.insert(f.resource_id.clone(), false);
+            }
+        }
+        for chunk in check_items.chunks(500) {
+            let chunk_res = self.check_bulk_hashes(chunk).await?;
+            for (res_id, _) in chunk {
+                let exists = chunk_res.get(res_id).and_then(|opt| opt.as_ref()).is_some();
+                out.insert(res_id.clone(), exists);
+            }
+        }
+        Ok(out)
     }
 }

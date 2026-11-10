@@ -1199,6 +1199,15 @@
       document.getElementById('logConsole').innerHTML = '';
     }
 
+    function escapeHtml(raw) {
+      return String(raw ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     function formatBytes(bytes) {
       const b = Number(bytes) || 0;
       if (b <= 0) return '0 B';
@@ -1669,7 +1678,7 @@
       if (archives.length > 0) {
         archiveListEl.innerHTML = archives.map(a => `
           <div class="archive-row">
-            <span>${a.name}</span>
+            <span>${escapeHtml(a.name)}</span>
             <span class="num" style="color:var(--muted);">${formatBytes(a.size_bytes)}</span>
           </div>
         `).join('');
@@ -1718,8 +1727,8 @@
         failureList.innerHTML = allFailures.map(f => `
           <div class="failure-row">
             <div>
-              <div class="failure-path mono">[${f.source} → ${f.target_type}] ${f.parent_path}/${f.name}</div>
-              <div class="failure-err mono">${f.error_msg}</div>
+              <div class="failure-path mono">[${escapeHtml(f.source)} → ${escapeHtml(f.target_type)}] ${escapeHtml(f.parent_path)}/${escapeHtml(f.name)}</div>
+              <div class="failure-err mono">${escapeHtml(f.error_msg)}</div>
             </div>
             <div class="num" style="color:var(--subtle);font-size:11.5px;white-space:nowrap;">재시도 ${f.retry_count}회</div>
           </div>

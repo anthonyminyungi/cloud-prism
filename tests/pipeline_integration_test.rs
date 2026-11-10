@@ -1030,3 +1030,76 @@ async fn test_takeout_combined_photos_and_drive_routes_photos_to_immich_and_docs
         "Combined Takeout ZIP must be deleted after both Immich and Nextcloud verify all 4 files"
     );
 }
+
+#[tokio::test]
+async fn test_takeout_preserves_zip_when_nextcloud_disabled_and_archive_contains_documents() {
+    use std::fs::File;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_takeout_guard.db");
+    let tmp_download_dir = temp_dir.path().join("tmp_guard_sync");
+    let takeout_dir = temp_dir.path().join("takeout_guard_staging");
+    std::fs::create_dir_all(&takeout_dir).unwrap();
+
+    let zip_path = takeout_dir.join("takeout-mixed-001.zip");
+    {
+        let file = File::create(&zip_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip.start_file("Takeout/Google 포토/2026/photo.jpg", opts)
+            .unwrap();
+        zip.write_all(b"photo_bytes_123").unwrap();
+        zip.start_file("Takeout/드라이브/중요문서.pdf", opts)
+            .unwrap();
+        zip.write_all(b"important_pdf_bytes").unwrap();
+        zip.finish().unwrap();
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "Takeout/Google 포토/2026/photo.jpg", "action": "accept" }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "immich_photo_1",
+            "status": "created"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: tmp_download_dir.to_str().unwrap().to_string(),
+        takeout_dir: takeout_dir.to_str().unwrap().to_string(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_key".to_string(),
+        enable_nextcloud: false, // Nextcloud disabled!
+        rate_limit_rps: 100.0,
+        concurrency: 2,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    let state = AppState::new(db, cfg.clone());
+    let pipeline = SyncPipeline::from_config(state, cfg, "takeout").unwrap();
+
+    let stats = pipeline.run_auto().await.unwrap();
+    assert_eq!(stats.uploaded_immich_created, 1);
+    assert!(
+        zip_path.exists(),
+        "Takeout ZIP must NOT be deleted when Nextcloud is disabled and archive contains non-media documents"
+    );
+}

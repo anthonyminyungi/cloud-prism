@@ -5,6 +5,7 @@ use crate::db::FileRecord;
 use crate::router::{SourceType, SyncResultKind, TargetType};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::path::Path;
 
 pub struct UploadContext<'a> {
@@ -40,4 +41,13 @@ pub trait TargetProvider: Send + Sync {
 
     async fn upload(&self, ctx: UploadContext<'_>) -> Result<UploadOutcome>;
     async fn verify_exists(&self, file: &FileRecord) -> Result<bool>;
+
+    async fn verify_exists_batch(&self, files: &[FileRecord]) -> Result<HashMap<String, bool>> {
+        let mut out = HashMap::with_capacity(files.len());
+        for f in files {
+            let ok = self.verify_exists(f).await.unwrap_or(false);
+            out.insert(f.resource_id.clone(), ok);
+        }
+        Ok(out)
+    }
 }

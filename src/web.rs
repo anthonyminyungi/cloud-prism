@@ -483,12 +483,13 @@ async fn upload_takeout_zip(
     }
 
     let dest_path = Path::new(&cfg.takeout_dir).join(&safe_name);
-    let mut file = match tokio::fs::File::create(&dest_path).await {
+    let part_path = Path::new(&cfg.takeout_dir).join(format!("{}.part", safe_name));
+    let mut file = match tokio::fs::File::create(&part_path).await {
         Ok(f) => f,
         Err(err) => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("ZIP 파일 생성 실패: {}", err),
+                format!("ZIP 임시 파일 생성 실패: {}", err),
             )
         }
     };
@@ -500,7 +501,8 @@ async fn upload_takeout_zip(
         match chunk_res {
             Ok(chunk) => {
                 if let Err(err) = file.write_all(&chunk).await {
-                    let _ = tokio::fs::remove_file(&dest_path).await;
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&part_path).await;
                     return error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("ZIP 파일 쓰기 실패: {}", err),
@@ -509,7 +511,8 @@ async fn upload_takeout_zip(
                 written_bytes += chunk.len() as u64;
             }
             Err(err) => {
-                let _ = tokio::fs::remove_file(&dest_path).await;
+                drop(file);
+                let _ = tokio::fs::remove_file(&part_path).await;
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     format!("업로드 스트림 수신 중단: {}", err),
@@ -518,7 +521,26 @@ async fn upload_takeout_zip(
         }
     }
 
-    let _ = file.flush().await;
+    if let Err(err) = file.flush().await {
+        drop(file);
+        let _ = tokio::fs::remove_file(&part_path).await;
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("ZIP 파일 플러시 실패: {}", err),
+        );
+    }
+    drop(file);
+
+    if dest_path.exists() {
+        let _ = tokio::fs::remove_file(&dest_path).await;
+    }
+    if let Err(err) = tokio::fs::rename(&part_path, &dest_path).await {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("ZIP 파일 원자적 이름 변경 실패: {}", err),
+        );
+    }
     let verification = verify_single_service(&state, "takeout").await;
     let archives = list_takeout_archives(&cfg.takeout_dir);
     let current_state = *state.job_state.read().await;

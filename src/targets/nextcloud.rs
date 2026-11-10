@@ -223,7 +223,7 @@ impl NextcloudTarget {
             .await;
         let url = self.dav_url(&remote_path);
 
-        let bytes = tokio::fs::read(file_path).await?;
+        let file_len = tokio::fs::metadata(file_path).await?.len();
         let mtime_epoch = DateTime::parse_from_rfc3339(modified_time_iso)
             .ok()
             .map(|dt| dt.timestamp())
@@ -234,11 +234,16 @@ impl NextcloudTarget {
         let resp = self
             .limiter
             .send_with_retry(|| {
+                let std_file =
+                    std::fs::File::open(file_path).expect("temp file must exist during upload");
+                let async_file = tokio::fs::File::from_std(std_file);
+                let stream = tokio_util::io::ReaderStream::new(async_file);
                 self.client
                     .put(&url)
                     .basic_auth(&self.user, Some(&self.app_password))
                     .header(HEADER_MTIME, &mtime_epoch)
-                    .body(bytes.clone())
+                    .header(reqwest::header::CONTENT_LENGTH, file_len)
+                    .body(reqwest::Body::wrap_stream(stream))
             })
             .await?;
 

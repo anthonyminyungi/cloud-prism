@@ -13,6 +13,11 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
 pub const DEFAULT_FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
+pub const LARGE_FILE_DISK_FALLBACK_THRESHOLD: u64 = 256 * 1024 * 1024; // 256 MB
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 15;
+const HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+const HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
+const STREAM_CHUNK_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteFolder {
@@ -87,9 +92,37 @@ pub fn sanitize_filename(filename: &str) -> String {
     filename.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
 }
 
+pub fn resolve_temp_dir(
+    preferred_tmp: &Path,
+    fallback_disk_tmp: Option<&Path>,
+    size_hint: Option<u64>,
+) -> PathBuf {
+    if let (Some(disk_dir), Some(sz)) = (fallback_disk_tmp, size_hint) {
+        if sz >= LARGE_FILE_DISK_FALLBACK_THRESHOLD {
+            return disk_dir.to_path_buf();
+        }
+    }
+    preferred_tmp.to_path_buf()
+}
+
+pub fn cleanup_temp_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.is_file() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 pub fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
+        .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -106,6 +139,9 @@ pub fn build_target_http_client(follow_redirects: bool) -> reqwest::Client {
         .no_proxy()
         .danger_accept_invalid_certs(true)
         .redirect(redirect_policy)
+        .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
+        .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
         .build()
         .unwrap_or_else(|_| build_http_client())
 }
@@ -129,8 +165,20 @@ pub async fn stream_response_to_temp(
     let mut hasher = Sha1::new();
     let mut total_bytes: u64 = 0;
     let mut stream = resp.bytes_stream();
+    let chunk_timeout = std::time::Duration::from_secs(STREAM_CHUNK_TIMEOUT_SECS);
 
-    while let Some(chunk_res) = stream.next().await {
+    loop {
+        let next_item = tokio::time::timeout(chunk_timeout, stream.next())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "다운로드 스트림 읽기 타임아웃 ({}초 초과)",
+                    STREAM_CHUNK_TIMEOUT_SECS
+                )
+            })?;
+        let Some(chunk_res) = next_item else {
+            break;
+        };
         let chunk = chunk_res?;
         hasher.update(&chunk);
         file.write_all(&chunk).await?;

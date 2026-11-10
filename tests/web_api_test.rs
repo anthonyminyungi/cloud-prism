@@ -118,6 +118,7 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     assert!(!html.contains("id=\"cfgGdriveToken\""));
     assert!(html.contains("id=\"sampleLimitSelect\""));
     assert!(html.contains("toggleTheme"));
+    assert!(html.contains("escapeHtml"));
     assert!(!html.contains("linear-gradient("));
     assert!(!html.contains("📦"));
     assert!(!html.contains("🚀"));
@@ -225,6 +226,24 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     assert_eq!(path_json["verification"]["ok"], false);
 
     let zip_bytes = build_sample_takeout_zip_bytes();
+
+    // 5a-0. Direct browser ZIP upload via POST /api/takeout/upload writes atomically (.part -> .zip)
+    let upload_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/takeout/upload?filename=takeout-2026-001.zip")
+                .body(Body::from(zip_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload_resp.status(), StatusCode::OK);
+    assert!(custom_takeout_dir.join("takeout-2026-001.zip").exists());
+    assert!(!custom_takeout_dir
+        .join("takeout-2026-001.zip.part")
+        .exists());
 
     // 5a. Reject HTML login page URLs (when user pastes webpage link instead of direct stream URL)
     Mock::given(method("GET"))

@@ -16,6 +16,6 @@ services:
       # TrueNAS SCALE 예시: /mnt/<Pool이름>/apps/cloud-prism:/data
       - ./data:/data
     tmpfs:
-      # ZFS 디스크 쓰기(CoW) 및 스냅샷 부풀림 방지를 위해 임시 다운로드는 RAM(tmpfs)에서 처리 후 즉시 삭제
-      - /tmp/mybox_sync:size=1G,mode=1777
+      # ZFS 디스크 쓰기(CoW) 및 스냅샷 부풀림 방지를 위해 임시 다운로드는 RAM(tmpfs)에서 처리 후 즉시 삭제 (대용량 256MB+ 파일은 /data/.tmp_sync로 자동 우회)
+      - /tmp/mybox_sync:size=2G,mode=1777
     restart: unless-stopped

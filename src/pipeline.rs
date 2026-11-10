@@ -78,9 +78,11 @@ pub struct SyncPipeline {
 impl SyncPipeline {
     pub fn from_config(state: Arc<AppState>, config: AppConfig, source_name: &str) -> Result<Self> {
         let source_type: SourceType = source_name.parse()?;
-        let limiter = RateLimiter::new(config.rate_limit_rps, config.max_retries);
-        let source = build_source_provider(&config, source_type, limiter.clone());
-        let targets = build_target_providers(&config, limiter);
+        let source_limiter = RateLimiter::new(config.rate_limit_rps, config.max_retries);
+        let target_limiter =
+            RateLimiter::new((config.rate_limit_rps * 10.0).max(50.0), config.max_retries);
+        let source = build_source_provider(&config, source_type, source_limiter);
+        let targets = build_target_providers(&config, target_limiter);
 
         Ok(Self {
             state,
@@ -321,7 +323,12 @@ impl SyncPipeline {
             let batch = self
                 .state
                 .db
-                .get_pending_files(src, max_retries, batch_size)
+                .get_pending_files_for_config(
+                    src,
+                    max_retries,
+                    batch_size,
+                    self.config.enable_nextcloud,
+                )
                 .await?;
             if batch.is_empty() {
                 break;
@@ -357,6 +364,43 @@ impl SyncPipeline {
         Ok(stats)
     }
 
+    async fn verify_uploaded_batch(&self, files: &[FileRecord]) -> Result<HashMap<String, bool>> {
+        let mut by_target: HashMap<TargetType, Vec<FileRecord>> = HashMap::new();
+        let mut results = HashMap::with_capacity(files.len());
+
+        for f in files {
+            match f.target_type.parse::<TargetType>() {
+                Ok(t) => by_target.entry(t).or_default().push(f.clone()),
+                Err(_) => {
+                    results.insert(f.resource_id.clone(), false);
+                }
+            }
+        }
+
+        for (target_type, group) in by_target {
+            if self.state.is_stopping() {
+                break;
+            }
+            match self.targets.get(&target_type) {
+                Some(target) => match target.verify_exists_batch(&group).await {
+                    Ok(map) => results.extend(map),
+                    Err(_) => {
+                        for f in group {
+                            results.insert(f.resource_id, false);
+                        }
+                    }
+                },
+                None => {
+                    for f in group {
+                        results.insert(f.resource_id, false);
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     async fn cleanup_takeout_archives_after_sync(&self) -> Result<()> {
         let src = self.source_key();
         let archives = list_takeout_archives(&self.config.takeout_dir);
@@ -377,6 +421,27 @@ impl SyncPipeline {
                 )
                 .await;
             return Ok(());
+        }
+
+        if !self.config.enable_nextcloud {
+            let takeout_provider = GoogleTakeoutProvider::new(&self.config.takeout_dir);
+            let skipped_docs = takeout_provider
+                .count_unclassified_files(false)
+                .unwrap_or(0);
+            if skipped_docs > 0 {
+                self.state
+                    .emit_event(
+                        src,
+                        JobState::Syncing,
+                        None,
+                        format!(
+                            "[{}] ZIP 내에 Nextcloud 미사용으로 건너뛴 일반 문서 파일 {}건이 포함되어 있어 로컬 ZIP 아카이브를 보존합니다.",
+                            src, skipped_docs
+                        ),
+                    )
+                    .await;
+                return Ok(());
+            }
         }
 
         let stats = self.state.db.get_stats(src).await?;
@@ -430,17 +495,15 @@ impl SyncPipeline {
             )
             .await;
 
+        let verified_map = self.verify_uploaded_batch(&uploaded).await?;
         for file in &uploaded {
             if self.state.is_stopping() {
                 return Ok(());
             }
-            let verified = match file.target_type.parse::<TargetType>() {
-                Ok(t) => match self.targets.get(&t) {
-                    Some(target) => target.verify_exists(file).await.unwrap_or(false),
-                    None => false,
-                },
-                Err(_) => false,
-            };
+            let verified = verified_map
+                .get(&file.resource_id)
+                .copied()
+                .unwrap_or(false);
             if !verified {
                 self.state
                     .emit_event(
@@ -457,12 +520,11 @@ impl SyncPipeline {
             }
         }
 
-        for file in &uploaded {
-            self.state
-                .db
-                .mark_file_deleted(src, &file.resource_id)
-                .await?;
-        }
+        let deleted_ids: Vec<String> = uploaded.iter().map(|f| f.resource_id.clone()).collect();
+        self.state
+            .db
+            .mark_files_deleted_batch(src, &deleted_ids)
+            .await?;
 
         let dir_path = Path::new(&self.config.takeout_dir);
         let mut removed_count = 0usize;
@@ -608,14 +670,30 @@ impl SyncPipeline {
             }
         }
 
-        let downloaded = self
+        let fallback_dir = self.config.disk_fallback_tmp_dir();
+        let size_hint = if file.size > 0 {
+            Some(file.size as u64)
+        } else {
+            None
+        };
+        let chosen_tmp = crate::sources::resolve_temp_dir(
+            Path::new(&self.config.tmp_dir),
+            Some(&fallback_dir),
+            size_hint,
+        );
+        let downloaded = match self
             .source
-            .download_to_temp(
-                &file.resource_id,
-                &file.name,
-                Path::new(&self.config.tmp_dir),
-            )
-            .await?;
+            .download_to_temp(&file.resource_id, &file.name, &chosen_tmp)
+            .await
+        {
+            Ok(d) => d,
+            Err(_first_err) if chosen_tmp != fallback_dir => {
+                self.source
+                    .download_to_temp(&file.resource_id, &file.name, &fallback_dir)
+                    .await?
+            }
+            Err(err) => return Err(err),
+        };
 
         let created_at = downloaded
             .created_time_override
@@ -680,18 +758,17 @@ impl SyncPipeline {
             )
             .await;
 
+        let verified_map = self.verify_uploaded_batch(&uploaded).await?;
+
         for file in uploaded {
             if self.state.is_stopping() {
                 break;
             }
 
-            let verified = match file.target_type.parse::<TargetType>() {
-                Ok(t) => match self.targets.get(&t) {
-                    Some(target) => target.verify_exists(&file).await.unwrap_or(false),
-                    None => false,
-                },
-                Err(_) => false,
-            };
+            let verified = verified_map
+                .get(&file.resource_id)
+                .copied()
+                .unwrap_or(false);
 
             if !verified {
                 self.state
@@ -769,26 +846,41 @@ impl SyncPipeline {
 }
 
 pub fn spawn_auto_sync_scheduler(state: Arc<AppState>) {
-    let interval_mins = state.config.sync_interval_minutes;
-    if interval_mins == 0 {
-        return;
-    }
-
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_mins * 60));
-        ticker.tick().await;
-
         loop {
-            ticker.tick().await;
+            let interval_mins = state.effective_config().await.sync_interval_minutes;
+            if interval_mins == 0 {
+                state.scheduler_notify.notified().await;
+                continue;
+            }
+
+            tokio::select! {
+                _ = state.scheduler_notify.notified() => {
+                    continue;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(interval_mins * 60)) => {}
+            }
 
             let current_cfg = state.effective_config().await;
-            let sources = current_cfg.configured_sources();
+            if current_cfg.sync_interval_minutes == 0 || !current_cfg.summary().immich_configured {
+                continue;
+            }
+            let readiness = state.readiness_summary().await;
+            let sources: Vec<String> = if !readiness.verified_sources.is_empty() {
+                readiness.verified_sources
+            } else {
+                current_cfg
+                    .configured_sources()
+                    .into_iter()
+                    .map(|s| s.as_str().to_string())
+                    .collect()
+            };
             if sources.is_empty() {
                 continue;
             }
 
-            for src_type in sources {
-                let src_key = src_type.as_str();
+            for src_key in &sources {
+                let src_key = src_key.as_str();
                 {
                     let mut js = state.job_state.write().await;
                     if *js != JobState::Idle {
@@ -804,7 +896,7 @@ pub fn spawn_auto_sync_scheduler(state: Arc<AppState>) {
                         None,
                         format!(
                             "[자동 스케줄러] {}분 주기 증분 스캔 & 동기화를 시작합니다. (원격 삭제 제외)",
-                            interval_mins
+                            current_cfg.sync_interval_minutes
                         ),
                     )
                     .await;

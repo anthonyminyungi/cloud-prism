@@ -331,3 +331,99 @@ async fn test_upsert_files_heals_fallback_created_time_and_updates_exported_size
     assert_eq!(deletable.len(), 1);
     assert_eq!(deletable[0].size, 12345);
 }
+
+#[tokio::test]
+async fn test_rescan_zero_size_uploaded_preserved_and_filtered_pending_and_batch_delete() {
+    let db = CheckpointDB::connect(":memory:").await.unwrap();
+
+    // 1. Insert a Google Doc (size = 0 at scan time) and a photo (size = 500)
+    db.upsert_files(&[
+        FileUpsert {
+            source_type: "gdrive".to_string(),
+            resource_id: "gdoc_1".to_string(),
+            name: "기획서.docx".to_string(),
+            parent_path: "/".to_string(),
+            size: 0,
+            created_time: "2026-01-01T00:00:00Z".to_string(),
+            modified_time: "2026-01-01T00:00:00Z".to_string(),
+            target_type: "nextcloud".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "gdrive".to_string(),
+            resource_id: "photo_1".to_string(),
+            name: "pic.jpg".to_string(),
+            parent_path: "/".to_string(),
+            size: 500,
+            created_time: "2026-01-02T00:00:00Z".to_string(),
+            modified_time: "2026-01-02T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+    ])
+    .await
+    .unwrap();
+
+    // When enable_nextcloud = false, only immich pending files should be returned
+    let immich_only = db
+        .get_pending_files_for_config("gdrive", 3, 100, false)
+        .await
+        .unwrap();
+    assert_eq!(immich_only.len(), 1);
+    assert_eq!(immich_only[0].resource_id, "photo_1");
+
+    // Mark gdoc_1 uploaded with actual exported size (9876 bytes)
+    db.mark_file_uploaded_with_size(
+        "gdrive",
+        "gdoc_1",
+        "sha1_gdoc",
+        "/GoogleDrive/기획서.docx",
+        "created",
+        Some(9876),
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded("gdrive", "photo_1", "sha1_pic", "imm_1", "created")
+        .await
+        .unwrap();
+
+    // 2. Re-scan where Google Drive API again reports size = 0 for gdoc_1 with identical timestamps:
+    // MUST NOT reset status to PENDING and MUST preserve size = 9876!
+    db.upsert_files(&[FileUpsert {
+        source_type: "gdrive".to_string(),
+        resource_id: "gdoc_1".to_string(),
+        name: "기획서.docx".to_string(),
+        parent_path: "/".to_string(),
+        size: 0,
+        created_time: "2026-01-01T00:00:00Z".to_string(),
+        modified_time: "2026-01-01T00:00:00Z".to_string(),
+        target_type: "nextcloud".to_string(),
+        sha1_hash: None,
+    }])
+    .await
+    .unwrap();
+
+    let pending_after = db.get_pending_files("gdrive", 3, 100).await.unwrap();
+    assert!(
+        pending_after.is_empty(),
+        "Uploaded zero-metadata-size file must not reset to PENDING on rescan"
+    );
+
+    let deletable = db
+        .get_uploaded_files_for_delete("gdrive", 100)
+        .await
+        .unwrap();
+    let gdoc_row = deletable
+        .iter()
+        .find(|r| r.resource_id == "gdoc_1")
+        .unwrap();
+    assert_eq!(gdoc_row.size, 9876);
+
+    // 3. Batch mark deleted
+    let deleted_cnt = db
+        .mark_files_deleted_batch("gdrive", &["gdoc_1".to_string(), "photo_1".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(deleted_cnt, 2);
+    assert_eq!(db.get_stats("gdrive").await.unwrap().deleted_files, 2);
+}

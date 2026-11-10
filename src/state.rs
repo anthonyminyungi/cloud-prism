@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -82,12 +82,15 @@ pub struct AppState {
     pub recent_logs: RwLock<VecDeque<ProgressEvent>>,
     pub event_tx: broadcast::Sender<ProgressEvent>,
     pub job_handle: Mutex<Option<JoinHandle<()>>>,
+    pub scheduler_notify: Arc<Notify>,
 }
 
 impl AppState {
     pub fn new(db: CheckpointDB, config: AppConfig) -> Arc<Self> {
         let mut initial_runtime = config.clone();
         initial_runtime.load_persisted_if_exists();
+        crate::sources::cleanup_temp_dir(std::path::Path::new(&initial_runtime.tmp_dir));
+        crate::sources::cleanup_temp_dir(&initial_runtime.disk_fallback_tmp_dir());
         let (event_tx, _) = broadcast::channel(256);
         Arc::new(Self {
             db,
@@ -105,6 +108,7 @@ impl AppState {
             recent_logs: RwLock::new(VecDeque::with_capacity(MAX_RECENT_LOGS)),
             event_tx,
             job_handle: Mutex::new(None),
+            scheduler_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -151,6 +155,11 @@ impl AppState {
             || before.nextcloud_base_dir != cfg.nextcloud_base_dir
         {
             conn.remove("nextcloud");
+        }
+        drop(conn);
+
+        if before.sync_interval_minutes != cfg.sync_interval_minutes {
+            self.scheduler_notify.notify_waiters();
         }
 
         Ok(cfg.clone())

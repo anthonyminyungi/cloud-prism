@@ -1,4 +1,4 @@
-use crate::router::SourceType;
+use crate::router::{SourceType, TargetRouter};
 use crate::sources::{
     sanitize_filename, DownloadedSourceFile, ListPage, RemoteFile, SourceProvider, TempFileGuard,
     DEFAULT_FALLBACK_TIMESTAMP,
@@ -8,10 +8,12 @@ use async_trait::async_trait;
 use chrono::{NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use zip::ZipArchive;
 
 /// Strips the outer `Takeout/` wrapper and service root folder (`드라이브`, `Drive`, `Google 포토`, etc.)
@@ -131,14 +133,24 @@ struct TakeoutTimestamp {
     timestamp: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct TakeoutArchiveIndex {
+    zip_signatures: Vec<(PathBuf, u64, Option<SystemTime>)>,
+    entry_to_zip: HashMap<String, PathBuf>,
+    sidecar_to_zip: HashMap<String, PathBuf>,
+    non_media_count: usize,
+}
+
 pub struct GoogleTakeoutProvider {
     takeout_dir: PathBuf,
+    index_cache: Arc<Mutex<Option<TakeoutArchiveIndex>>>,
 }
 
 impl GoogleTakeoutProvider {
     pub fn new(takeout_dir: impl Into<PathBuf>) -> Self {
         Self {
             takeout_dir: takeout_dir.into(),
+            index_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -159,6 +171,98 @@ impl GoogleTakeoutProvider {
             .collect();
         paths.sort();
         Ok(paths)
+    }
+
+    fn compute_zip_signatures(&self) -> Result<Vec<(PathBuf, u64, Option<SystemTime>)>> {
+        let paths = self.list_zip_paths()?;
+        let mut sigs = Vec::with_capacity(paths.len());
+        for p in paths {
+            if let Ok(meta) = std::fs::metadata(&p) {
+                sigs.push((p, meta.len(), meta.modified().ok()));
+            }
+        }
+        Ok(sigs)
+    }
+
+    fn get_or_build_index(&self) -> Result<TakeoutArchiveIndex> {
+        let sigs = self.compute_zip_signatures()?;
+        if let Ok(guard) = self.index_cache.lock() {
+            if let Some(ref cached) = *guard {
+                if cached.zip_signatures == sigs {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        let mut entry_to_zip = HashMap::new();
+        let mut sidecar_to_zip = HashMap::new();
+        let mut non_media_count = 0usize;
+
+        for (zip_path, _, _) in &sigs {
+            let Ok(file) = File::open(zip_path) else {
+                continue;
+            };
+            let Ok(mut archive) = ZipArchive::new(file) else {
+                continue;
+            };
+
+            for i in 0..archive.len() {
+                let Ok(zf) = archive.by_index_raw(i) else {
+                    continue;
+                };
+                if zf.is_dir() {
+                    continue;
+                }
+                let entry_name = zf.name().to_string();
+                if entry_name.to_ascii_lowercase().ends_with(".json") {
+                    sidecar_to_zip
+                        .entry(entry_name)
+                        .or_insert_with(|| zip_path.clone());
+                    continue;
+                }
+
+                let filename = Path::new(&entry_name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&entry_name)
+                    .to_string();
+                if is_takeout_system_entry(&entry_name, &filename) {
+                    continue;
+                }
+
+                if let std::collections::hash_map::Entry::Vacant(vacant) =
+                    entry_to_zip.entry(entry_name)
+                {
+                    vacant.insert(zip_path.clone());
+                    if TargetRouter::classify(&filename, false).is_none() {
+                        non_media_count += 1;
+                    }
+                }
+            }
+        }
+
+        let built = TakeoutArchiveIndex {
+            zip_signatures: sigs,
+            entry_to_zip,
+            sidecar_to_zip,
+            non_media_count,
+        };
+
+        if let Ok(mut guard) = self.index_cache.lock() {
+            *guard = Some(built.clone());
+        }
+
+        Ok(built)
+    }
+
+    /// Returns the number of non-media user files inside the Takeout ZIP archives
+    /// that would be skipped when `enable_nextcloud` is false.
+    pub fn count_unclassified_files(&self, enable_nextcloud: bool) -> Result<usize> {
+        if enable_nextcloud {
+            return Ok(0);
+        }
+        let idx = self.get_or_build_index()?;
+        Ok(idx.non_media_count)
     }
 
     fn parse_sidecar_timestamp(json_bytes: &[u8]) -> Option<String> {
@@ -197,11 +301,11 @@ impl GoogleTakeoutProvider {
         })
     }
 
-    fn find_sidecar_timestamp(
-        &self,
+    fn find_sidecar_timestamp_indexed(
         primary_zip_path: &Path,
         primary_archive: &mut ZipArchive<File>,
         entry_name: &str,
+        sidecar_to_zip: &HashMap<String, PathBuf>,
     ) -> Option<String> {
         let candidates = Self::sidecar_candidates(entry_name);
 
@@ -210,20 +314,23 @@ impl GoogleTakeoutProvider {
             return Some(ts);
         }
 
-        // 2. Split-ZIP fallback: when Google Takeout places the media file in 001.zip
-        //    and its .json sidecar in 002.zip, search sibling ZIP archives.
-        let zip_paths = self.list_zip_paths().ok()?;
-        for zip_path in zip_paths {
-            if zip_path == primary_zip_path {
+        // 2. Indexed split-ZIP lookup: only open the specific sibling archive containing the sidecar
+        for cand in &candidates {
+            let Some(sibling_zip_path) = sidecar_to_zip.get(cand) else {
+                continue;
+            };
+            if sibling_zip_path == primary_zip_path {
                 continue;
             }
-            let Ok(file) = File::open(&zip_path) else {
+            let Ok(file) = File::open(sibling_zip_path) else {
                 continue;
             };
             let Ok(mut sibling_archive) = ZipArchive::new(file) else {
                 continue;
             };
-            if let Some(ts) = Self::read_sidecar_from_archive(&mut sibling_archive, &candidates) {
+            if let Some(ts) =
+                Self::read_sidecar_from_archive(&mut sibling_archive, std::slice::from_ref(cand))
+            {
                 return Some(ts);
             }
         }
@@ -231,19 +338,15 @@ impl GoogleTakeoutProvider {
         None
     }
 
-    fn locate_entry_archive(
+    fn resolve_entry_zip_path(
         &self,
         resource_id: &str,
-    ) -> Result<(PathBuf, ZipArchive<File>, String)> {
-        // Support legacy "zip_name::entry_name" format if present, otherwise treat resource_id as canonical entry_name
+        index: &TakeoutArchiveIndex,
+    ) -> Result<(PathBuf, String)> {
         if let Some((zip_name, entry_name)) = resource_id.split_once("::") {
             let candidate_path = self.takeout_dir.join(zip_name);
             if candidate_path.exists() {
-                let file = File::open(&candidate_path)?;
-                let mut archive = ZipArchive::new(file)?;
-                if archive.by_name(entry_name).is_ok() {
-                    return Ok((candidate_path, archive, entry_name.to_string()));
-                }
+                return Ok((candidate_path, entry_name.to_string()));
             }
         }
 
@@ -251,6 +354,10 @@ impl GoogleTakeoutProvider {
             .split_once("::")
             .map(|(_, e)| e)
             .unwrap_or(resource_id);
+
+        if let Some(zip_path) = index.entry_to_zip.get(entry_name) {
+            return Ok((zip_path.clone(), entry_name.to_string()));
+        }
 
         for zip_path in self.list_zip_paths()? {
             let Ok(file) = File::open(&zip_path) else {
@@ -260,7 +367,7 @@ impl GoogleTakeoutProvider {
                 continue;
             };
             if archive.by_name(entry_name).is_ok() {
-                return Ok((zip_path, archive, entry_name.to_string()));
+                return Ok((zip_path, entry_name.to_string()));
             }
         }
 
@@ -311,7 +418,7 @@ impl SourceProvider for GoogleTakeoutProvider {
             let mut archive = ZipArchive::new(file)?;
 
             for i in 0..archive.len() {
-                let zf = archive.by_index(i)?;
+                let zf = archive.by_index_raw(i)?;
                 if zf.is_dir() {
                     continue;
                 }
@@ -364,35 +471,66 @@ impl SourceProvider for GoogleTakeoutProvider {
         filename: &str,
         tmp_dir: &Path,
     ) -> Result<DownloadedSourceFile> {
-        let (zip_path, mut archive, entry_name) = self.locate_entry_archive(resource_id)?;
+        let index = self.get_or_build_index()?;
+        let (zip_path, entry_name) = self.resolve_entry_zip_path(resource_id, &index)?;
 
         tokio::fs::create_dir_all(tmp_dir).await?;
-        let temp_path = tmp_dir.join(format!("takeout_{}", sanitize_filename(filename)));
-        let temp_guard = TempFileGuard::new(temp_path);
+        let id_hash = hex::encode(Sha1::digest(resource_id.as_bytes()));
+        let id_hash12 = &id_hash[..12];
+        let temp_path = tmp_dir.join(format!(
+            "takeout_{}_{}",
+            id_hash12,
+            sanitize_filename(filename)
+        ));
+        let temp_guard = TempFileGuard::new(temp_path.clone());
+        let is_media = TargetRouter::classify(filename, false).is_some();
+        let sidecar_to_zip = index.sidecar_to_zip;
 
-        let mut hasher = Sha1::new();
-        let mut total_bytes: u64 = 0;
-        {
-            let mut zf = archive.by_name(&entry_name)?;
-            let mut out = File::create(temp_guard.path())?;
-            let mut buf = [0u8; 64 * 1024];
-            loop {
-                let n = zf.read(&mut buf)?;
-                if n == 0 {
-                    break;
+        let (sha1_hash, total_bytes, created_override) =
+            tokio::task::spawn_blocking(move || -> Result<(String, u64, Option<String>)> {
+                let file = File::open(&zip_path)?;
+                let mut archive = ZipArchive::new(file)?;
+                let mut hasher = Sha1::new();
+                let mut total_bytes: u64 = 0;
+                {
+                    let mut zf = archive.by_name(&entry_name)?;
+                    let mut out = File::create(&temp_path)?;
+                    let mut buf = [0u8; 64 * 1024];
+                    loop {
+                        let n = zf.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                        out.write_all(&buf[..n])?;
+                        total_bytes += n as u64;
+                    }
+                    out.flush()?;
                 }
-                hasher.update(&buf[..n]);
-                out.write_all(&buf[..n])?;
-                total_bytes += n as u64;
-            }
-            out.flush()?;
-        }
 
-        let created_override = self.find_sidecar_timestamp(&zip_path, &mut archive, &entry_name);
+                let created_override = if is_media {
+                    Self::find_sidecar_timestamp_indexed(
+                        &zip_path,
+                        &mut archive,
+                        &entry_name,
+                        &sidecar_to_zip,
+                    )
+                } else {
+                    None
+                };
+
+                Ok((
+                    hex::encode(hasher.finalize()),
+                    total_bytes,
+                    created_override,
+                ))
+            })
+            .await
+            .map_err(|e| anyhow!("Takeout 압축 해제 작업 스레드 오류: {}", e))??;
 
         Ok(DownloadedSourceFile {
             temp_guard,
-            sha1_hash: hex::encode(hasher.finalize()),
+            sha1_hash,
             size: total_bytes,
             created_time_override: created_override.clone(),
             modified_time_override: created_override,
@@ -560,5 +698,67 @@ mod tests {
 
         assert_eq!(page.files[2].name, "jeju.jpg");
         assert_eq!(page.files[2].parent_path, "/Trips");
+    }
+
+    #[tokio::test]
+    async fn test_takeout_concurrent_identical_filenames_and_unclassified_count() {
+        let dir = TempDir::new().unwrap();
+        let zip_path = dir.path().join("takeout-concurrent.zip");
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut zip = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default();
+
+            // Two identically named photos in different folders
+            zip.start_file("Takeout/Google Photos/2023/IMG_0001.JPG", opts)
+                .unwrap();
+            zip.write_all(b"photo_2023_payload_aaaaaa").unwrap();
+
+            zip.start_file("Takeout/Google Photos/2024/IMG_0001.JPG", opts)
+                .unwrap();
+            zip.write_all(b"photo_2024_payload_bbbbbbbbbb").unwrap();
+
+            // One non-media document inside Drive
+            zip.start_file("Takeout/Drive/계약서.pdf", opts).unwrap();
+            zip.write_all(b"pdf_document_bytes").unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let provider = std::sync::Arc::new(GoogleTakeoutProvider::new(dir.path()));
+
+        // When Nextcloud is disabled, 1 unclassified file (계약서.pdf) must be detected
+        assert_eq!(provider.count_unclassified_files(false).unwrap(), 1);
+        assert_eq!(provider.count_unclassified_files(true).unwrap(), 0);
+
+        // Concurrent download_to_temp of identically-named files must not collide on temp file path
+        let tmp_dir = TempDir::new().unwrap();
+        let p1 = provider.clone();
+        let p2 = provider.clone();
+        let t1 = tmp_dir.path().to_path_buf();
+        let t2 = tmp_dir.path().to_path_buf();
+
+        let (res1, res2) = tokio::join!(
+            p1.download_to_temp(
+                "Takeout/Google Photos/2023/IMG_0001.JPG",
+                "IMG_0001.JPG",
+                &t1
+            ),
+            p2.download_to_temp(
+                "Takeout/Google Photos/2024/IMG_0001.JPG",
+                "IMG_0001.JPG",
+                &t2
+            )
+        );
+        let d1 = res1.unwrap();
+        let d2 = res2.unwrap();
+
+        assert_ne!(
+            d1.temp_guard.path(),
+            d2.temp_guard.path(),
+            "Identical filenames in different folders must have distinct temp paths"
+        );
+        assert_eq!(d1.size, 25);
+        assert_eq!(d2.size, 29);
     }
 }

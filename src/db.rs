@@ -376,15 +376,22 @@ impl CheckpointDB {
                         (Some(new_h), Some(old_h)) => new_h != old_h,
                         _ => false,
                     };
-                    let content_changed = old.size != f.size
+                    let size_changed = f.size > 0 && old.size > 0 && old.size != f.size;
+                    let content_changed = size_changed
                         || old.created_time != f.created_time
                         || old.modified_time != f.modified_time
                         || hash_changed;
 
+                    let preserved_size = if f.size == 0 && old.size > 0 && !content_changed {
+                        old.size
+                    } else {
+                        f.size
+                    };
+
                     let mut active: file_entity::ActiveModel = old.into();
                     active.name = Set(effective_name);
                     active.parent_path = Set(f.parent_path.clone());
-                    active.size = Set(f.size);
+                    active.size = Set(preserved_size);
                     active.created_time = Set(f.created_time.clone());
                     active.modified_time = Set(f.modified_time.clone());
                     active.target_type = Set(f.target_type.clone());
@@ -464,10 +471,27 @@ impl CheckpointDB {
         max_retries: i64,
         limit: i64,
     ) -> Result<Vec<FileRecord>> {
-        let rows = file_entity::Entity::find()
+        self.get_pending_files_for_config(source_type, max_retries, limit, true)
+            .await
+    }
+
+    pub async fn get_pending_files_for_config(
+        &self,
+        source_type: &str,
+        max_retries: i64,
+        limit: i64,
+        enable_nextcloud: bool,
+    ) -> Result<Vec<FileRecord>> {
+        let mut query = file_entity::Entity::find()
             .filter(file_entity::Column::SourceType.eq(source_type))
             .filter(file_entity::Column::Status.eq(FileStatus::Pending.as_str()))
-            .filter(file_entity::Column::RetryCount.lt(max_retries))
+            .filter(file_entity::Column::RetryCount.lt(max_retries));
+
+        if !enable_nextcloud {
+            query = query.filter(file_entity::Column::TargetType.eq(TargetType::Immich.as_str()));
+        }
+
+        let rows = query
             .order_by_asc(file_entity::Column::CreatedTime)
             .order_by_asc(file_entity::Column::ModifiedTime)
             .order_by_asc(file_entity::Column::ParentPath)
@@ -622,6 +646,36 @@ impl CheckpointDB {
             .exec(&self.conn)
             .await?;
         Ok(())
+    }
+
+    pub async fn mark_files_deleted_batch(
+        &self,
+        source_type: &str,
+        resource_ids: &[String],
+    ) -> Result<u64> {
+        if resource_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let txn = self.conn.begin().await?;
+        let mut total = 0u64;
+
+        for chunk in resource_ids.chunks(500) {
+            let res = file_entity::Entity::update_many()
+                .col_expr(
+                    file_entity::Column::Status,
+                    Expr::value(FileStatus::Deleted.as_str()),
+                )
+                .col_expr(file_entity::Column::UpdatedAt, Expr::value(now.clone()))
+                .filter(file_entity::Column::SourceType.eq(source_type))
+                .filter(file_entity::Column::ResourceId.is_in(chunk.iter().cloned()))
+                .exec(&txn)
+                .await?;
+            total += res.rows_affected;
+        }
+
+        txn.commit().await?;
+        Ok(total)
     }
 
     pub async fn get_stats(&self, source_type: &str) -> Result<SyncStats> {

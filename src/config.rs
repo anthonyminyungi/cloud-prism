@@ -258,6 +258,13 @@ impl AppConfig {
             .join("settings.json")
     }
 
+    pub fn disk_fallback_tmp_dir(&self) -> PathBuf {
+        Path::new(&self.db_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".tmp_sync")
+    }
+
     pub fn load_persisted_if_exists(&mut self) {
         let path = self.settings_file_path();
         let Ok(bytes) = std::fs::read(&path) else {
@@ -296,7 +303,12 @@ impl AppConfig {
             verify_service: None,
         };
         let json_bytes = serde_json::to_vec_pretty(&persisted)?;
-        std::fs::write(path, json_bytes)?;
+        std::fs::write(&path, json_bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 
