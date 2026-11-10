@@ -14,44 +14,79 @@ async fn test_full_pipeline_scan_sync_and_verified_delete() {
     let db_path = temp_dir.path().join("test_pipeline.db");
     let tmp_download_dir = temp_dir.path().join("tmp_mybox_sync");
 
-    // 1. Mock MYBOX list_page (root has 1 photo and 1 PDF)
+    // 1. Mock MYBOX list_page (root has 1 subfolder, 1 photo, and 1 PDF; subfolder is empty)
     Mock::given(method("GET"))
-        .and(path("/v1/files"))
-        .and(query_param("folder_id", "root"))
+        .and(path("/v1/drive/resources"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "items": [
+            "fileCount": 2,
+            "subFolderCount": 1,
+            "resources": [
                 {
-                    "resource_id": "photo_1",
-                    "name": "vacation.jpg",
-                    "is_folder": false,
-                    "size": 14,
-                    "created_time": "2026-05-01T12:00:00Z",
-                    "modified_time": "2026-05-01T12:00:00Z"
+                    "resourceId": "folder_sub_1",
+                    "name": "Album2026",
+                    "type": "folder",
+                    "size": 0,
+                    "createdAt": "2026-05-01T10:00:00Z",
+                    "modifiedAt": "2026-05-01T10:00:00Z"
                 },
                 {
-                    "resource_id": "doc_1",
+                    "resourceId": "photo_1",
+                    "name": "vacation.jpg",
+                    "type": "file",
+                    "size": 14,
+                    "createdAt": "2026-05-01T12:00:00Z",
+                    "modifiedAt": "2026-05-01T12:00:00Z"
+                },
+                {
+                    "resourceId": "doc_1",
                     "name": "manual.pdf",
-                    "is_folder": false,
+                    "type": "file",
                     "size": 11,
-                    "created_time": "2026-05-02T12:00:00Z",
-                    "modified_time": "2026-05-02T12:00:00Z"
+                    "createdAt": "2026-05-02T12:00:00Z",
+                    "modifiedAt": "2026-05-02T12:00:00Z"
                 }
             ]
         })))
         .mount(&mock_server)
         .await;
 
-    // 2. Mock MYBOX file downloads
     Mock::given(method("GET"))
-        .and(path("/v1/files/download"))
-        .and(query_param("resource_id", "photo_1"))
+        .and(path("/v1/drive/folders/folder_sub_1/resources"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "fileCount": 0,
+            "subFolderCount": 0,
+            "resources": []
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // 2. Mock MYBOX 2-step file downloads (GET /v1/drive/files/{fileId}/download -> downloadUrl -> stream)
+    Mock::given(method("GET"))
+        .and(path("/v1/drive/files/photo_1/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "downloadUrl": format!("{}/v1/storage/download/photo_1", mock_server.uri()),
+            "expiresIn": 600
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/storage/download/photo_1"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake_jpg_bytes".as_slice()))
         .mount(&mock_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path("/v1/files/download"))
-        .and(query_param("resource_id", "doc_1"))
+        .and(path("/v1/drive/files/doc_1/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "downloadUrl": format!("{}/v1/storage/download/doc_1", mock_server.uri()),
+            "expiresIn": 600
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/storage/download/doc_1"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello_world".as_slice()))
         .mount(&mock_server)
         .await;
@@ -114,11 +149,18 @@ async fn test_full_pipeline_scan_sync_and_verified_delete() {
         .mount(&mock_server)
         .await;
 
-    // 6. Mock MYBOX remote trash endpoint
-    Mock::given(method("POST"))
-        .and(path("/v1/files/trash"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": "trashed"})))
-        .expect(2)
+    // 6. Mock MYBOX remote trash endpoints (DELETE /v1/drive/resources/{resourceId})
+    Mock::given(method("DELETE"))
+        .and(path("/v1/drive/resources/photo_1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v1/drive/resources/doc_1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
         .mount(&mock_server)
         .await;
 
@@ -145,10 +187,10 @@ async fn test_full_pipeline_scan_sync_and_verified_delete() {
 
     let pipeline = SyncPipeline::from_config(state.clone(), cfg, "mybox").unwrap();
 
-    // Step A: Scan
+    // Step A: Scan (root + folder_sub_1 = 2 scanned folders)
     let stats_after_scan = pipeline.run_scan().await.unwrap();
     assert_eq!(stats_after_scan.pending_files, 2);
-    assert_eq!(stats_after_scan.scanned_folders, 1);
+    assert_eq!(stats_after_scan.scanned_folders, 2);
 
     // Step B: Sync (must route photo_1 -> Immich and doc_1 -> Nextcloud, never deleting source)
     let stats_after_sync = pipeline.run_sync().await.unwrap();
@@ -190,25 +232,26 @@ async fn test_incremental_rescan_and_remote_direct_deletion_excludes_from_sync()
 
     // Cycle 1: MYBOX root has photo_1 (will be synced) and doc_1 (user will delete on MYBOX after sync)
     Mock::given(method("GET"))
-        .and(path("/v1/files"))
-        .and(query_param("folder_id", "root"))
+        .and(path("/v1/drive/resources"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "items": [
+            "fileCount": 2,
+            "subFolderCount": 0,
+            "resources": [
                 {
-                    "resource_id": "photo_1",
+                    "resourceId": "photo_1",
                     "name": "vacation.jpg",
-                    "is_folder": false,
+                    "type": "file",
                     "size": 14,
-                    "created_time": "2026-05-01T12:00:00Z",
-                    "modified_time": "2026-05-01T12:00:00Z"
+                    "createdAt": "2026-05-01T12:00:00Z",
+                    "modifiedAt": "2026-05-01T12:00:00Z"
                 },
                 {
-                    "resource_id": "doc_1",
+                    "resourceId": "doc_1",
                     "name": "manual.pdf",
-                    "is_folder": false,
+                    "type": "file",
                     "size": 11,
-                    "created_time": "2026-05-02T12:00:00Z",
-                    "modified_time": "2026-05-02T12:00:00Z"
+                    "createdAt": "2026-05-02T12:00:00Z",
+                    "modifiedAt": "2026-05-02T12:00:00Z"
                 }
             ]
         })))
@@ -218,25 +261,26 @@ async fn test_incremental_rescan_and_remote_direct_deletion_excludes_from_sync()
 
     // Cycle 2: User deleted doc_1 directly on MYBOX, kept photo_1 unchanged, and added photo_2
     Mock::given(method("GET"))
-        .and(path("/v1/files"))
-        .and(query_param("folder_id", "root"))
+        .and(path("/v1/drive/resources"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "items": [
+            "fileCount": 2,
+            "subFolderCount": 0,
+            "resources": [
                 {
-                    "resource_id": "photo_1",
+                    "resourceId": "photo_1",
                     "name": "vacation.jpg",
-                    "is_folder": false,
+                    "type": "file",
                     "size": 14,
-                    "created_time": "2026-05-01T12:00:00Z",
-                    "modified_time": "2026-05-01T12:00:00Z"
+                    "createdAt": "2026-05-01T12:00:00Z",
+                    "modifiedAt": "2026-05-01T12:00:00Z"
                 },
                 {
-                    "resource_id": "photo_2",
+                    "resourceId": "photo_2",
                     "name": "newly_added.jpg",
-                    "is_folder": false,
+                    "type": "file",
                     "size": 14,
-                    "created_time": "2026-05-03T12:00:00Z",
-                    "modified_time": "2026-05-03T12:00:00Z"
+                    "createdAt": "2026-05-03T12:00:00Z",
+                    "modifiedAt": "2026-05-03T12:00:00Z"
                 }
             ]
         })))
@@ -245,24 +289,51 @@ async fn test_incremental_rescan_and_remote_direct_deletion_excludes_from_sync()
 
     // Downloads: photo_1 must only be downloaded ONCE (in Cycle 1), NOT re-downloaded in Cycle 2!
     Mock::given(method("GET"))
-        .and(path("/v1/files/download"))
-        .and(query_param("resource_id", "photo_1"))
+        .and(path("/v1/drive/files/photo_1/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "downloadUrl": format!("{}/v1/storage/download/photo_1", mock_server.uri()),
+            "expiresIn": 600
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/storage/download/photo_1"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake_jpg_bytes".as_slice()))
         .expect(1)
         .mount(&mock_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path("/v1/files/download"))
-        .and(query_param("resource_id", "doc_1"))
+        .and(path("/v1/drive/files/doc_1/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "downloadUrl": format!("{}/v1/storage/download/doc_1", mock_server.uri()),
+            "expiresIn": 600
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/storage/download/doc_1"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello_world".as_slice()))
         .expect(1)
         .mount(&mock_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path("/v1/files/download"))
-        .and(query_param("resource_id", "photo_2"))
+        .and(path("/v1/drive/files/photo_2/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "downloadUrl": format!("{}/v1/storage/download/photo_2", mock_server.uri()),
+            "expiresIn": 600
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/storage/download/photo_2"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"new_jpg_bytes!".as_slice()))
         .expect(1)
         .mount(&mock_server)

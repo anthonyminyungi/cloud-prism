@@ -971,7 +971,7 @@
             </div>
             <div class="form-field">
               <label class="field-label" for="cfgMyboxApiBase">API Base URL <span class="opt-tag">선택 · 기본값 자동 적용</span></label>
-              <input id="cfgMyboxApiBase" type="text" class="input-text mono" placeholder="https://apis.naver.com/mybox" />
+              <input id="cfgMyboxApiBase" type="text" class="input-text mono" placeholder="https://open-api.mybox.naver.com" />
             </div>
           </div>
         </div>
@@ -1281,7 +1281,10 @@
         document.getElementById('cfgNextcloudPassword').value = '';
         if (cs.nextcloud_url) document.getElementById('cfgNextcloudUrl').value = cs.nextcloud_url;
       }
-      if (service === 'mybox') document.getElementById('cfgMyboxPat').value = '';
+      if (service === 'mybox') {
+        document.getElementById('cfgMyboxPat').value = '';
+        if (cs.mybox_api_base) document.getElementById('cfgMyboxApiBase').value = cs.mybox_api_base;
+      }
 
       await fetchStatus();
     }
@@ -1668,7 +1671,7 @@
       setInputIfUntouched('cfgNextcloudUrl', c.nextcloud_url || '');
       setInputIfUntouched('cfgNextcloudBaseDir', c.nextcloud_base_dir || '/');
       setInputIfUntouched('cfgNextcloudUser', c.nextcloud_user || '');
-      setInputIfUntouched('cfgMyboxApiBase', c.mybox_api_base || 'https://apis.naver.com/mybox');
+      setInputIfUntouched('cfgMyboxApiBase', c.mybox_api_base || 'https://open-api.mybox.naver.com');
       setInputIfUntouched('cfgTakeoutDir', t.dir || c.takeout_dir || '/data/takeout');
       setInputIfUntouched('cfgConcurrency', c.concurrency || 3);
       setInputIfUntouched('cfgRateLimitRps', c.rate_limit_rps || 5);

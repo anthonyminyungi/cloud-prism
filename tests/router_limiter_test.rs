@@ -1,4 +1,6 @@
-use mybox_immich_sync::config::{normalize_base_url, normalize_nextcloud_url, AppConfig};
+use mybox_immich_sync::config::{
+    normalize_base_url, normalize_mybox_api_base, normalize_nextcloud_url, AppConfig,
+};
 use mybox_immich_sync::limiter::RateLimiter;
 use mybox_immich_sync::router::{SourceType, TargetRouter, TargetType};
 use mybox_immich_sync::targets::nextcloud::NextcloudTarget;
@@ -75,6 +77,14 @@ fn test_config_env_map_parsing_and_url_normalization() {
     assert_eq!(
         normalize_nextcloud_url("https://nas.local/nextcloud/remote.php/dav/files/user"),
         "https://nas.local/nextcloud"
+    );
+    assert_eq!(
+        normalize_mybox_api_base("https://apis.naver.com/mybox"),
+        "https://open-api.mybox.naver.com"
+    );
+    assert_eq!(
+        normalize_mybox_api_base("https://open-api.mybox.naver.com/v1/drive/"),
+        "https://open-api.mybox.naver.com"
     );
 }
 

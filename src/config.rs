@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_PORT: u16 = 3080;
 pub const DEFAULT_DB_PATH: &str = "/data/sync_state.db";
 pub const DEFAULT_TMP_DIR: &str = "/tmp/mybox_sync";
-pub const DEFAULT_MYBOX_API_BASE: &str = "https://apis.naver.com/mybox";
+pub const DEFAULT_MYBOX_API_BASE: &str = "https://open-api.mybox.naver.com";
 pub const DEFAULT_GDRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
 pub const DEFAULT_TAKEOUT_DIR: &str = "/data/takeout";
 pub const DEFAULT_NEXTCLOUD_BASE_DIR: &str = "/";
@@ -35,6 +35,23 @@ pub fn normalize_base_url(raw: &str) -> String {
     } else {
         format!("http://{}", trimmed)
     }
+}
+
+pub fn normalize_mybox_api_base(raw: &str) -> String {
+    let mut url = normalize_base_url(raw);
+    if url.is_empty()
+        || url.eq_ignore_ascii_case("https://apis.naver.com/mybox")
+        || url.eq_ignore_ascii_case("http://apis.naver.com/mybox")
+    {
+        return DEFAULT_MYBOX_API_BASE.to_string();
+    }
+    for marker in ["/v1/drive", "/v1"] {
+        if let Some((prefix, _)) = url.split_once(marker) {
+            url = prefix.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+    url
 }
 
 pub fn normalize_nextcloud_url(raw: &str) -> String {
@@ -169,6 +186,8 @@ impl AppConfig {
                 Value::String(_) => {
                     let normalized = if key == "nextcloud_url" {
                         normalize_nextcloud_url(raw)
+                    } else if key == "mybox_api_base" {
+                        normalize_mybox_api_base(raw)
                     } else if key == "immich_url" {
                         normalize_base_url(raw)
                     } else if URL_KEYS.contains(&key.as_str()) {
@@ -289,9 +308,9 @@ impl AppConfig {
             }
         }
         if let Some(ref v) = req.mybox_api_base {
-            let trimmed = v.trim().trim_end_matches('/');
+            let trimmed = v.trim();
             if !trimmed.is_empty() {
-                self.mybox_api_base = trimmed.to_string();
+                self.mybox_api_base = normalize_mybox_api_base(trimmed);
             }
         }
         if let Some(ref v) = req.gdrive_access_token {

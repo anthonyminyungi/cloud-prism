@@ -32,12 +32,13 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("web_test.db");
 
-    // Mock MYBOX quota endpoint for connection test
+    // Mock MYBOX storage endpoint for connection test (official Open API)
     Mock::given(method("GET"))
-        .and(path("/v1/quota"))
+        .and(path("/v1/drive/storage"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "used": 10737418240_i64,
-            "quota": 32212254720_i64
+            "usedBytes": 10737418240_i64,
+            "quotaBytes": 32212254720_i64,
+            "maxFileBytes": 10737418240_i64
         })))
         .mount(&mock_server)
         .await;
@@ -51,24 +52,26 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
 
     // Mock MYBOX list_page for scan job (returns 2 items to verify sample limit=1)
     Mock::given(method("GET"))
-        .and(path("/v1/files"))
+        .and(path("/v1/drive/resources"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "items": [
+            "fileCount": 2,
+            "subFolderCount": 0,
+            "resources": [
                 {
-                    "resource_id": "web_photo_1",
+                    "resourceId": "web_photo_1",
                     "name": "sunset.jpg",
-                    "is_folder": false,
+                    "type": "file",
                     "size": 12345,
-                    "created_time": "2026-10-01T00:00:00Z",
-                    "modified_time": "2026-10-01T00:00:00Z"
+                    "createdAt": "2026-10-01T00:00:00Z",
+                    "modifiedAt": "2026-10-01T00:00:00Z"
                 },
                 {
-                    "resource_id": "web_photo_2",
+                    "resourceId": "web_photo_2",
                     "name": "ocean.jpg",
-                    "is_folder": false,
+                    "type": "file",
                     "size": 23456,
-                    "created_time": "2026-10-02T00:00:00Z",
-                    "modified_time": "2026-10-02T00:00:00Z"
+                    "createdAt": "2026-10-02T00:00:00Z",
+                    "modifiedAt": "2026-10-02T00:00:00Z"
                 }
             ]
         })))
