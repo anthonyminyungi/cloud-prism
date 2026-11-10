@@ -216,14 +216,14 @@ async fn test_connections(
 ) -> impl IntoResponse {
     let mut results = HashMap::new();
 
-    if let Some(ref svc) = q
+    if let Some(svc) = q
         .service
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
         if let Some(res) = verify_single_service(&state, svc).await {
-            results.insert((*svc).to_string(), res);
+            results.insert(svc.to_string(), res);
         } else {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -907,13 +907,13 @@ async fn start_job(
         .collect();
 
     if target_sources.is_empty() {
-        if let Some(ref single) = req
+        if let Some(single) = req
             .source
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            target_sources.push((*single).to_string());
+            target_sources.push(single.to_string());
         }
     }
 

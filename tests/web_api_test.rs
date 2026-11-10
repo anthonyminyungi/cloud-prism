@@ -112,7 +112,8 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     assert!(html.contains("id=\"syncView\""));
     assert!(html.contains("id=\"cleanupView\""));
     assert!(html.contains("id=\"settingsView\""));
-    assert!(html.contains("id=\"cfgTakeoutUrl\""));
+    assert!(html.contains("id=\"zipDropzone\""));
+    assert!(html.contains("id=\"cfgTakeoutDir\""));
     assert!(html.contains("Google 포토 · 드라이브 (Google Takeout)"));
     assert!(!html.contains("id=\"cfgGdriveToken\""));
     assert!(html.contains("id=\"sampleLimitSelect\""));
@@ -133,9 +134,12 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
         .await
         .unwrap();
     assert_eq!(init_status_resp.status(), StatusCode::OK);
-    let init_status: Value =
-        serde_json::from_slice(&to_bytes(init_status_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let init_status: Value = serde_json::from_slice(
+        &to_bytes(init_status_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(init_status["readiness"]["targets_ready"], false);
     assert_eq!(init_status["readiness"]["sync_tab_enabled"], false);
     assert_eq!(init_status["readiness"]["delete_tab_enabled"], false);
@@ -153,9 +157,12 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
         .await
         .unwrap();
     assert_eq!(immich_conn_resp.status(), StatusCode::OK);
-    let immich_conn: Value =
-        serde_json::from_slice(&to_bytes(immich_conn_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let immich_conn: Value = serde_json::from_slice(
+        &to_bytes(immich_conn_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(immich_conn["results"]["immich"]["ok"], true);
     assert!(immich_conn["results"]["mybox"].is_null());
     assert_eq!(immich_conn["readiness"]["immich_verified"], true);
@@ -175,13 +182,19 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
         .await
         .unwrap();
     assert_eq!(mybox_conn_resp.status(), StatusCode::OK);
-    let mybox_conn: Value =
-        serde_json::from_slice(&to_bytes(mybox_conn_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let mybox_conn: Value = serde_json::from_slice(
+        &to_bytes(mybox_conn_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(mybox_conn["results"]["mybox"]["ok"], true);
     assert_eq!(mybox_conn["readiness"]["sync_tab_enabled"], true);
     assert_eq!(mybox_conn["readiness"]["delete_tab_enabled"], true);
-    assert_eq!(mybox_conn["readiness"]["verified_sources"], json!(["mybox"]));
+    assert_eq!(
+        mybox_conn["readiness"]["verified_sources"],
+        json!(["mybox"])
+    );
     assert_eq!(
         mybox_conn["readiness"]["verified_cloud_sources"],
         json!(["mybox"])
@@ -377,9 +390,12 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
         .await
         .unwrap();
     assert_eq!(settings_resp.status(), StatusCode::OK);
-    let settings_json: Value =
-        serde_json::from_slice(&to_bytes(settings_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let settings_json: Value = serde_json::from_slice(
+        &to_bytes(settings_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(settings_json["saved"], true);
     assert_eq!(settings_json["config_summary"]["gdrive_configured"], true);
     assert_eq!(settings_json["config_summary"]["mybox_configured"], true); // Blank secret preserves existing MYBOX token

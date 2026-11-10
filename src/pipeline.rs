@@ -581,7 +581,10 @@ impl SyncPipeline {
         }
     }
 
-    async fn transfer_file(&self, file: &FileRecord) -> Result<(String, Option<i64>, UploadOutcome)> {
+    async fn transfer_file(
+        &self,
+        file: &FileRecord,
+    ) -> Result<(String, Option<i64>, UploadOutcome)> {
         let target_type: TargetType = file.target_type.parse()?;
         let target = self
             .targets

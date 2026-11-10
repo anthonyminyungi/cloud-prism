@@ -138,13 +138,17 @@ async fn test_full_pipeline_scan_sync_and_verified_delete() {
         .await;
 
     Mock::given(method("PUT"))
-        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/manual.pdf"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/manual.pdf",
+        ))
         .respond_with(ResponseTemplate::new(201))
         .mount(&mock_server)
         .await;
 
     Mock::given(method("HEAD"))
-        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/manual.pdf"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/manual.pdf",
+        ))
         .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "11"))
         .mount(&mock_server)
         .await;
@@ -372,7 +376,9 @@ async fn test_incremental_rescan_and_remote_direct_deletion_excludes_from_sync()
         .await;
 
     Mock::given(method("PUT"))
-        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/manual.pdf"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/manual.pdf",
+        ))
         .respond_with(ResponseTemplate::new(201))
         .mount(&mock_server)
         .await;
@@ -524,7 +530,7 @@ async fn test_takeout_sync_preserves_zip_on_sample_limit_and_auto_deletes_after_
         !zip_path.exists(),
         "Local Takeout ZIP must be automatically deleted after full sync and Immich verification"
     );
-    assert_eq!(state.readiness_summary().await.sync_tab_enabled, false);
+    assert!(!state.readiness_summary().await.sync_tab_enabled);
 }
 
 #[tokio::test]
@@ -644,9 +650,7 @@ async fn test_gdrive_owned_quota_filtering_workspace_export_and_concurrent_nextc
     Mock::given(method("GET"))
         .and(path("/files/photo_owned_1"))
         .and(query_param("alt", "media"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_bytes(b"owned_jpeg_payload".as_slice()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"owned_jpeg_payload".as_slice()))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -719,10 +723,8 @@ async fn test_gdrive_owned_quota_filtering_workspace_export_and_concurrent_nextc
         .await;
 
     // 6. Nextcloud MKCOL: even with concurrency = 4, /GoogleDrive MUST only be MKCOL'd ONCE!
-    let enc_sub_dir = percent_encoding::utf8_percent_encode(
-        "2025_09 정산",
-        percent_encoding::NON_ALPHANUMERIC,
-    );
+    let enc_sub_dir =
+        percent_encoding::utf8_percent_encode("2025_09 정산", percent_encoding::NON_ALPHANUMERIC);
     // Match exact WebDAV percent-encoding used on HTTP wire (spaces & UTF-8 bytes encoded)
     let dav_encode_seg = |s: &str| -> String {
         use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -818,7 +820,9 @@ async fn test_gdrive_owned_quota_filtering_workspace_export_and_concurrent_nextc
     for id in ["photo_owned_1", "gdoc_1", "gdoc_2", "gsheet_1"] {
         Mock::given(method("PATCH"))
             .and(path(format!("/files/{}", id)))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": id, "trashed": true})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"id": id, "trashed": true})),
+            )
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -962,27 +966,35 @@ async fn test_takeout_combined_photos_and_drive_routes_photos_to_immich_and_docs
         .await;
 
     Mock::given(method("PUT"))
-        .and(path("/remote.php/dav/files/ncuser/GoogleDrive/contract.pdf"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/GoogleDrive/contract.pdf",
+        ))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&mock_server)
         .await;
 
     Mock::given(method("PUT"))
-        .and(path("/remote.php/dav/files/ncuser/GoogleDrive/Work/plan.docx"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/GoogleDrive/Work/plan.docx",
+        ))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&mock_server)
         .await;
 
     Mock::given(method("HEAD"))
-        .and(path("/remote.php/dav/files/ncuser/GoogleDrive/contract.pdf"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/GoogleDrive/contract.pdf",
+        ))
         .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "12"))
         .mount(&mock_server)
         .await;
 
     Mock::given(method("HEAD"))
-        .and(path("/remote.php/dav/files/ncuser/GoogleDrive/Work/plan.docx"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/GoogleDrive/Work/plan.docx",
+        ))
         .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "13"))
         .mount(&mock_server)
         .await;
@@ -1018,4 +1030,3 @@ async fn test_takeout_combined_photos_and_drive_routes_photos_to_immich_and_docs
         "Combined Takeout ZIP must be deleted after both Immich and Nextcloud verify all 4 files"
     );
 }
-
