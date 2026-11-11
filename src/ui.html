@@ -857,6 +857,42 @@
       </section>
 
       <div id="verifiedSourceList"></div>
+
+      <!-- 사후 보정 및 핀포인트 이동 패널 -->
+      <section class="source-card" id="repairToolsCard" style="margin-top: 16px;">
+        <div class="source-card-header">
+          <div class="source-card-title-wrap">
+            <span class="source-card-title">사후 보정 및 핀포인트 이동</span>
+            <span class="role-tag">마이그레이션 완료 후 보정</span>
+          </div>
+          <div class="action-toolbar">
+            <button id="btnRepairAll" class="btn" onclick="startRepairJob('all')">전체 일괄 보정 실행</button>
+          </div>
+        </div>
+        <div class="integration-body">
+          <div class="form-grid">
+            <div class="s-metric" style="border: 1px solid var(--border); border-radius: 6px;">
+              <div class="s-metric-label">1. Nextcloud 내 라이브포토(.zip) · (null) 자동 복구</div>
+              <div class="s-metric-val num" id="repairAnomalyCount">0건</div>
+              <div class="s-metric-sub" style="margin-top: 6px; flex-wrap: wrap;">
+                <span>LIVE 배지 결합 · Magic Bytes 확장자 복원</span>
+                <button id="btnRepairAnomalies" class="btn btn-primary" onclick="startRepairJob('anomalies')">라이브포토 · (null) 복구 실행</button>
+              </div>
+            </div>
+            <div class="s-metric" style="border: 1px solid var(--border); border-radius: 6px;">
+              <div class="s-metric-label">2. Immich 특정 앨범 → Nextcloud 원래 폴더로 핀포인트 이동</div>
+              <div style="display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap: wrap;">
+                <input id="repairAlbumInput" type="text" class="input-text mono" value="to-nextcloud" placeholder="to-nextcloud" style="max-width: 180px;" />
+                <button id="btnRepairAlbum" class="btn btn-primary" onclick="startRepairJob('album_to_nextcloud')">앨범 항목 → Nextcloud 원래 폴더로 이동</button>
+              </div>
+              <div class="s-metric-sub" style="margin-top: 6px;">
+                <span>Immich에서 옮길 이미지를 앨범(기본 <span class="mono">to-nextcloud</span>)에 담은 뒤 실행하세요.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <div class="section-hint">
         연결 확인을 통과한 소스만 표시됩니다. 다른 데이터 소스를 추가하려면 <button class="link-btn" onclick="selectMainTab('settings')">연동
           설정</button> 탭에서 연결을 확인하세요.
@@ -1146,7 +1182,8 @@
     const SOURCE_NAMES = {
       mybox: '네이버 MYBOX',
       gdrive: 'Google Drive',
-      takeout: 'Google 포토 · 드라이브 (Takeout)'
+      takeout: 'Google 포토 · 드라이브 (Takeout)',
+      repair: '사후 보정 · 핀포인트 이동'
     };
 
     function updateThemeButtonLabel() {
@@ -1164,7 +1201,7 @@
     }
 
     function selectMainTab(tab) {
-      if (tab === 'sync' && !latestReadiness.sync_tab_enabled) return;
+      if (tab === 'sync' && !latestReadiness.sync_tab_enabled && !latestReadiness.targets_ready) return;
       if (tab === 'cleanup' && !latestReadiness.delete_tab_enabled) return;
 
       currentTab = tab;
@@ -1458,11 +1495,15 @@
       const syncBadge = document.getElementById('navSyncBadge');
       const cleanupBadge = document.getElementById('navCleanupBadge');
 
-      syncTab.disabled = !r.sync_tab_enabled;
+      const canOpenSync = Boolean(r.sync_tab_enabled || r.targets_ready);
+      syncTab.disabled = !canOpenSync;
       cleanupTab.disabled = !r.delete_tab_enabled;
 
       if (r.sync_tab_enabled) {
         syncBadge.textContent = `${(r.verified_sources || []).length}개 활성`;
+        syncBadge.classList.add('ready');
+      } else if (r.targets_ready) {
+        syncBadge.textContent = '보정 가능';
         syncBadge.classList.add('ready');
       } else {
         syncBadge.textContent = '잠김';
@@ -1481,7 +1522,7 @@
         initialRouteResolved = true;
         selectMainTab(r.sync_tab_enabled ? 'sync' : 'settings');
       } else {
-        if (currentTab === 'sync' && !r.sync_tab_enabled) selectMainTab('settings');
+        if (currentTab === 'sync' && !canOpenSync) selectMainTab('settings');
         if (currentTab === 'cleanup' && !r.delete_tab_enabled) selectMainTab('settings');
       }
 
@@ -1507,6 +1548,16 @@
       const archivesCount = ((d.takeout_info || {}).archives || []).length;
       const isIdle = (d.state || 'idle') === 'idle';
       const disAttr = isIdle ? '' : 'disabled';
+
+      const anomalyCount = (d.repair_info && d.repair_info.nextcloud_anomaly_count) || 0;
+      const anomalyEl = document.getElementById('repairAnomalyCount');
+      if (anomalyEl) anomalyEl.textContent = `${anomalyCount.toLocaleString()}건`;
+      const btnAnomalies = document.getElementById('btnRepairAnomalies');
+      const btnAlbum = document.getElementById('btnRepairAlbum');
+      const btnAll = document.getElementById('btnRepairAll');
+      if (btnAnomalies) btnAnomalies.disabled = !isIdle;
+      if (btnAlbum) btnAlbum.disabled = !isIdle;
+      if (btnAll) btnAll.disabled = !isIdle;
 
       const globalBtn = document.getElementById('globalSyncBtn');
       if (!isIdle) {
@@ -1790,6 +1841,23 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source })
       });
+      fetchStatus();
+    }
+
+    async function startRepairJob(mode) {
+      const albumInput = document.getElementById('repairAlbumInput');
+      const album_name = (albumInput && albumInput.value ? albumInput.value.trim() : 'to-nextcloud') || 'to-nextcloud';
+      const limit = getSelectedSampleLimit();
+      const res = await fetch('/api/jobs/repair', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, album_name, limit })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        appendLog(new Date().toLocaleTimeString(), `사후 보정 시작 실패: ${data.error || res.statusText}`);
+        return;
+      }
       fetchStatus();
     }
 

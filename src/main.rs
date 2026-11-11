@@ -3,7 +3,10 @@ use clap::{Parser, Subcommand};
 use comfy_table::Table;
 use mybox_immich_sync::config::AppConfig;
 use mybox_immich_sync::db::CheckpointDB;
-use mybox_immich_sync::pipeline::{spawn_auto_sync_scheduler, SyncPipeline};
+use mybox_immich_sync::pipeline::{
+    run_move_immich_album_to_nextcloud_with_limit, run_repair_nextcloud_anomalies_with_limit,
+    spawn_auto_sync_scheduler, SyncPipeline,
+};
 use mybox_immich_sync::state::AppState;
 use mybox_immich_sync::web::{build_router, verify_all_configured};
 use std::net::SocketAddr;
@@ -57,6 +60,13 @@ enum Commands {
     Status {
         #[arg(long, default_value = "mybox")]
         source: String,
+    },
+    /// Post-migration repair: recover Nextcloud livephoto.zip & (null) files and move Immich album items to Nextcloud
+    Repair {
+        #[arg(long, default_value = "to-nextcloud")]
+        album: String,
+        #[arg(long)]
+        limit: Option<u64>,
     },
 }
 
@@ -131,6 +141,20 @@ async fn main() -> Result<()> {
             ]);
             table.add_row(vec!["실패 항목 (FAILED)", &stats.failed_files.to_string()]);
             println!("{table}");
+        }
+        Commands::Repair { album, limit } => {
+            let repaired =
+                run_repair_nextcloud_anomalies_with_limit(state.clone(), cfg.clone(), limit)
+                    .await?;
+            let moved = if cfg.enable_nextcloud {
+                run_move_immich_album_to_nextcloud_with_limit(state, cfg, &album, limit).await?
+            } else {
+                0
+            };
+            println!(
+                "Repair completed: anomalies_repaired={}, album_moved={}",
+                repaired, moved
+            );
         }
     }
 

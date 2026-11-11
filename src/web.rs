@@ -1,6 +1,9 @@
 use crate::config::SettingsUpdateRequest;
 use crate::limiter::{format_error_chain, RateLimiter};
-use crate::pipeline::{build_source_provider, build_target_providers, SyncPipeline};
+use crate::pipeline::{
+    build_source_provider, build_target_providers, run_move_immich_album_to_nextcloud_with_limit,
+    run_repair_nextcloud_anomalies_with_limit, SyncPipeline,
+};
 use crate::router::{SourceType, TargetType};
 use crate::sources::sanitize_filename;
 use crate::sources::takeout::list_takeout_archives;
@@ -53,6 +56,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/settings", post(update_settings))
         .route("/api/status", get(get_status))
         .route("/api/jobs/start", post(start_job))
+        .route("/api/jobs/repair", post(start_repair_job))
         .route("/api/jobs/stop", post(stop_job))
         .route("/api/jobs/retry-failed", post(retry_failed))
         .route("/api/takeout/path", post(set_takeout_path))
@@ -308,6 +312,11 @@ async fn get_status(
     let takeout_dir_exists = Path::new(&cfg.takeout_dir).exists();
     let connections = state.connection_status.read().await.clone();
     let readiness = state.readiness_summary().await;
+    let nextcloud_anomaly_count = state
+        .db
+        .count_nextcloud_repair_candidates()
+        .await
+        .unwrap_or(0);
 
     (
         StatusCode::OK,
@@ -326,6 +335,10 @@ async fn get_status(
                 "dir": cfg.takeout_dir,
                 "exists": takeout_dir_exists,
                 "archives": takeout_archives
+            },
+            "repair_info": {
+                "nextcloud_anomaly_count": nextcloud_anomaly_count,
+                "default_album_name": "to-nextcloud"
             },
             "stats": stats,
             "all_stats": {
@@ -1074,6 +1087,133 @@ async fn retry_failed(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairMode {
+    Anomalies,
+    AlbumToNextcloud,
+    All,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartRepairRequest {
+    mode: RepairMode,
+    #[serde(default)]
+    album_name: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+async fn start_repair_job(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<StartRepairRequest>,
+) -> impl IntoResponse {
+    let cfg = state.effective_config().await;
+    let album_name = req
+        .album_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("to-nextcloud")
+        .to_string();
+    let limit = req.limit.filter(|&n| n > 0);
+
+    if matches!(req.mode, RepairMode::AlbumToNextcloud | RepairMode::All) && !cfg.enable_nextcloud {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Nextcloud 연동이 활성화되어 있지 않습니다. 설정 탭에서 Nextcloud를 먼저 활성화해 주세요.",
+        );
+    }
+
+    {
+        let mut js = state.job_state.write().await;
+        if *js != JobState::Idle {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "Job is already running",
+                    "state": *js
+                })),
+            )
+                .into_response();
+        }
+        *js = JobState::Syncing;
+    }
+
+    state.stop_flag.store(false, Ordering::SeqCst);
+    let state_clone = state.clone();
+    let mode = req.mode;
+    let album_for_task = album_name.clone();
+
+    let handle = tokio::spawn(async move {
+        let res = match mode {
+            RepairMode::Anomalies => {
+                run_repair_nextcloud_anomalies_with_limit(state_clone.clone(), cfg, limit).await
+            }
+            RepairMode::AlbumToNextcloud => {
+                run_move_immich_album_to_nextcloud_with_limit(
+                    state_clone.clone(),
+                    cfg,
+                    &album_for_task,
+                    limit,
+                )
+                .await
+            }
+            RepairMode::All => {
+                state_clone.batch_active.store(true, Ordering::SeqCst);
+                let first = run_repair_nextcloud_anomalies_with_limit(
+                    state_clone.clone(),
+                    cfg.clone(),
+                    limit,
+                )
+                .await;
+                state_clone.batch_active.store(false, Ordering::SeqCst);
+                match first {
+                    Ok(c1) => {
+                        if state_clone.is_stopping() {
+                            state_clone
+                                .finish_job("repair", "사후 보정 작업이 일시정지되었습니다.")
+                                .await;
+                            Ok(c1)
+                        } else {
+                            run_move_immich_album_to_nextcloud_with_limit(
+                                state_clone.clone(),
+                                cfg,
+                                &album_for_task,
+                                limit,
+                            )
+                            .await
+                            .map(|c2| c1 + c2)
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
+
+        if let Err(err) = res {
+            state_clone.batch_active.store(false, Ordering::SeqCst);
+            state_clone
+                .finish_job("repair", format!("사후 보정 중 오류 발생: {}", err))
+                .await;
+        }
+        state_clone.stop_flag.store(false, Ordering::SeqCst);
+    });
+
+    *state.job_handle.lock().await = Some(handle);
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "started": true,
+            "mode": req.mode,
+            "album_name": album_name,
+            "limit": limit
+        })),
+    )
+        .into_response()
+}
+
 async fn sse_events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -1091,4 +1231,87 @@ async fn sse_events(
 
 fn error_response(status: StatusCode, err: impl std::fmt::Display) -> axum::response::Response {
     (status, Json(json!({ "error": err.to_string() }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::db::{CheckpointDB, FileUpsert};
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn test_status_includes_repair_info_and_repair_endpoint_validation() {
+        let db = CheckpointDB::connect(":memory:").await.unwrap();
+        db.upsert_files(&[FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_lp_1".to_string(),
+            name: "livephoto.,zip".to_string(),
+            parent_path: "/2023".to_string(),
+            size: 100,
+            created_time: "2023-05-01T00:00:00Z".to_string(),
+            modified_time: "2023-05-01T00:00:00Z".to_string(),
+            target_type: "nextcloud".to_string(),
+            sha1_hash: None,
+        }])
+        .await
+        .unwrap();
+        db.mark_file_uploaded(
+            "mybox",
+            "res_lp_1",
+            "sha1",
+            "/Cloud-Backup/MyBox/2023/livephoto.,zip",
+            "UPLOADED",
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = AppConfig {
+            db_path: tmp.path().join("test.db").to_str().unwrap().to_string(),
+            enable_nextcloud: false,
+            ..Default::default()
+        };
+        let state = AppState::new(db, cfg);
+        let app = build_router(state);
+
+        // 1. Check GET /api/status includes repair_info
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["repair_info"]["nextcloud_anomaly_count"], 1);
+        assert_eq!(val["repair_info"]["default_album_name"], "to-nextcloud");
+
+        // 2. Check POST /api/jobs/repair rejects album_to_nextcloud when Nextcloud is disabled
+        let resp2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs/repair")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "mode": "album_to_nextcloud",
+                            "album_name": "to-nextcloud"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+    }
 }

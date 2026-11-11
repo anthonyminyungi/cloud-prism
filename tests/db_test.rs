@@ -427,3 +427,143 @@ async fn test_rescan_zero_size_uploaded_preserved_and_filtered_pending_and_batch
     assert_eq!(deleted_cnt, 2);
     assert_eq!(db.get_stats("gdrive").await.unwrap().deleted_files, 2);
 }
+
+#[tokio::test]
+async fn test_repair_candidates_immich_asset_lookup_and_reclassification() {
+    use mybox_immich_sync::router::TargetType;
+
+    let db = CheckpointDB::connect(":memory:").await.unwrap();
+
+    db.upsert_files(&[
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_lp_1".to_string(),
+            name: "livephoto.,zip".to_string(),
+            parent_path: "/2023/아이폰".to_string(),
+            size: 4096,
+            created_time: "2023-05-01T10:00:00Z".to_string(),
+            modified_time: "2023-05-01T10:00:00Z".to_string(),
+            target_type: "nextcloud".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_null_1".to_string(),
+            name: "IMG_7777.(null)".to_string(),
+            parent_path: "/2023/아이폰".to_string(),
+            size: 2048,
+            created_time: "2023-05-02T10:00:00Z".to_string(),
+            modified_time: "2023-05-02T10:00:00Z".to_string(),
+            target_type: "nextcloud".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_normal_zip".to_string(),
+            name: "work_backup.zip".to_string(),
+            parent_path: "/업무".to_string(),
+            size: 8192,
+            created_time: "2023-05-03T10:00:00Z".to_string(),
+            modified_time: "2023-05-03T10:00:00Z".to_string(),
+            target_type: "nextcloud".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_icon_1".to_string(),
+            name: "favicon.png".to_string(),
+            parent_path: "/웹프로젝트/assets".to_string(),
+            size: 512,
+            created_time: "2024-01-01T00:00:00Z".to_string(),
+            modified_time: "2024-01-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+    ])
+    .await
+    .unwrap();
+
+    db.mark_file_uploaded(
+        "mybox",
+        "res_lp_1",
+        "sha_lp",
+        "/MyBox/2023/아이폰/livephoto.,zip",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "res_null_1",
+        "sha_null",
+        "/MyBox/2023/아이폰/IMG_7777.(null)",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "res_normal_zip",
+        "sha_zip",
+        "/MyBox/업무/work_backup.zip",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "res_icon_1",
+        "sha_icon",
+        "immich-asset-uuid-icon-1",
+        "created",
+    )
+    .await
+    .unwrap();
+
+    // 1. Only livephoto.,zip and IMG_7777.(null) must be returned as Nextcloud repair candidates
+    assert_eq!(db.count_nextcloud_repair_candidates().await.unwrap(), 2);
+    let candidates = db.get_nextcloud_repair_candidates().await.unwrap();
+    assert_eq!(candidates.len(), 2);
+
+    // 2. Reclassify res_lp_1 from Nextcloud to Immich
+    db.update_file_reclassified(
+        "mybox",
+        "res_lp_1",
+        "IMG_0001.JPG",
+        TargetType::Immich,
+        "immich-live-photo-uuid-1",
+        "sha_img_0001",
+        3500,
+        "created",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(db.count_nextcloud_repair_candidates().await.unwrap(), 1);
+
+    // 3. Lookup Immich asset by remote_target_id or deviceAssetId and reclassify to Nextcloud
+    let matched = db
+        .find_file_for_immich_asset("immich-asset-uuid-icon-1", Some("res_icon_1"), "favicon.png")
+        .await
+        .unwrap()
+        .expect("should find icon record in DB");
+    assert_eq!(matched.parent_path, "/웹프로젝트/assets");
+
+    db.update_file_reclassified(
+        &matched.source_type,
+        &matched.resource_id,
+        &matched.name,
+        TargetType::Nextcloud,
+        "/MyBox/웹프로젝트/assets/favicon.png",
+        "sha_icon",
+        512,
+        "created",
+    )
+    .await
+    .unwrap();
+
+    let stats = db.get_stats("mybox").await.unwrap();
+    // Immich now has res_lp_1 (1), Nextcloud has res_null_1 + res_normal_zip + res_icon_1 (3)
+    assert_eq!(stats.uploaded_immich_created, 1);
+    assert_eq!(stats.uploaded_nextcloud, 3);
+}

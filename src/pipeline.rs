@@ -1,11 +1,15 @@
 use crate::config::AppConfig;
 use crate::db::{FileRecord, FileUpsert, SyncStats};
 use crate::limiter::RateLimiter;
-use crate::router::{SourceType, SyncResultKind, TargetRouter, TargetType};
+use crate::router::{
+    extract_timestamp_from_filename, inspect_file_path, pick_older_timestamp,
+    replace_or_append_extension, DetectedFileKind, SourceType, SyncResultKind, TargetRouter,
+    TargetType,
+};
 use crate::sources::gdrive::GoogleDriveProvider;
 use crate::sources::mybox::MyboxProvider;
 use crate::sources::takeout::{list_takeout_archives, GoogleTakeoutProvider};
-use crate::sources::SourceProvider;
+use crate::sources::{try_extract_livephoto_zip, SourceProvider};
 use crate::state::{AppState, JobState};
 use crate::targets::immich::ImmichTarget;
 use crate::targets::nextcloud::NextcloudTarget;
@@ -72,6 +76,8 @@ pub struct SyncPipeline {
     source_type: SourceType,
     source: Arc<dyn SourceProvider>,
     targets: HashMap<TargetType, Arc<dyn TargetProvider>>,
+    immich_target: Arc<ImmichTarget>,
+    nextcloud_target: Arc<NextcloudTarget>,
     limit_files: Option<u64>,
 }
 
@@ -82,7 +88,21 @@ impl SyncPipeline {
         let target_limiter =
             RateLimiter::new((config.rate_limit_rps * 10.0).max(50.0), config.max_retries);
         let source = build_source_provider(&config, source_type, source_limiter);
-        let targets = build_target_providers(&config, target_limiter);
+        let immich_target = Arc::new(ImmichTarget::new(
+            config.immich_url.clone(),
+            config.immich_api_key.clone(),
+            target_limiter.clone(),
+        ));
+        let nextcloud_target = Arc::new(NextcloudTarget::new(
+            config.nextcloud_url.clone(),
+            config.nextcloud_user.clone(),
+            config.nextcloud_app_password.clone(),
+            config.nextcloud_base_dir.clone(),
+            target_limiter,
+        ));
+        let mut targets: HashMap<TargetType, Arc<dyn TargetProvider>> = HashMap::new();
+        targets.insert(TargetType::Immich, immich_target.clone());
+        targets.insert(TargetType::Nextcloud, nextcloud_target.clone());
 
         Ok(Self {
             state,
@@ -90,6 +110,8 @@ impl SyncPipeline {
             source_type,
             source,
             targets,
+            immich_target,
+            nextcloud_target,
             limit_files: None,
         })
     }
@@ -597,7 +619,7 @@ impl SyncPipeline {
             .await;
 
         match self.transfer_file(&file).await {
-            Ok((sha1, actual_size, outcome)) => {
+            Ok((sha1, actual_size, outcome, reclassified)) => {
                 let result_str = outcome.sync_result.as_str();
                 let _ = self
                     .state
@@ -611,16 +633,33 @@ impl SyncPipeline {
                         actual_size,
                     )
                     .await;
+                let (final_name, final_target) =
+                    if let Some((new_name, new_target)) = reclassified {
+                        let _ = self
+                            .state
+                            .db
+                            .update_file_reclassified(
+                                src,
+                                &file.resource_id,
+                                &new_name,
+                                new_target,
+                                &outcome.remote_target_id,
+                                &sha1,
+                                actual_size.unwrap_or(file.size),
+                                result_str,
+                            )
+                            .await;
+                        (new_name, new_target.as_str().to_string())
+                    } else {
+                        (file.name.clone(), file.target_type.clone())
+                    };
                 self.state.processed_files.fetch_add(1, Ordering::SeqCst);
                 self.state
                     .emit_event(
                         src,
                         JobState::Syncing,
-                        Some(file.name.clone()),
-                        format!(
-                            "이주 완료 [{} / {}]: {}",
-                            file.target_type, result_str, file.name
-                        ),
+                        Some(final_name.clone()),
+                        format!("이주 완료 [{} / {}]: {}", final_target, result_str, final_name),
                     )
                     .await;
             }
@@ -646,27 +685,38 @@ impl SyncPipeline {
     async fn transfer_file(
         &self,
         file: &FileRecord,
-    ) -> Result<(String, Option<i64>, UploadOutcome)> {
+    ) -> Result<(
+        String,
+        Option<i64>,
+        UploadOutcome,
+        Option<(String, TargetType)>,
+    )> {
         let target_type: TargetType = file.target_type.parse()?;
         let target = self
             .targets
             .get(&target_type)
             .ok_or_else(|| anyhow!("등록되지 않은 타겟 플러그인: {}", target_type))?;
 
+        let is_livephoto_zip = TargetRouter::is_livephoto_archive_name(&file.name);
+        let is_null_ext = TargetRouter::has_null_extension(&file.name);
+
         // Zero-download fast path if source metadata already includes a SHA-1 checksum
-        if let Some(ref existing_sha1) = file.sha1_hash {
-            if let Ok(Some(existing_asset_id)) = target
-                .precheck_duplicate(&file.resource_id, existing_sha1)
-                .await
-            {
-                return Ok((
-                    existing_sha1.clone(),
-                    None,
-                    UploadOutcome {
-                        remote_target_id: existing_asset_id,
-                        sync_result: SyncResultKind::Duplicate,
-                    },
-                ));
+        if !is_livephoto_zip && !is_null_ext {
+            if let Some(ref existing_sha1) = file.sha1_hash {
+                if let Ok(Some(existing_asset_id)) = target
+                    .precheck_duplicate(&file.resource_id, existing_sha1)
+                    .await
+                {
+                    return Ok((
+                        existing_sha1.clone(),
+                        None,
+                        UploadOutcome {
+                            remote_target_id: existing_asset_id,
+                            sync_result: SyncResultKind::Duplicate,
+                        },
+                        None,
+                    ));
+                }
             }
         }
 
@@ -695,14 +745,155 @@ impl SyncPipeline {
             Err(err) => return Err(err),
         };
 
-        let created_at = downloaded
+        let base_created = downloaded
             .created_time_override
             .as_deref()
             .unwrap_or(&file.created_time);
+        let filename_ts = extract_timestamp_from_filename(&file.name);
+        let resolved_created = pick_older_timestamp(base_created, filename_ts.as_deref());
         let modified_at = downloaded
             .modified_time_override
             .as_deref()
             .unwrap_or(&file.modified_time);
+
+        let inspected = if is_null_ext {
+            inspect_file_path(downloaded.temp_guard.path())
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        if is_livephoto_zip || matches!(inspected, Some(DetectedFileKind::ZipArchive)) {
+            if let Ok(Some(extracted)) = try_extract_livephoto_zip(
+                downloaded.temp_guard.path(),
+                &file.name,
+                &chosen_tmp,
+            ) {
+                let created_with_zip = pick_older_timestamp(
+                    &resolved_created,
+                    extracted.timestamp_override.as_deref(),
+                );
+                let img_ts = extract_timestamp_from_filename(&extracted.image_filename);
+                let final_created = pick_older_timestamp(&created_with_zip, img_ts.as_deref());
+
+                let outcome = self
+                    .immich_target
+                    .upload_live_photo(
+                        &extracted,
+                        &file.resource_id,
+                        &final_created,
+                        modified_at,
+                    )
+                    .await?;
+
+                return Ok((
+                    extracted.image_sha1,
+                    Some(extracted.image_size as i64),
+                    outcome,
+                    Some((extracted.image_filename, TargetType::Immich)),
+                ));
+            } else if is_livephoto_zip {
+                // Not a valid Live Photo pair inside the archive; fall back to Nextcloud if enabled
+                if !self.config.enable_nextcloud {
+                    return Err(anyhow!(
+                        "라이브포토 아카이브 내 유효한 사진+영상 쌍이 없으며 Nextcloud가 비활성화 상태입니다: {}",
+                        file.name
+                    ));
+                }
+                let outcome = self
+                    .nextcloud_target
+                    .upload(UploadContext {
+                        source_type: self.source_type,
+                        file_path: downloaded.temp_guard.path(),
+                        resource_id: &file.resource_id,
+                        filename: &file.name,
+                        parent_path: &file.parent_path,
+                        sha1_hash: &downloaded.sha1_hash,
+                        created_at: &resolved_created,
+                        modified_at,
+                    })
+                    .await?;
+                return Ok((
+                    downloaded.sha1_hash.clone(),
+                    Some(downloaded.size as i64),
+                    outcome,
+                    Some((file.name.clone(), TargetType::Nextcloud)),
+                ));
+            }
+        }
+
+        if is_null_ext {
+            match inspected {
+                Some(DetectedFileKind::Media { ext, .. }) => {
+                    let restored_name = replace_or_append_extension(&file.name, ext);
+                    let outcome = self
+                        .immich_target
+                        .upload(UploadContext {
+                            source_type: self.source_type,
+                            file_path: downloaded.temp_guard.path(),
+                            resource_id: &file.resource_id,
+                            filename: &restored_name,
+                            parent_path: &file.parent_path,
+                            sha1_hash: &downloaded.sha1_hash,
+                            created_at: &resolved_created,
+                            modified_at,
+                        })
+                        .await?;
+                    return Ok((
+                        downloaded.sha1_hash.clone(),
+                        Some(downloaded.size as i64),
+                        outcome,
+                        Some((restored_name, TargetType::Immich)),
+                    ));
+                }
+                Some(DetectedFileKind::Document { ext, .. }) => {
+                    let restored_name = replace_or_append_extension(&file.name, ext);
+                    let outcome = self
+                        .nextcloud_target
+                        .upload(UploadContext {
+                            source_type: self.source_type,
+                            file_path: downloaded.temp_guard.path(),
+                            resource_id: &file.resource_id,
+                            filename: &restored_name,
+                            parent_path: &file.parent_path,
+                            sha1_hash: &downloaded.sha1_hash,
+                            created_at: &resolved_created,
+                            modified_at,
+                        })
+                        .await?;
+                    return Ok((
+                        downloaded.sha1_hash.clone(),
+                        Some(downloaded.size as i64),
+                        outcome,
+                        Some((restored_name, TargetType::Nextcloud)),
+                    ));
+                }
+                Some(DetectedFileKind::ZipArchive) => {
+                    let restored_name = replace_or_append_extension(&file.name, "zip");
+                    let outcome = self
+                        .nextcloud_target
+                        .upload(UploadContext {
+                            source_type: self.source_type,
+                            file_path: downloaded.temp_guard.path(),
+                            resource_id: &file.resource_id,
+                            filename: &restored_name,
+                            parent_path: &file.parent_path,
+                            sha1_hash: &downloaded.sha1_hash,
+                            created_at: &resolved_created,
+                            modified_at,
+                        })
+                        .await?;
+                    return Ok((
+                        downloaded.sha1_hash.clone(),
+                        Some(downloaded.size as i64),
+                        outcome,
+                        Some((restored_name, TargetType::Nextcloud)),
+                    ));
+                }
+                None => {}
+            }
+        }
 
         let outcome = target
             .upload(UploadContext {
@@ -712,7 +903,7 @@ impl SyncPipeline {
                 filename: &file.name,
                 parent_path: &file.parent_path,
                 sha1_hash: &downloaded.sha1_hash,
-                created_at,
+                created_at: &resolved_created,
                 modified_at,
             })
             .await?;
@@ -721,6 +912,7 @@ impl SyncPipeline {
             downloaded.sha1_hash.clone(),
             Some(downloaded.size as i64),
             outcome,
+            None,
         ))
     }
 
@@ -845,6 +1037,672 @@ impl SyncPipeline {
     }
 }
 
+pub async fn run_repair_nextcloud_anomalies(
+    state: Arc<AppState>,
+    config: AppConfig,
+) -> Result<u64> {
+    run_repair_nextcloud_anomalies_with_limit(state, config, None).await
+}
+
+pub async fn run_repair_nextcloud_anomalies_with_limit(
+    state: Arc<AppState>,
+    config: AppConfig,
+    limit: Option<u64>,
+) -> Result<u64> {
+    let mut candidates = state.db.get_nextcloud_repair_candidates().await?;
+    if let Some(n) = limit.filter(|&n| n > 0) {
+        candidates.truncate(n as usize);
+    }
+    if candidates.is_empty() {
+        state
+            .finish_job(
+                "repair",
+                "[사후 보정] Nextcloud 내 복구 대상(livephoto.zip / (null)) 항목이 없습니다.",
+            )
+            .await;
+        return Ok(0);
+    }
+
+    state
+        .begin_phase("repair", JobState::Syncing, candidates.len() as u64)
+        .await;
+    state
+        .emit_event(
+            "repair",
+            JobState::Syncing,
+            None,
+            format!(
+                "[사후 보정] Nextcloud 내 livephoto.zip 및 (null) 파일 {}건 복구 및 재분류를 시작합니다.",
+                candidates.len()
+            ),
+        )
+        .await;
+
+    let target_limiter =
+        RateLimiter::new((config.rate_limit_rps * 10.0).max(50.0), config.max_retries);
+    let immich_target = ImmichTarget::new(
+        config.immich_url.clone(),
+        config.immich_api_key.clone(),
+        target_limiter.clone(),
+    );
+    let nextcloud_target = NextcloudTarget::new(
+        config.nextcloud_url.clone(),
+        config.nextcloud_user.clone(),
+        config.nextcloud_app_password.clone(),
+        config.nextcloud_base_dir.clone(),
+        target_limiter,
+    );
+    let fallback_dir = config.disk_fallback_tmp_dir();
+    let mut repaired_count = 0u64;
+
+    for file in candidates {
+        if state.is_stopping() {
+            break;
+        }
+        let source_type: SourceType = file.source_type.parse().unwrap_or(SourceType::Mybox);
+        let size_hint = (file.size > 0).then_some(file.size as u64);
+        let chosen_tmp = crate::sources::resolve_temp_dir(
+            Path::new(&config.tmp_dir),
+            Some(&fallback_dir),
+            size_hint,
+        );
+
+        let old_remote_path = file.remote_target_id.clone().unwrap_or_else(|| {
+            format!(
+                "{}/{}/{}/{}",
+                config.nextcloud_base_dir.trim_end_matches('/'),
+                source_type.nextcloud_folder_name(),
+                file.parent_path.trim_matches('/'),
+                file.name
+            )
+        });
+
+        let downloaded = match nextcloud_target
+            .download_file_to_temp(&old_remote_path, &file.name, &chosen_tmp)
+            .await
+        {
+            Ok(d) => d,
+            Err(_nc_err) => {
+                let source_limiter = RateLimiter::new(config.rate_limit_rps, config.max_retries);
+                let source_provider = build_source_provider(&config, source_type, source_limiter);
+                match source_provider
+                    .download_to_temp(&file.resource_id, &file.name, &chosen_tmp)
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(err) => {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(file.name.clone()),
+                                format!("[사후 보정] 원본 다운로드 실패 ({}): {}", file.name, err),
+                            )
+                            .await;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let is_livephoto_zip = TargetRouter::is_livephoto_archive_name(&file.name);
+        let is_null_ext = TargetRouter::has_null_extension(&file.name);
+        let inspected = if is_null_ext {
+            inspect_file_path(downloaded.temp_guard.path())
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        if is_livephoto_zip || matches!(inspected, Some(DetectedFileKind::ZipArchive)) {
+            if let Ok(Some(extracted)) = try_extract_livephoto_zip(
+                downloaded.temp_guard.path(),
+                &file.name,
+                &chosen_tmp,
+            ) {
+                let base_created = pick_older_timestamp(
+                    &file.created_time,
+                    extracted.timestamp_override.as_deref(),
+                );
+                let img_ts = extract_timestamp_from_filename(&extracted.image_filename);
+                let created_at = pick_older_timestamp(&base_created, img_ts.as_deref());
+
+                match immich_target
+                    .upload_live_photo(
+                        &extracted,
+                        &file.resource_id,
+                        &created_at,
+                        &file.modified_time,
+                    )
+                    .await
+                {
+                    Ok(outcome) => {
+                        let verified = !outcome.remote_target_id.is_empty();
+                        if verified {
+                            let _ = nextcloud_target.delete_file(&old_remote_path).await;
+                        }
+                        let vid_label = extracted
+                            .video_filename
+                            .as_deref()
+                            .unwrap_or("livephoto.mov");
+                        state
+                            .db
+                            .update_file_reclassified(
+                                &file.source_type,
+                                &file.resource_id,
+                                &extracted.image_filename,
+                                TargetType::Immich,
+                                &outcome.remote_target_id,
+                                &extracted.image_sha1,
+                                extracted.image_size as i64,
+                                outcome.sync_result.as_str(),
+                            )
+                            .await?;
+                        repaired_count += 1;
+                        state.processed_files.fetch_add(1, Ordering::SeqCst);
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(extracted.image_filename.clone()),
+                                format!(
+                                    "[사후 보정] 라이브포토 복구 완료 (Nextcloud → Immich LIVE): {} → {} + {}",
+                                    file.name, extracted.image_filename, vid_label
+                                ),
+                            )
+                            .await;
+                        continue;
+                    }
+                    Err(err) => {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(file.name.clone()),
+                                format!("[사후 보정] 라이브포토 업로드 실패 ({}): {}", file.name, err),
+                            )
+                            .await;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if is_null_ext {
+            match inspected {
+                Some(DetectedFileKind::Media { ext, .. }) => {
+                    let restored_name = replace_or_append_extension(&file.name, ext);
+                    let fn_ts = extract_timestamp_from_filename(&restored_name);
+                    let created_at = pick_older_timestamp(&file.created_time, fn_ts.as_deref());
+                    match immich_target
+                        .upload(UploadContext {
+                            source_type,
+                            file_path: downloaded.temp_guard.path(),
+                            resource_id: &file.resource_id,
+                            filename: &restored_name,
+                            parent_path: &file.parent_path,
+                            sha1_hash: &downloaded.sha1_hash,
+                            created_at: &created_at,
+                            modified_at: &file.modified_time,
+                        })
+                        .await
+                    {
+                        Ok(outcome) => {
+                            if !outcome.remote_target_id.is_empty() {
+                                let _ = nextcloud_target.delete_file(&old_remote_path).await;
+                            }
+                            state
+                                .db
+                                .update_file_reclassified(
+                                    &file.source_type,
+                                    &file.resource_id,
+                                    &restored_name,
+                                    TargetType::Immich,
+                                    &outcome.remote_target_id,
+                                    &downloaded.sha1_hash,
+                                    downloaded.size as i64,
+                                    outcome.sync_result.as_str(),
+                                )
+                                .await?;
+                            repaired_count += 1;
+                            state.processed_files.fetch_add(1, Ordering::SeqCst);
+                            state
+                                .emit_event(
+                                    "repair",
+                                    JobState::Syncing,
+                                    Some(restored_name.clone()),
+                                    format!(
+                                        "[사후 보정] (null) 미디어 복구 완료 (Nextcloud → Immich): {} → {}",
+                                        file.name, restored_name
+                                    ),
+                                )
+                                .await;
+                        }
+                        Err(err) => {
+                            state
+                                .emit_event(
+                                    "repair",
+                                    JobState::Syncing,
+                                    Some(file.name.clone()),
+                                    format!("[사후 보정] 미디어 업로드 실패 ({}): {}", file.name, err),
+                                )
+                                .await;
+                        }
+                    }
+                }
+                Some(DetectedFileKind::Document { ext, .. }) => {
+                    let restored_name = replace_or_append_extension(&file.name, ext);
+                    match nextcloud_target
+                        .upload(UploadContext {
+                            source_type,
+                            file_path: downloaded.temp_guard.path(),
+                            resource_id: &file.resource_id,
+                            filename: &restored_name,
+                            parent_path: &file.parent_path,
+                            sha1_hash: &downloaded.sha1_hash,
+                            created_at: &file.created_time,
+                            modified_at: &file.modified_time,
+                        })
+                        .await
+                    {
+                        Ok(outcome) => {
+                            if outcome.remote_target_id != old_remote_path {
+                                let _ = nextcloud_target.delete_file(&old_remote_path).await;
+                            }
+                            state
+                                .db
+                                .update_file_reclassified(
+                                    &file.source_type,
+                                    &file.resource_id,
+                                    &restored_name,
+                                    TargetType::Nextcloud,
+                                    &outcome.remote_target_id,
+                                    &downloaded.sha1_hash,
+                                    downloaded.size as i64,
+                                    outcome.sync_result.as_str(),
+                                )
+                                .await?;
+                            repaired_count += 1;
+                            state.processed_files.fetch_add(1, Ordering::SeqCst);
+                            state
+                                .emit_event(
+                                    "repair",
+                                    JobState::Syncing,
+                                    Some(restored_name.clone()),
+                                    format!(
+                                        "[사후 보정] (null) 문서 확장자 복원 완료 (Nextcloud): {} → {}",
+                                        file.name, restored_name
+                                    ),
+                                )
+                                .await;
+                        }
+                        Err(err) => {
+                            state
+                                .emit_event(
+                                    "repair",
+                                    JobState::Syncing,
+                                    Some(file.name.clone()),
+                                    format!("[사후 보정] 문서 재업로드 실패 ({}): {}", file.name, err),
+                                )
+                                .await;
+                        }
+                    }
+                }
+                Some(DetectedFileKind::ZipArchive) => {
+                    let restored_name = replace_or_append_extension(&file.name, "zip");
+                    match nextcloud_target
+                        .upload(UploadContext {
+                            source_type,
+                            file_path: downloaded.temp_guard.path(),
+                            resource_id: &file.resource_id,
+                            filename: &restored_name,
+                            parent_path: &file.parent_path,
+                            sha1_hash: &downloaded.sha1_hash,
+                            created_at: &file.created_time,
+                            modified_at: &file.modified_time,
+                        })
+                        .await
+                    {
+                        Ok(outcome) => {
+                            if outcome.remote_target_id != old_remote_path {
+                                let _ = nextcloud_target.delete_file(&old_remote_path).await;
+                            }
+                            state
+                                .db
+                                .update_file_reclassified(
+                                    &file.source_type,
+                                    &file.resource_id,
+                                    &restored_name,
+                                    TargetType::Nextcloud,
+                                    &outcome.remote_target_id,
+                                    &downloaded.sha1_hash,
+                                    downloaded.size as i64,
+                                    outcome.sync_result.as_str(),
+                                )
+                                .await?;
+                            repaired_count += 1;
+                            state.processed_files.fetch_add(1, Ordering::SeqCst);
+                            state
+                                .emit_event(
+                                    "repair",
+                                    JobState::Syncing,
+                                    Some(restored_name.clone()),
+                                    format!(
+                                        "[사후 보정] (null) 압축파일 확장자 복원 완료 (Nextcloud): {} → {}",
+                                        file.name, restored_name
+                                    ),
+                                )
+                                .await;
+                        }
+                        Err(err) => {
+                            state
+                                .emit_event(
+                                    "repair",
+                                    JobState::Syncing,
+                                    Some(file.name.clone()),
+                                    format!("[사후 보정] 압축파일 재업로드 실패 ({}): {}", file.name, err),
+                                )
+                                .await;
+                        }
+                    }
+                }
+                None => {
+                    state
+                        .emit_event(
+                            "repair",
+                            JobState::Syncing,
+                            Some(file.name.clone()),
+                            format!(
+                                "[사후 보정] Magic Bytes 미식별 — Nextcloud에 원본 유지: {}",
+                                file.name
+                            ),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
+    state
+        .finish_job(
+            "repair",
+            format!(
+                "[사후 보정] Nextcloud 내 livephoto.zip 및 (null) 복구 완료 ({}건 처리됨)",
+                repaired_count
+            ),
+        )
+        .await;
+    Ok(repaired_count)
+}
+
+pub async fn run_move_immich_album_to_nextcloud(
+    state: Arc<AppState>,
+    config: AppConfig,
+    album_name: &str,
+) -> Result<u64> {
+    run_move_immich_album_to_nextcloud_with_limit(state, config, album_name, None).await
+}
+
+pub async fn run_move_immich_album_to_nextcloud_with_limit(
+    state: Arc<AppState>,
+    config: AppConfig,
+    album_name: &str,
+    limit: Option<u64>,
+) -> Result<u64> {
+    if !config.enable_nextcloud {
+        return Err(anyhow!(
+            "Nextcloud 연동이 활성화되어 있지 않습니다. 설정에서 Nextcloud를 먼저 활성화해 주세요."
+        ));
+    }
+
+    let target_limiter =
+        RateLimiter::new((config.rate_limit_rps * 10.0).max(50.0), config.max_retries);
+    let immich_target = ImmichTarget::new(
+        config.immich_url.clone(),
+        config.immich_api_key.clone(),
+        target_limiter.clone(),
+    );
+    let nextcloud_target = NextcloudTarget::new(
+        config.nextcloud_url.clone(),
+        config.nextcloud_user.clone(),
+        config.nextcloud_app_password.clone(),
+        config.nextcloud_base_dir.clone(),
+        target_limiter,
+    );
+
+    let Some((_album_id, mut assets)) = immich_target.get_album_assets_by_name(album_name).await?
+    else {
+        state
+            .finish_job(
+                "repair",
+                format!(
+                    "[앨범 핀포인트 이동] Immich에 '{}' 앨범이 존재하지 않습니다.",
+                    album_name
+                ),
+            )
+            .await;
+        return Ok(0);
+    };
+    if let Some(n) = limit.filter(|&n| n > 0) {
+        assets.truncate(n as usize);
+    }
+    if assets.is_empty() {
+        state
+            .finish_job(
+                "repair",
+                format!(
+                    "[앨범 핀포인트 이동] Immich '{}' 앨범에 이동할 항목이 없습니다.",
+                    album_name
+                ),
+            )
+            .await;
+        return Ok(0);
+    }
+
+    state
+        .begin_phase("repair", JobState::Syncing, assets.len() as u64)
+        .await;
+    state
+        .emit_event(
+            "repair",
+            JobState::Syncing,
+            None,
+            format!(
+                "[앨범 핀포인트 이동] Immich '{}' 앨범 내 {}건 항목을 Nextcloud 원래 폴더로 이관합니다.",
+                album_name,
+                assets.len()
+            ),
+        )
+        .await;
+
+    let fallback_dir = config.disk_fallback_tmp_dir();
+    let mut moved_count = 0u64;
+
+    for asset in assets {
+        if state.is_stopping() {
+            break;
+        }
+
+        let db_record = state
+            .db
+            .find_file_for_immich_asset(
+                &asset.id,
+                asset.device_asset_id.as_deref(),
+                &asset.original_file_name,
+            )
+            .await?;
+
+        let (source_type, resource_id, parent_path, filename, created_at, modified_at) =
+            if let Some(ref rec) = db_record {
+                (
+                    rec.source_type.parse().unwrap_or(SourceType::Mybox),
+                    rec.resource_id.clone(),
+                    rec.parent_path.clone(),
+                    rec.name.clone(),
+                    rec.created_time.clone(),
+                    rec.modified_time.clone(),
+                )
+            } else {
+                let fallback_name = if asset.original_file_name.trim().is_empty() {
+                    format!("{}.bin", asset.id)
+                } else {
+                    asset.original_file_name.clone()
+                };
+                let now = chrono::Utc::now().to_rfc3339();
+                (
+                    SourceType::Mybox,
+                    asset
+                        .device_asset_id
+                        .clone()
+                        .unwrap_or_else(|| asset.id.clone()),
+                    "/Immich_Moved".to_string(),
+                    fallback_name,
+                    now.clone(),
+                    now,
+                )
+            };
+
+        let chosen_tmp = crate::sources::resolve_temp_dir(
+            Path::new(&config.tmp_dir),
+            Some(&fallback_dir),
+            None,
+        );
+
+        let downloaded = match immich_target
+            .download_asset_to_temp(&asset.id, &filename, &chosen_tmp)
+            .await
+        {
+            Ok(d) => d,
+            Err(err) => {
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(filename.clone()),
+                        format!(
+                            "[앨범 핀포인트 이동] Immich 원본 다운로드 실패 ({}): {}",
+                            filename, err
+                        ),
+                    )
+                    .await;
+                continue;
+            }
+        };
+
+        let outcome = match nextcloud_target
+            .upload(UploadContext {
+                source_type,
+                file_path: downloaded.temp_guard.path(),
+                resource_id: &resource_id,
+                filename: &filename,
+                parent_path: &parent_path,
+                sha1_hash: &downloaded.sha1_hash,
+                created_at: &created_at,
+                modified_at: &modified_at,
+            })
+            .await
+        {
+            Ok(o) => o,
+            Err(err) => {
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(filename.clone()),
+                        format!(
+                            "[앨범 핀포인트 이동] Nextcloud 업로드 실패 ({}): {}",
+                            filename, err
+                        ),
+                    )
+                    .await;
+                continue;
+            }
+        };
+
+        let verified = nextcloud_target
+            .check_file_exists(&outcome.remote_target_id, downloaded.size as i64)
+            .await
+            .unwrap_or(false);
+        if !verified {
+            state
+                .emit_event(
+                    "repair",
+                    JobState::Syncing,
+                    Some(filename.clone()),
+                    format!(
+                        "[앨범 핀포인트 이동] Nextcloud 존재 검증 실패로 Immich 삭제 보류: {}",
+                        filename
+                    ),
+                )
+                .await;
+            continue;
+        }
+
+        let mut ids_to_delete = vec![asset.id.clone()];
+        if let Some(ref vid) = asset.live_photo_video_id {
+            if !vid.trim().is_empty() {
+                ids_to_delete.push(vid.clone());
+            }
+        }
+        if let Err(err) = immich_target.delete_assets(&ids_to_delete).await {
+            state
+                .emit_event(
+                    "repair",
+                    JobState::Syncing,
+                    Some(filename.clone()),
+                    format!(
+                        "[앨범 핀포인트 이동] Nextcloud 업로드 완료했으나 Immich 자산 삭제 실패 ({}): {}",
+                        filename, err
+                    ),
+                )
+                .await;
+        }
+
+        if let Some(rec) = db_record {
+            state
+                .db
+                .update_file_reclassified(
+                    &rec.source_type,
+                    &rec.resource_id,
+                    &filename,
+                    TargetType::Nextcloud,
+                    &outcome.remote_target_id,
+                    &downloaded.sha1_hash,
+                    downloaded.size as i64,
+                    outcome.sync_result.as_str(),
+                )
+                .await?;
+        }
+
+        moved_count += 1;
+        state.processed_files.fetch_add(1, Ordering::SeqCst);
+        state
+            .emit_event(
+                "repair",
+                JobState::Syncing,
+                Some(filename.clone()),
+                format!(
+                    "[앨범 핀포인트 이동] Immich → Nextcloud 이관 완료: {}/{}",
+                    parent_path.trim_end_matches('/'),
+                    filename
+                ),
+            )
+            .await;
+    }
+
+    state
+        .finish_job(
+            "repair",
+            format!(
+                "[앨범 핀포인트 이동] Immich '{}' 앨범 → Nextcloud 이관 완료 ({}건 처리됨)",
+                album_name, moved_count
+            ),
+        )
+        .await;
+    Ok(moved_count)
+}
+
 pub fn spawn_auto_sync_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
@@ -921,4 +1779,37 @@ pub fn spawn_auto_sync_scheduler(state: Arc<AppState>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::CheckpointDB;
+
+    #[tokio::test]
+    async fn test_move_immich_album_requires_enabled_nextcloud() {
+        let db = CheckpointDB::connect(":memory:").await.unwrap();
+        let cfg = AppConfig {
+            enable_nextcloud: false,
+            ..Default::default()
+        };
+        let state = AppState::new(db, cfg.clone());
+
+        let res = run_move_immich_album_to_nextcloud(state, cfg, "to-nextcloud").await;
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Nextcloud 연동이 활성화되어 있지 않습니다"));
+    }
+
+    #[tokio::test]
+    async fn test_repair_nextcloud_anomalies_noop_when_empty() {
+        let db = CheckpointDB::connect(":memory:").await.unwrap();
+        let cfg = AppConfig::default();
+        let state = AppState::new(db, cfg.clone());
+
+        let count = run_repair_nextcloud_anomalies(state, cfg).await.unwrap();
+        assert_eq!(count, 0);
+    }
 }

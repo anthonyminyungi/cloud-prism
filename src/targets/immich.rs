@@ -1,21 +1,101 @@
 use crate::config::normalize_base_url;
 use crate::db::FileRecord;
 use crate::limiter::RateLimiter;
-use crate::router::{SyncResultKind, TargetType};
-use crate::sources::build_target_http_client;
+use crate::router::{
+    inspect_file_path, replace_or_append_extension, DetectedFileKind, SyncResultKind,
+    TargetRouter, TargetType,
+};
+use crate::sources::{
+    build_target_http_client, stream_response_to_temp, DownloadedSourceFile, ExtractedLivePhoto,
+};
 use crate::targets::{TargetProvider, UploadContext, UploadOutcome};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
 
 const ENDPOINT_PING: &str = "/api/server/ping";
 const ENDPOINT_BULK_CHECK: &str = "/api/assets/bulk-upload-check";
 const ENDPOINT_ASSETS: &str = "/api/assets";
+const ENDPOINT_ALBUMS: &str = "/api/albums";
 const HEADER_API_KEY: &str = "x-api-key";
 const DEVICE_ID: &str = "mybox-immich-sync";
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImmichAlbumSummaryDto {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub album_name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImmichAlbumDetailDto {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub album_name: String,
+    #[serde(default)]
+    pub assets: Vec<ImmichAlbumAsset>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImmichAlbumAsset {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub device_asset_id: Option<String>,
+    #[serde(default)]
+    pub original_file_name: String,
+    #[serde(default)]
+    pub file_created_at: Option<String>,
+    #[serde(default)]
+    pub file_modified_at: Option<String>,
+    #[serde(default)]
+    pub checksum: Option<String>,
+    #[serde(default)]
+    pub live_photo_video_id: Option<String>,
+}
+
+pub fn resolve_upload_filename_and_mime(
+    file_path: &Path,
+    filename: &str,
+) -> (String, Option<&'static str>) {
+    let Ok(Some(DetectedFileKind::Media { ext, mime, .. })) = inspect_file_path(file_path) else {
+        return (filename.to_string(), None);
+    };
+
+    if TargetRouter::has_null_extension(filename)
+        || TargetRouter::is_livephoto_archive_name(filename)
+    {
+        return (replace_or_append_extension(filename, ext), Some(mime));
+    }
+
+    let current_ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let is_equivalent_ext = current_ext == ext
+        || (ext == "jpg" && current_ext == "jpeg")
+        || (ext == "tif" && current_ext == "tiff")
+        || (ext == "heic" && current_ext == "heif");
+
+    let final_name = if is_equivalent_ext {
+        filename.to_string()
+    } else {
+        replace_or_append_extension(filename, ext)
+    };
+
+    (final_name, Some(mime))
+}
 
 #[derive(Debug, Serialize)]
 struct BulkUploadCheckRequest<'a> {
@@ -141,8 +221,31 @@ impl ImmichTarget {
         created_at: &str,
         modified_at: &str,
     ) -> Result<(String, SyncResultKind)> {
+        self.upload_asset_with_options(
+            file_path,
+            filename,
+            device_asset_id,
+            created_at,
+            modified_at,
+            None,
+        )
+        .await
+    }
+
+    pub async fn upload_asset_with_options(
+        &self,
+        file_path: &Path,
+        filename: &str,
+        device_asset_id: &str,
+        created_at: &str,
+        modified_at: &str,
+        live_photo_video_id: Option<&str>,
+    ) -> Result<(String, SyncResultKind)> {
         let url = self.endpoint(ENDPOINT_ASSETS);
         let file_len = tokio::fs::metadata(file_path).await?.len();
+        let (effective_filename, detected_mime) =
+            resolve_upload_filename_and_mime(file_path, filename);
+        let live_vid_opt = live_photo_video_id.map(str::to_string);
 
         let resp = self
             .limiter
@@ -152,13 +255,22 @@ impl ImmichTarget {
                 let async_file = tokio::fs::File::from_std(std_file);
                 let reader_stream = tokio_util::io::ReaderStream::new(async_file);
                 let body = reqwest::Body::wrap_stream(reader_stream);
-                let part = Part::stream_with_length(body, file_len).file_name(filename.to_string());
-                let form = Form::new()
+                let mut part = Part::stream_with_length(body, file_len)
+                    .file_name(effective_filename.clone());
+                if let Some(mime_str) = detected_mime {
+                    part = part
+                        .mime_str(mime_str)
+                        .expect("DetectedFileKind mime must be a valid MIME string");
+                }
+                let mut form = Form::new()
                     .text("deviceAssetId", device_asset_id.to_string())
                     .text("deviceId", DEVICE_ID)
                     .text("fileCreatedAt", created_at.to_string())
-                    .text("fileModifiedAt", modified_at.to_string())
-                    .part("assetData", part);
+                    .text("fileModifiedAt", modified_at.to_string());
+                if let Some(ref vid_id) = live_vid_opt {
+                    form = form.text("livePhotoVideoId", vid_id.clone());
+                }
+                form = form.part("assetData", part);
                 self.client
                     .post(&url)
                     .header(HEADER_API_KEY, &self.api_key)
@@ -185,6 +297,200 @@ impl ImmichTarget {
         };
 
         Ok((id, kind))
+    }
+
+    pub async fn link_live_photo_video(
+        &self,
+        photo_asset_id: &str,
+        video_asset_id: &str,
+    ) -> Result<()> {
+        let url = format!("{}/{}", self.endpoint(ENDPOINT_ASSETS), photo_asset_id);
+        let payload = json!({ "livePhotoVideoId": video_asset_id });
+        let resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .put(&url)
+                    .header(HEADER_API_KEY, &self.api_key)
+                    .json(&payload)
+            })
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Immich 라이브포토 비디오 연결 실패 (HTTP {}): {}",
+                status,
+                text
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn upload_live_photo(
+        &self,
+        extracted: &ExtractedLivePhoto,
+        resource_id: &str,
+        created_at: &str,
+        modified_at: &str,
+    ) -> Result<UploadOutcome> {
+        let mut video_asset_id: Option<String> = None;
+        if let Some(ref v_guard) = extracted.video_guard {
+            let vid_name = extracted
+                .video_filename
+                .as_deref()
+                .unwrap_or("livephoto.mov");
+            let vid_device_id = format!("{}#livevideo", resource_id);
+            let (vid_id, _) = self
+                .upload_asset_with_options(
+                    v_guard.path(),
+                    vid_name,
+                    &vid_device_id,
+                    created_at,
+                    modified_at,
+                    None,
+                )
+                .await?;
+            video_asset_id = Some(vid_id);
+        }
+
+        let (photo_id, sync_result) = self
+            .upload_asset_with_options(
+                extracted.image_guard.path(),
+                &extracted.image_filename,
+                resource_id,
+                created_at,
+                modified_at,
+                video_asset_id.as_deref(),
+            )
+            .await?;
+
+        if sync_result == SyncResultKind::Duplicate {
+            if let Some(ref vid_id) = video_asset_id {
+                let _ = self.link_live_photo_video(&photo_id, vid_id).await;
+            }
+        }
+
+        Ok(UploadOutcome {
+            remote_target_id: photo_asset_id_or_default(&photo_id),
+            sync_result,
+        })
+    }
+
+    pub async fn get_album_assets_by_name(
+        &self,
+        album_name: &str,
+    ) -> Result<Option<(String, Vec<ImmichAlbumAsset>)>> {
+        let list_url = self.endpoint(ENDPOINT_ALBUMS);
+        let resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .get(&list_url)
+                    .header(HEADER_API_KEY, &self.api_key)
+            })
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "Immich 앨범 목록 조회 실패: HTTP {}",
+                resp.status()
+            ));
+        }
+
+        let albums: Vec<ImmichAlbumSummaryDto> = resp.json().await?;
+        let target_name = album_name.trim();
+        let Some(matched) = albums
+            .into_iter()
+            .find(|a| a.album_name.trim().eq_ignore_ascii_case(target_name))
+        else {
+            return Ok(None);
+        };
+
+        let detail_url = format!("{}/{}", self.endpoint(ENDPOINT_ALBUMS), matched.id);
+        let detail_resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .get(&detail_url)
+                    .header(HEADER_API_KEY, &self.api_key)
+            })
+            .await?;
+
+        if !detail_resp.status().is_success() {
+            return Err(anyhow!(
+                "Immich 앨범 상세 조회 실패 ({}): HTTP {}",
+                matched.id,
+                detail_resp.status()
+            ));
+        }
+
+        let detail: ImmichAlbumDetailDto = detail_resp.json().await?;
+        Ok(Some((detail.id, detail.assets)))
+    }
+
+    pub async fn download_asset_to_temp(
+        &self,
+        asset_id: &str,
+        filename: &str,
+        tmp_dir: &Path,
+    ) -> Result<DownloadedSourceFile> {
+        let url = format!("{}/{}/original", self.endpoint(ENDPOINT_ASSETS), asset_id);
+        let resp = self
+            .limiter
+            .send_with_retry(|| self.client.get(&url).header(HEADER_API_KEY, &self.api_key))
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "Immich 원본 자산 다운로드 실패 ({}): HTTP {}",
+                asset_id,
+                resp.status()
+            ));
+        }
+
+        stream_response_to_temp(resp, "immich", asset_id, filename, tmp_dir).await
+    }
+
+    pub async fn delete_assets(&self, asset_ids: &[String]) -> Result<()> {
+        if asset_ids.is_empty() {
+            return Ok(());
+        }
+
+        let url = self.endpoint(ENDPOINT_ASSETS);
+        let payload = json!({
+            "ids": asset_ids,
+            "force": true
+        });
+        let resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .delete(&url)
+                    .header(HEADER_API_KEY, &self.api_key)
+                    .json(&payload)
+            })
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Immich 자산 삭제 실패 (HTTP {}): {}",
+                status,
+                text
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn photo_asset_id_or_default(id: &str) -> String {
+    if id.trim().is_empty() {
+        "immich_uploaded_id".to_string()
+    } else {
+        id.to_string()
     }
 }
 
@@ -276,5 +582,55 @@ impl TargetProvider for ImmichTarget {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_resolve_upload_filename_and_mime_for_null_and_mismatched_ext() {
+        let dir = TempDir::new().unwrap();
+
+        let null_file = dir.path().join("IMG_9999.(null)");
+        std::fs::write(&null_file, b"\xFF\xD8\xFF\xE0fake_jpeg").unwrap();
+        let (name1, mime1) = resolve_upload_filename_and_mime(&null_file, "IMG_9999.(null)");
+        assert_eq!(name1, "IMG_9999.jpg");
+        assert_eq!(mime1, Some("image/jpeg"));
+
+        let disguised_heic = dir.path().join("IMG_0001.jpg");
+        std::fs::write(&disguised_heic, b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00").unwrap();
+        let (name2, mime2) = resolve_upload_filename_and_mime(&disguised_heic, "IMG_0001.jpg");
+        assert_eq!(name2, "IMG_0001.heic");
+        assert_eq!(mime2, Some("image/heic"));
+    }
+
+    #[test]
+    fn test_immich_album_dto_deserialization() {
+        let raw_detail = r#"{
+            "id": "album-uuid-1",
+            "albumName": "to-nextcloud",
+            "assets": [
+                {
+                    "id": "asset-uuid-100",
+                    "deviceAssetId": "mybox_res_55",
+                    "originalFileName": "app_icon.png",
+                    "fileCreatedAt": "2025-05-01T10:00:00Z",
+                    "fileModifiedAt": "2025-05-01T10:00:00Z",
+                    "livePhotoVideoId": null
+                }
+            ]
+        }"#;
+        let parsed: ImmichAlbumDetailDto = serde_json::from_str(raw_detail).unwrap();
+        assert_eq!(parsed.album_name, "to-nextcloud");
+        assert_eq!(parsed.assets.len(), 1);
+        assert_eq!(parsed.assets[0].id, "asset-uuid-100");
+        assert_eq!(
+            parsed.assets[0].device_asset_id.as_deref(),
+            Some("mybox_res_55")
+        );
+        assert_eq!(parsed.assets[0].original_file_name, "app_icon.png");
     }
 }

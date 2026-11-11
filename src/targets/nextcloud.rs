@@ -2,7 +2,10 @@ use crate::config::normalize_nextcloud_url;
 use crate::db::FileRecord;
 use crate::limiter::RateLimiter;
 use crate::router::{SourceType, SyncResultKind, TargetType};
-use crate::sources::{build_target_http_client, join_remote_path, sanitize_filename};
+use crate::sources::{
+    build_target_http_client, join_remote_path, sanitize_filename, stream_response_to_temp,
+    DownloadedSourceFile,
+};
 use crate::targets::{TargetProvider, UploadContext, UploadOutcome};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -291,6 +294,61 @@ impl NextcloudTarget {
         }
 
         Ok(true)
+    }
+
+    pub async fn download_file_to_temp(
+        &self,
+        remote_target_path: &str,
+        filename: &str,
+        tmp_dir: &Path,
+    ) -> Result<DownloadedSourceFile> {
+        let url = self.dav_url(remote_target_path);
+        let resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .get(&url)
+                    .basic_auth(&self.user, Some(&self.app_password))
+            })
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Nextcloud 파일 다운로드 실패 ({}): HTTP {}{}",
+                remote_target_path,
+                status,
+                truncate_dav_err(&body)
+            ));
+        }
+
+        stream_response_to_temp(resp, "nextcloud", remote_target_path, filename, tmp_dir).await
+    }
+
+    pub async fn delete_file(&self, remote_target_path: &str) -> Result<()> {
+        let url = self.dav_url(remote_target_path);
+        let resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .delete(&url)
+                    .basic_auth(&self.user, Some(&self.app_password))
+            })
+            .await?;
+
+        if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Err(anyhow!(
+            "Nextcloud 파일 삭제 실패 ({}): HTTP {}{}",
+            remote_target_path,
+            status,
+            truncate_dav_err(&body)
+        ))
     }
 }
 

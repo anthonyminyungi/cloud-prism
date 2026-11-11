@@ -2,15 +2,21 @@ pub mod gdrive;
 pub mod mybox;
 pub mod takeout;
 
-use crate::router::SourceType;
+use crate::router::{
+    extract_timestamp_from_filename, inspect_magic_bytes, pick_older_timestamp,
+    replace_or_append_extension, DetectedFileKind, SourceType, TargetRouter,
+};
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::{NaiveDate, TimeZone, Utc};
 use futures::StreamExt;
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
+use zip::ZipArchive;
 
 pub const DEFAULT_FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 pub const LARGE_FILE_DISK_FALLBACK_THRESHOLD: u64 = 256 * 1024 * 1024; // 256 MB
@@ -76,6 +82,199 @@ pub struct DownloadedSourceFile {
     pub size: u64,
     pub created_time_override: Option<String>,
     pub modified_time_override: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ExtractedLivePhoto {
+    pub image_guard: TempFileGuard,
+    pub image_filename: String,
+    pub image_sha1: String,
+    pub image_size: u64,
+    pub video_guard: Option<TempFileGuard>,
+    pub video_filename: Option<String>,
+    pub timestamp_override: Option<String>,
+}
+
+pub fn zip_datetime_to_rfc3339_opt(dt: Option<zip::DateTime>) -> Option<String> {
+    let dt = dt?;
+    if dt.year() <= 1980
+        && dt.month() == 1
+        && dt.day() == 1
+        && dt.hour() == 0
+        && dt.minute() == 0
+        && dt.second() == 0
+    {
+        return None;
+    }
+    NaiveDate::from_ymd_opt(dt.year() as i32, dt.month() as u32, dt.day() as u32)
+        .and_then(|d| d.and_hms_opt(dt.hour() as u32, dt.minute() as u32, dt.second() as u32))
+        .map(|naive| Utc.from_utc_datetime(&naive).to_rfc3339())
+}
+
+pub fn try_extract_livephoto_zip(
+    zip_path: &Path,
+    original_zip_name: &str,
+    tmp_dir: &Path,
+) -> Result<Option<ExtractedLivePhoto>> {
+    let Ok(file) = std::fs::File::open(zip_path) else {
+        return Ok(None);
+    };
+    let Ok(mut archive) = ZipArchive::new(file) else {
+        return Ok(None);
+    };
+
+    let is_named_livephoto = TargetRouter::is_livephoto_archive_name(original_zip_name);
+    let mut image_entry: Option<(usize, String, Option<String>)> = None;
+    let mut video_entry: Option<(usize, String, Option<String>)> = None;
+    let mut has_other_files = false;
+
+    for idx in 0..archive.len() {
+        let Ok(mut zf) = archive.by_index(idx) else {
+            continue;
+        };
+        if zf.is_dir() {
+            continue;
+        }
+        let raw_entry_name = zf.name().to_string();
+        if raw_entry_name.starts_with("__MACOSX/") {
+            continue;
+        }
+        let fname = Path::new(&raw_entry_name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&raw_entry_name)
+            .to_string();
+        if fname.starts_with("._") || fname.eq_ignore_ascii_case(".DS_Store") {
+            continue;
+        }
+
+        let mut header = [0u8; 64];
+        let n = zf.read(&mut header).unwrap_or(0);
+        let detected = inspect_magic_bytes(&header[..n]);
+        let entry_ts = zip_datetime_to_rfc3339_opt(zf.last_modified())
+            .or_else(|| extract_timestamp_from_filename(&fname));
+
+        let ext = Path::new(&fname)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        match detected {
+            Some(DetectedFileKind::Media {
+                ext: det_ext,
+                is_video: false,
+                ..
+            }) => {
+                let normalized = if TargetRouter::has_null_extension(&fname)
+                    || !TargetRouter::is_media_extension(&ext)
+                {
+                    replace_or_append_extension(&fname, det_ext)
+                } else {
+                    fname
+                };
+                if image_entry.is_none() {
+                    image_entry = Some((idx, normalized, entry_ts));
+                }
+            }
+            Some(DetectedFileKind::Media {
+                ext: det_ext,
+                is_video: true,
+                ..
+            }) => {
+                let normalized = if TargetRouter::has_null_extension(&fname)
+                    || !TargetRouter::is_video_extension(&ext)
+                {
+                    replace_or_append_extension(&fname, det_ext)
+                } else {
+                    fname
+                };
+                if video_entry.is_none() {
+                    video_entry = Some((idx, normalized, entry_ts));
+                }
+            }
+            _ => {
+                if TargetRouter::is_video_extension(&ext) {
+                    if video_entry.is_none() {
+                        video_entry = Some((idx, fname, entry_ts));
+                    }
+                } else if TargetRouter::is_media_extension(&ext) {
+                    if image_entry.is_none() {
+                        image_entry = Some((idx, fname, entry_ts));
+                    }
+                } else {
+                    has_other_files = true;
+                }
+            }
+        }
+    }
+
+    let qualifies = if is_named_livephoto {
+        image_entry.is_some()
+    } else {
+        image_entry.is_some() && video_entry.is_some() && !has_other_files
+    };
+
+    if !qualifies {
+        return Ok(None);
+    }
+
+    let (img_idx, img_name, img_ts) = image_entry.expect("checked Some above");
+    std::fs::create_dir_all(tmp_dir)?;
+    let prefix_hash = hex::encode(Sha1::digest(
+        format!("{}:{}", zip_path.display(), original_zip_name).as_bytes(),
+    ));
+    let prefix10 = &prefix_hash[..10];
+
+    let img_temp_path = tmp_dir.join(format!("lp_img_{}_{}", prefix10, sanitize_filename(&img_name)));
+    let img_guard = TempFileGuard::new(img_temp_path.clone());
+    let mut img_hasher = Sha1::new();
+    let mut img_size: u64 = 0;
+    {
+        let mut zf = archive.by_index(img_idx)?;
+        let mut out = std::fs::File::create(&img_temp_path)?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = zf.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            img_hasher.update(&buf[..n]);
+            out.write_all(&buf[..n])?;
+            img_size += n as u64;
+        }
+        out.flush()?;
+    }
+
+    let (video_guard, video_filename, vid_ts) = if let Some((vid_idx, vid_name, v_ts)) = video_entry
+    {
+        let vid_temp_path =
+            tmp_dir.join(format!("lp_vid_{}_{}", prefix10, sanitize_filename(&vid_name)));
+        let v_guard = TempFileGuard::new(vid_temp_path.clone());
+        let mut zf = archive.by_index(vid_idx)?;
+        let mut out = std::fs::File::create(&vid_temp_path)?;
+        std::io::copy(&mut zf, &mut out)?;
+        out.flush()?;
+        (Some(v_guard), Some(vid_name), v_ts)
+    } else {
+        (None, None, None)
+    };
+
+    let outer_ts = extract_timestamp_from_filename(original_zip_name);
+    let best_ts = [img_ts, vid_ts, outer_ts]
+        .into_iter()
+        .flatten()
+        .reduce(|acc, cand| pick_older_timestamp(&acc, Some(&cand)));
+
+    Ok(Some(ExtractedLivePhoto {
+        image_guard: img_guard,
+        image_filename: img_name,
+        image_sha1: hex::encode(img_hasher.finalize()),
+        image_size: img_size,
+        video_guard,
+        video_filename,
+        timestamp_override: best_ts,
+    }))
 }
 
 pub fn join_remote_path(parent: &str, name: &str) -> String {
@@ -234,5 +433,70 @@ mod tests {
 
         // Guard dropped: file must be removed automatically
         assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn test_livephoto_zip_extraction_and_normal_zip_ignore() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let dir = TempDir::new().unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+
+        // 1. Live Photo ZIP with JPG + MOV and ZIP entry timestamp
+        let lp_zip_path = dir.path().join("IMG_1234.livephoto.zip");
+        {
+            let f = std::fs::File::create(&lp_zip_path).unwrap();
+            let mut zw = ZipWriter::new(f);
+            let dt = zip::DateTime::from_date_and_time(2023, 7, 15, 10, 20, 30).unwrap();
+            let opts = SimpleFileOptions::default().last_modified_time(dt);
+
+            zw.start_file("__MACOSX/._IMG_1234.JPG", opts).unwrap();
+            zw.write_all(b"macos_resource_fork").unwrap();
+
+            zw.start_file("IMG_1234.JPG", opts).unwrap();
+            zw.write_all(b"\xFF\xD8\xFF\xE0fake_jpeg_data_1234")
+                .unwrap();
+
+            zw.start_file("IMG_1234.MOV", opts).unwrap();
+            zw.write_all(b"\x00\x00\x00\x14ftypqt  \x20\x05\x03\x00fake_mov_data")
+                .unwrap();
+
+            zw.finish().unwrap();
+        }
+
+        let extracted =
+            try_extract_livephoto_zip(&lp_zip_path, "IMG_1234.livephoto.zip", tmp_dir.path())
+                .unwrap()
+                .expect("must extract Live Photo pair");
+        assert_eq!(extracted.image_filename, "IMG_1234.JPG");
+        assert_eq!(
+            extracted.video_filename.as_deref(),
+            Some("IMG_1234.MOV")
+        );
+        assert!(extracted.image_guard.path().exists());
+        assert!(extracted.video_guard.as_ref().unwrap().path().exists());
+        assert!(extracted
+            .timestamp_override
+            .as_deref()
+            .unwrap()
+            .starts_with("2023-07-15T10:20:30"));
+
+        // 2. Normal document ZIP must return None
+        let doc_zip_path = dir.path().join("project_docs.zip");
+        {
+            let f = std::fs::File::create(&doc_zip_path).unwrap();
+            let mut zw = ZipWriter::new(f);
+            let opts = SimpleFileOptions::default();
+            zw.start_file("report.pdf", opts).unwrap();
+            zw.write_all(b"%PDF-1.7 fake pdf").unwrap();
+            zw.finish().unwrap();
+        }
+        assert!(
+            try_extract_livephoto_zip(&doc_zip_path, "project_docs.zip", tmp_dir.path())
+                .unwrap()
+                .is_none()
+        );
     }
 }

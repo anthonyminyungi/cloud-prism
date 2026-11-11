@@ -1103,3 +1103,294 @@ async fn test_takeout_preserves_zip_when_nextcloud_disabled_and_archive_contains
         "Takeout ZIP must NOT be deleted when Nextcloud is disabled and archive contains non-media documents"
     );
 }
+
+#[tokio::test]
+async fn test_post_migration_repair_and_album_pinpoint_move() {
+    use mybox_immich_sync::db::FileUpsert;
+    use mybox_immich_sync::pipeline::{
+        run_move_immich_album_to_nextcloud, run_repair_nextcloud_anomalies,
+    };
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_repair.db");
+    let tmp_download_dir = temp_dir.path().join("tmp_repair_sync");
+
+    // Build an in-memory LivePhoto ZIP archive (1 JPG + 1 MOV)
+    let mut zip_buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut zip_buf);
+        let opts = SimpleFileOptions::default();
+        zip.start_file("IMG_4321.JPG", opts).unwrap();
+        zip.write_all(&[0xFF, 0xD8, 0xFF, 0xE0, b'J', b'F', b'I', b'F'])
+            .unwrap();
+        zip.start_file("IMG_4321.MOV", opts).unwrap();
+        zip.write_all(&[
+            0x00, 0x00, 0x00, 0x14, b'f', b't', b'y', b'p', b'q', b't', b' ', b' ',
+        ])
+        .unwrap();
+        zip.finish().unwrap();
+    }
+    let livephoto_zip_bytes = zip_buf.into_inner();
+    let null_jpeg_bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+    let icon_png_bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+
+    // 1. Mock Nextcloud GET & DELETE for the 2 repair candidates
+    Mock::given(method("GET"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/2023/livephoto.,zip",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(livephoto_zip_bytes))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/2023/livephoto.,zip",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/2023/IMG_9999.(null)",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(null_jpeg_bytes))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/2023/IMG_9999.(null)",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 2. Mock Immich bulk-upload-check & uploads for repair (1 video + 1 live photo + 1 recovered JPEG = 3 POST /api/assets)
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "res_null_1", "action": "accept" }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "immich_repaired_asset",
+            "status": "created"
+        })))
+        .expect(3)
+        .mount(&mock_server)
+        .await;
+
+    // 3. Mock Immich album endpoints for `to-nextcloud` pinpoint move
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": "album_to_nc_1",
+                "albumName": "to-nextcloud",
+                "assetCount": 1
+            }
+        ])))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/albums/album_to_nc_1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "album_to_nc_1",
+            "albumName": "to-nextcloud",
+            "assets": [
+                {
+                    "id": "asset_icon_1",
+                    "deviceAssetId": "res_icon_1",
+                    "originalFileName": "app_icon.png",
+                    "livePhotoVideoId": null
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/asset_icon_1/original"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(icon_png_bytes.clone()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("MKCOL"))
+        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("MKCOL"))
+        .and(path("/remote.php/dav/files/ncuser/Cloud-Backup/GoogleDrive"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("MKCOL"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/GoogleDrive/Project",
+        ))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("MKCOL"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/GoogleDrive/Project/icons",
+        ))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/GoogleDrive/Project/icons/app_icon.png",
+        ))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/GoogleDrive/Project/icons/app_icon.png",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", icon_png_bytes.len().to_string()),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/assets"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: tmp_download_dir.to_str().unwrap().to_string(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_key".to_string(),
+        enable_nextcloud: true,
+        nextcloud_url: mock_server.uri(),
+        nextcloud_user: "ncuser".to_string(),
+        nextcloud_app_password: "ncpassword".to_string(),
+        nextcloud_base_dir: "/Cloud-Backup".to_string(),
+        rate_limit_rps: 100.0,
+        concurrency: 2,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    db.upsert_files(&[
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_lp_1".to_string(),
+            name: "livephoto.,zip".to_string(),
+            parent_path: "/2023".to_string(),
+            size: 100,
+            created_time: "2023-05-01T00:00:00Z".to_string(),
+            modified_time: "2023-05-01T00:00:00Z".to_string(),
+            target_type: "nextcloud".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_null_1".to_string(),
+            name: "IMG_9999.(null)".to_string(),
+            parent_path: "/2023".to_string(),
+            size: 50,
+            created_time: "2023-05-02T00:00:00Z".to_string(),
+            modified_time: "2023-05-02T00:00:00Z".to_string(),
+            target_type: "nextcloud".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "gdrive".to_string(),
+            resource_id: "res_icon_1".to_string(),
+            name: "app_icon.png".to_string(),
+            parent_path: "/Project/icons".to_string(),
+            size: 12,
+            created_time: "2024-01-01T00:00:00Z".to_string(),
+            modified_time: "2024-01-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+    ])
+    .await
+    .unwrap();
+
+    db.mark_file_uploaded(
+        "mybox",
+        "res_lp_1",
+        "sha_zip",
+        "/Cloud-Backup/MyBox/2023/livephoto.,zip",
+        "UPLOADED",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "res_null_1",
+        "sha_null",
+        "/Cloud-Backup/MyBox/2023/IMG_9999.(null)",
+        "UPLOADED",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "gdrive",
+        "res_icon_1",
+        "sha_icon",
+        "asset_icon_1",
+        "CREATED",
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::new(db, cfg.clone());
+
+    // Step 1: Run Nextcloud anomaly repair (livephoto.,zip & IMG_9999.(null) -> Immich)
+    let repaired = run_repair_nextcloud_anomalies(state.clone(), cfg.clone())
+        .await
+        .unwrap();
+    assert_eq!(repaired, 2);
+    assert_eq!(
+        state.db.count_nextcloud_repair_candidates().await.unwrap(),
+        0
+    );
+
+    // Step 2: Run Immich `to-nextcloud` album pinpoint move (app_icon.png -> Nextcloud /Project/icons)
+    let moved = run_move_immich_album_to_nextcloud(state.clone(), cfg.clone(), "to-nextcloud")
+        .await
+        .unwrap();
+    assert_eq!(moved, 1);
+
+    let gdrive_stats = state.db.get_stats("gdrive").await.unwrap();
+    assert_eq!(gdrive_stats.uploaded_nextcloud, 1);
+    assert_eq!(gdrive_stats.uploaded_immich_created, 0);
+}

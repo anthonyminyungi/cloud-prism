@@ -1,4 +1,4 @@
-use crate::router::{FileStatus, SyncResultKind, TargetType};
+use crate::router::{FileStatus, SyncResultKind, TargetRouter, TargetType};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use sea_orm::entity::prelude::*;
@@ -793,5 +793,123 @@ impl CheckpointDB {
                 updated_at: r.updated_at,
             })
             .collect())
+    }
+
+    pub async fn get_nextcloud_repair_candidates(&self) -> Result<Vec<FileRecord>> {
+        let rows = file_entity::Entity::find()
+            .filter(file_entity::Column::TargetType.eq(TargetType::Nextcloud.as_str()))
+            .filter(
+                file_entity::Column::Status
+                    .is_in([FileStatus::Uploaded.as_str(), FileStatus::Deleted.as_str()]),
+            )
+            .order_by_asc(file_entity::Column::CreatedTime)
+            .order_by_asc(file_entity::Column::ResourceId)
+            .all(&self.conn)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter(|r| {
+                TargetRouter::is_livephoto_archive_name(&r.name)
+                    || TargetRouter::has_null_extension(&r.name)
+            })
+            .collect())
+    }
+
+    pub async fn count_nextcloud_repair_candidates(&self) -> Result<u64> {
+        Ok(self.get_nextcloud_repair_candidates().await?.len() as u64)
+    }
+
+    pub async fn find_file_for_immich_asset(
+        &self,
+        asset_id: &str,
+        device_asset_id: Option<&str>,
+        original_file_name: &str,
+    ) -> Result<Option<FileRecord>> {
+        let trimmed_asset = asset_id.trim();
+        if !trimmed_asset.is_empty() {
+            if let Some(found) = file_entity::Entity::find()
+                .filter(file_entity::Column::RemoteTargetId.eq(trimmed_asset))
+                .one(&self.conn)
+                .await?
+            {
+                return Ok(Some(found));
+            }
+        }
+
+        if let Some(dev_id) = device_asset_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let clean_dev_id = dev_id.split_once('#').map(|(base, _)| base).unwrap_or(dev_id);
+            if let Some(found) = file_entity::Entity::find()
+                .filter(file_entity::Column::ResourceId.eq(clean_dev_id))
+                .one(&self.conn)
+                .await?
+            {
+                return Ok(Some(found));
+            }
+        }
+
+        let trimmed_name = original_file_name.trim();
+        if !trimmed_name.is_empty() {
+            if let Some(found) = file_entity::Entity::find()
+                .filter(file_entity::Column::TargetType.eq(TargetType::Immich.as_str()))
+                .filter(file_entity::Column::Name.eq(trimmed_name))
+                .order_by_desc(file_entity::Column::UpdatedAt)
+                .one(&self.conn)
+                .await?
+            {
+                return Ok(Some(found));
+            }
+        }
+
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_file_reclassified(
+        &self,
+        source_type: &str,
+        resource_id: &str,
+        new_name: &str,
+        new_target_type: TargetType,
+        new_remote_target_id: &str,
+        new_sha1: &str,
+        new_size: i64,
+        sync_result: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut update = file_entity::Entity::update_many()
+            .col_expr(file_entity::Column::Name, Expr::value(new_name.to_string()))
+            .col_expr(
+                file_entity::Column::TargetType,
+                Expr::value(new_target_type.as_str().to_string()),
+            )
+            .col_expr(
+                file_entity::Column::RemoteTargetId,
+                Expr::value(Some(new_remote_target_id.to_string())),
+            )
+            .col_expr(
+                file_entity::Column::Sha1Hash,
+                Expr::value(Some(new_sha1.to_string())),
+            )
+            .col_expr(
+                file_entity::Column::SyncResult,
+                Expr::value(Some(sync_result.to_string())),
+            )
+            .col_expr(
+                file_entity::Column::ErrorMsg,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now));
+
+        if new_size > 0 {
+            update = update.col_expr(file_entity::Column::Size, Expr::value(new_size));
+        }
+
+        update
+            .filter(file_entity::Column::SourceType.eq(source_type))
+            .filter(file_entity::Column::ResourceId.eq(resource_id))
+            .exec(&self.conn)
+            .await?;
+        Ok(())
     }
 }

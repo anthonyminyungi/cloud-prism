@@ -2,7 +2,10 @@ use mybox_immich_sync::config::{
     normalize_base_url, normalize_mybox_api_base, normalize_nextcloud_url, AppConfig,
 };
 use mybox_immich_sync::limiter::RateLimiter;
-use mybox_immich_sync::router::{SourceType, TargetRouter, TargetType};
+use mybox_immich_sync::router::{
+    extract_timestamp_from_filename, inspect_magic_bytes, pick_older_timestamp,
+    replace_or_append_extension, DetectedFileKind, SourceType, TargetRouter, TargetType,
+};
 use mybox_immich_sync::targets::nextcloud::NextcloudTarget;
 use mybox_immich_sync::targets::TargetProvider;
 use std::collections::HashMap;
@@ -26,6 +29,34 @@ fn test_target_router_classification() {
         Some(TargetType::Immich)
     );
 
+    // LivePhoto ZIP and (null) extension route to Immich during scan so they are inspected/unpacked
+    assert!(TargetRouter::is_livephoto_archive_name(
+        "IMG_1234.livephoto.zip"
+    ));
+    assert!(TargetRouter::is_livephoto_archive_name("livephoto.,zip"));
+    assert!(TargetRouter::is_livephoto_archive_name(
+        "20230501_LIVEPHOTO.ZIP"
+    ));
+    assert!(!TargetRouter::is_livephoto_archive_name("project_backup.zip"));
+
+    assert!(TargetRouter::has_null_extension("IMG_9999.(null)"));
+    assert!(TargetRouter::has_null_extension("20230501_112233(null)"));
+    assert!(TargetRouter::has_null_extension("photo.null"));
+    assert!(!TargetRouter::has_null_extension("photo.jpg"));
+
+    assert_eq!(
+        TargetRouter::classify("IMG_1234.livephoto.zip", false),
+        Some(TargetType::Immich)
+    );
+    assert_eq!(
+        TargetRouter::classify("livephoto.,zip", true),
+        Some(TargetType::Immich)
+    );
+    assert_eq!(
+        TargetRouter::classify("IMG_9999.(null)", false),
+        Some(TargetType::Immich)
+    );
+
     // Documents/archives route to Nextcloud when enabled, None when disabled
     assert_eq!(
         TargetRouter::classify("contract_2026.pdf", true),
@@ -36,6 +67,90 @@ fn test_target_router_classification() {
         Some(TargetType::Nextcloud)
     );
     assert_eq!(TargetRouter::classify("contract_2026.pdf", false), None);
+}
+
+#[test]
+fn test_magic_bytes_extension_recovery_and_filename_dates() {
+    assert_eq!(
+        inspect_magic_bytes(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]),
+        Some(DetectedFileKind::Media {
+            ext: "jpg",
+            mime: "image/jpeg",
+            is_video: false,
+        })
+    );
+    assert_eq!(
+        inspect_magic_bytes(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+        Some(DetectedFileKind::Media {
+            ext: "png",
+            mime: "image/png",
+            is_video: false,
+        })
+    );
+    assert_eq!(
+        inspect_magic_bytes(b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+        Some(DetectedFileKind::Media {
+            ext: "webp",
+            mime: "image/webp",
+            is_video: false,
+        })
+    );
+    assert_eq!(
+        inspect_magic_bytes(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00"),
+        Some(DetectedFileKind::Media {
+            ext: "heic",
+            mime: "image/heic",
+            is_video: false,
+        })
+    );
+    assert_eq!(
+        inspect_magic_bytes(b"\x00\x00\x00\x14ftypqt  \x20\x05\x03\x00"),
+        Some(DetectedFileKind::Media {
+            ext: "mov",
+            mime: "video/quicktime",
+            is_video: true,
+        })
+    );
+    assert_eq!(
+        inspect_magic_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00"),
+        Some(DetectedFileKind::Media {
+            ext: "mp4",
+            mime: "video/mp4",
+            is_video: true,
+        })
+    );
+    assert_eq!(
+        inspect_magic_bytes(b"PK\x03\x04\x14\x00\x00\x00"),
+        Some(DetectedFileKind::ZipArchive)
+    );
+    assert_eq!(
+        inspect_magic_bytes(b"%PDF-1.7\n"),
+        Some(DetectedFileKind::Document { ext: "pdf" })
+    );
+
+    assert_eq!(
+        replace_or_append_extension("IMG_9999.(null)", "jpg"),
+        "IMG_9999.jpg"
+    );
+    assert_eq!(
+        replace_or_append_extension("20230501_112233(null)", "heic"),
+        "20230501_112233.heic"
+    );
+    assert_eq!(
+        replace_or_append_extension("IMG_1234.livephoto.zip", "heic"),
+        "IMG_1234.heic"
+    );
+    assert_eq!(
+        replace_or_append_extension("livephoto.,zip", "jpg"),
+        "livephoto.jpg"
+    );
+
+    let kakao_ts = extract_timestamp_from_filename("KakaoTalk_20220514_153022123.jpg")
+        .expect("should parse KakaoTalk date");
+    assert!(kakao_ts.starts_with("2022-05-14T15:30:22"));
+
+    let chosen = pick_older_timestamp("2026-11-11T02:00:00Z", Some(&kakao_ts));
+    assert_eq!(chosen, kakao_ts);
 }
 
 #[test]
