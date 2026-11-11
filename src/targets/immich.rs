@@ -21,37 +21,53 @@ const ENDPOINT_PING: &str = "/api/server/ping";
 const ENDPOINT_BULK_CHECK: &str = "/api/assets/bulk-upload-check";
 const ENDPOINT_ASSETS: &str = "/api/assets";
 const ENDPOINT_ALBUMS: &str = "/api/albums";
+const ENDPOINT_SEARCH_METADATA: &str = "/api/search/metadata";
+const ENDPOINT_TIMELINE_BUCKETS: &str = "/api/timeline/buckets";
+const ENDPOINT_TIMELINE_BUCKET: &str = "/api/timeline/bucket";
 const HEADER_API_KEY: &str = "x-api-key";
 const DEVICE_ID: &str = "mybox-immich-sync";
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImmichAlbumSummaryDto {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub album_name: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub asset_count: usize,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImmichAlbumDetailDto {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub album_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub asset_count: usize,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub assets: Vec<ImmichAlbumAsset>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImmichAlbumAsset {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub id: String,
     #[serde(default)]
     pub device_asset_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub original_file_name: String,
     #[serde(default)]
     pub file_created_at: Option<String>,
@@ -61,6 +77,29 @@ pub struct ImmichAlbumAsset {
     pub checksum: Option<String>,
     #[serde(default)]
     pub live_photo_video_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImmichSearchMetadataResponse {
+    #[serde(default)]
+    assets: ImmichSearchAssetPage,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImmichSearchAssetPage {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    items: Vec<ImmichAlbumAsset>,
+    #[serde(default)]
+    next_page: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImmichTimeBucketSummary {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    time_bucket: String,
 }
 
 pub fn resolve_upload_filename_and_mime(
@@ -393,41 +432,232 @@ impl ImmichTarget {
             .await?;
 
         if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!(
-                "Immich 앨범 목록 조회 실패: HTTP {}",
-                resp.status()
+                "Immich 앨범 목록 조회 실패 (HTTP {}): {}",
+                status,
+                text
             ));
         }
 
-        let albums: Vec<ImmichAlbumSummaryDto> = resp.json().await?;
-        let target_name = album_name.trim();
-        let Some(matched) = albums
-            .into_iter()
-            .find(|a| a.album_name.trim().eq_ignore_ascii_case(target_name))
-        else {
-            return Ok(None);
-        };
+        let mut albums: Vec<ImmichAlbumSummaryDto> = resp.json().await?;
+        let target_lower = album_name.trim().to_lowercase();
 
-        let detail_url = format!("{}/{}", self.endpoint(ENDPOINT_ALBUMS), matched.id);
-        let detail_resp = self
+        let mut matched_albums: Vec<ImmichAlbumSummaryDto> = albums
+            .iter()
+            .filter(|a| a.album_name.trim().to_lowercase() == target_lower)
+            .cloned()
+            .collect();
+
+        if matched_albums.is_empty() {
+            let shared_url = format!("{}?shared=true", self.endpoint(ENDPOINT_ALBUMS));
+            if let Ok(shared_resp) = self
+                .limiter
+                .send_with_retry(|| {
+                    self.client
+                        .get(&shared_url)
+                        .header(HEADER_API_KEY, &self.api_key)
+                })
+                .await
+            {
+                if shared_resp.status().is_success() {
+                    if let Ok(shared_list) = shared_resp.json::<Vec<ImmichAlbumSummaryDto>>().await
+                    {
+                        for sa in shared_list {
+                            if sa.album_name.trim().to_lowercase() == target_lower {
+                                matched_albums.push(sa.clone());
+                            }
+                            albums.push(sa);
+                        }
+                    }
+                }
+            }
+        }
+
+        if matched_albums.is_empty() {
+            return Ok(None);
+        }
+
+        // Prioritize albums with the highest reported asset_count
+        matched_albums.sort_by(|a, b| b.asset_count.cmp(&a.asset_count));
+        let primary_id = matched_albums[0].id.clone();
+        let mut collected: Vec<ImmichAlbumAsset> = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+
+        for matched in matched_albums {
+            let detail_url = format!("{}/{}", self.endpoint(ENDPOINT_ALBUMS), matched.id);
+            let detail_resp = self
+                .limiter
+                .send_with_retry(|| {
+                    self.client
+                        .get(&detail_url)
+                        .header(HEADER_API_KEY, &self.api_key)
+                })
+                .await?;
+
+            if !detail_resp.status().is_success() {
+                let status = detail_resp.status();
+                let text = detail_resp.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "Immich 앨범 상세 조회 실패 ({} / HTTP {}): {}",
+                    matched.id,
+                    status,
+                    text
+                ));
+            }
+
+            let detail: ImmichAlbumDetailDto = detail_resp.json().await?;
+            let mut album_assets = detail.assets;
+
+            if album_assets.is_empty() {
+                if let Ok(search_assets) = self.fetch_album_assets_via_search(&matched.id).await {
+                    if !search_assets.is_empty() {
+                        album_assets = search_assets;
+                    }
+                }
+            }
+
+            if album_assets.is_empty() {
+                if let Ok(tl_assets) = self.fetch_album_assets_via_timeline(&matched.id).await {
+                    if !tl_assets.is_empty() {
+                        album_assets = tl_assets;
+                    }
+                }
+            }
+
+            for asset in album_assets {
+                if !asset.id.is_empty() && seen_ids.insert(asset.id.clone()) {
+                    collected.push(asset);
+                }
+            }
+        }
+
+        Ok(Some((primary_id, collected)))
+    }
+
+    async fn fetch_album_assets_via_search(
+        &self,
+        album_id: &str,
+    ) -> Result<Vec<ImmichAlbumAsset>> {
+        let url = self.endpoint(ENDPOINT_SEARCH_METADATA);
+        let mut all_items = Vec::new();
+        let mut page: u32 = 1;
+
+        loop {
+            let payload = json!({
+                "albumIds": [album_id],
+                "size": 500,
+                "page": page
+            });
+            let resp = self
+                .limiter
+                .send_with_retry(|| {
+                    self.client
+                        .post(&url)
+                        .header(HEADER_API_KEY, &self.api_key)
+                        .json(&payload)
+                })
+                .await?;
+
+            if !resp.status().is_success() {
+                break;
+            }
+
+            let dto: ImmichSearchMetadataResponse = resp.json().await?;
+            let count = dto.assets.items.len();
+            all_items.extend(dto.assets.items);
+
+            let next_page = dto.assets.next_page.and_then(|v| match v {
+                serde_json::Value::String(s) => s.parse::<u32>().ok(),
+                serde_json::Value::Number(n) => n.as_u64().map(|x| x as u32),
+                _ => None,
+            });
+            match next_page {
+                Some(np) if np > page && count > 0 => page = np,
+                _ => break,
+            }
+        }
+
+        Ok(all_items)
+    }
+
+    async fn fetch_album_assets_via_timeline(
+        &self,
+        album_id: &str,
+    ) -> Result<Vec<ImmichAlbumAsset>> {
+        let buckets_url = format!(
+            "{}?albumId={}",
+            self.endpoint(ENDPOINT_TIMELINE_BUCKETS),
+            album_id
+        );
+        let resp = self
             .limiter
             .send_with_retry(|| {
                 self.client
-                    .get(&detail_url)
+                    .get(&buckets_url)
                     .header(HEADER_API_KEY, &self.api_key)
             })
             .await?;
 
-        if !detail_resp.status().is_success() {
-            return Err(anyhow!(
-                "Immich 앨범 상세 조회 실패 ({}): HTTP {}",
-                matched.id,
-                detail_resp.status()
-            ));
+        if !resp.status().is_success() {
+            return Ok(Vec::new());
         }
 
-        let detail: ImmichAlbumDetailDto = detail_resp.json().await?;
-        Ok(Some((detail.id, detail.assets)))
+        let buckets: Vec<ImmichTimeBucketSummary> = resp.json().await.unwrap_or_default();
+        let mut all_assets = Vec::new();
+
+        for b in buckets {
+            if b.time_bucket.is_empty() {
+                continue;
+            }
+            let bucket_url = format!(
+                "{}?albumId={}&timeBucket={}",
+                self.endpoint(ENDPOINT_TIMELINE_BUCKET),
+                album_id,
+                b.time_bucket
+            );
+            let b_resp = self
+                .limiter
+                .send_with_retry(|| {
+                    self.client
+                        .get(&bucket_url)
+                        .header(HEADER_API_KEY, &self.api_key)
+                })
+                .await?;
+            if !b_resp.status().is_success() {
+                continue;
+            }
+            let val: serde_json::Value = b_resp.json().await.unwrap_or_default();
+            if let Ok(list) = serde_json::from_value::<Vec<ImmichAlbumAsset>>(val.clone()) {
+                all_assets.extend(list);
+            } else if let Some(ids) = val.get("id").and_then(|v| v.as_array()) {
+                // Columnar timeline format in newer Immich versions
+                let names = val.get("originalFileName").and_then(|v| v.as_array());
+                let live_ids = val.get("livePhotoVideoId").and_then(|v| v.as_array());
+                for (i, id_val) in ids.iter().enumerate() {
+                    if let Some(id_str) = id_val.as_str() {
+                        let orig_name = names
+                            .and_then(|arr| arr.get(i))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let live_id = live_ids
+                            .and_then(|arr| arr.get(i))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        all_assets.push(ImmichAlbumAsset {
+                            id: id_str.to_string(),
+                            original_file_name: orig_name,
+                            live_photo_video_id: live_id,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(all_assets)
     }
 
     pub async fn download_asset_to_temp(

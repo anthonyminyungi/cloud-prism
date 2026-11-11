@@ -1201,14 +1201,25 @@ pub async fn run_repair_nextcloud_anomalies_with_limit(
                             .await?;
                         repaired_count += 1;
                         state.processed_files.fetch_add(1, Ordering::SeqCst);
+                        let date_label = created_at.get(..10).unwrap_or(&created_at);
+                        let immich_link = format!(
+                            "{}/photos/{}",
+                            config.immich_url.trim_end_matches('/'),
+                            outcome.remote_target_id
+                        );
                         state
                             .emit_event(
                                 "repair",
                                 JobState::Syncing,
                                 Some(extracted.image_filename.clone()),
                                 format!(
-                                    "[사후 보정] 라이브포토 복구 완료 (Nextcloud → Immich LIVE): {} → {} + {}",
-                                    file.name, extracted.image_filename, vid_label
+                                    "[사후 보정] 라이브포토 복구 완료 [{} / 촬영일: {} / 확인: {}]: {} → {} + {}",
+                                    outcome.sync_result.as_str(),
+                                    date_label,
+                                    immich_link,
+                                    file.name,
+                                    extracted.image_filename,
+                                    vid_label
                                 ),
                             )
                             .await;
@@ -1267,14 +1278,29 @@ pub async fn run_repair_nextcloud_anomalies_with_limit(
                                 .await?;
                             repaired_count += 1;
                             state.processed_files.fetch_add(1, Ordering::SeqCst);
+                            let date_label = created_at.get(..10).unwrap_or(&created_at);
+                            let immich_link = format!(
+                                "{}/photos/{}",
+                                config.immich_url.trim_end_matches('/'),
+                                outcome.remote_target_id
+                            );
+                            let status_note = if outcome.sync_result == SyncResultKind::Duplicate {
+                                "DUPLICATE(동일 해시 사진 이미 존재)"
+                            } else {
+                                "CREATED(신규 업로드)"
+                            };
                             state
                                 .emit_event(
                                     "repair",
                                     JobState::Syncing,
                                     Some(restored_name.clone()),
                                     format!(
-                                        "[사후 보정] (null) 미디어 복구 완료 (Nextcloud → Immich): {} → {}",
-                                        file.name, restored_name
+                                        "[사후 보정] (null) 미디어 복구 완료 [{} / 촬영일: {} / 확인: {}]: {} → {}",
+                                        status_note,
+                                        date_label,
+                                        immich_link,
+                                        file.name,
+                                        restored_name
                                     ),
                                 )
                                 .await;
@@ -1471,7 +1497,7 @@ pub async fn run_move_immich_album_to_nextcloud_with_limit(
         target_limiter,
     );
 
-    let Some((_album_id, mut assets)) = immich_target.get_album_assets_by_name(album_name).await?
+    let Some((album_id, mut assets)) = immich_target.get_album_assets_by_name(album_name).await?
     else {
         state
             .finish_job(
@@ -1492,8 +1518,8 @@ pub async fn run_move_immich_album_to_nextcloud_with_limit(
             .finish_job(
                 "repair",
                 format!(
-                    "[앨범 핀포인트 이동] Immich '{}' 앨범에 이동할 항목이 없습니다.",
-                    album_name
+                    "[앨범 핀포인트 이동] Immich '{}' 앨범(ID: {})에 조회된 사진이 0건입니다. (앨범에 사진이 있다면 Immich API 키에 asset.read / album.read 권한이 있는지 확인해 주세요)",
+                    album_name, album_id
                 ),
             )
             .await;
