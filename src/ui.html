@@ -882,11 +882,12 @@
             <div class="s-metric" style="border: 1px solid var(--border); border-radius: 6px;">
               <div class="s-metric-label">2. Immich 특정 앨범 → Nextcloud 원래 폴더로 핀포인트 이동</div>
               <div style="display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap: wrap;">
-                <input id="repairAlbumInput" type="text" class="input-text mono" value="to-nextcloud" placeholder="to-nextcloud" style="max-width: 180px;" />
-                <button id="btnRepairAlbum" class="btn btn-primary" onclick="startRepairJob('album_to_nextcloud', false)">앨범 항목 → Nextcloud 원래 폴더로 이동</button>
+                <input id="repairAlbumInput" type="text" class="input-text mono" value="to-nextcloud" placeholder="to-nextcloud" style="max-width: 150px;" />
+                <button id="btnStageGdriveAlbum" class="btn" onclick="startRepairJob('stage_gdrive_to_album', false)">1단계: Google Drive 이미지 앨범에 담기 (0건)</button>
+                <button id="btnRepairAlbum" class="btn btn-primary" onclick="startRepairJob('album_to_nextcloud', false)">2단계: 앨범 항목 → Nextcloud 원래 폴더로 이동</button>
               </div>
               <div class="s-metric-sub" style="margin-top: 6px;">
-                <span>Immich에서 옮길 이미지를 앨범(기본 <span class="mono">to-nextcloud</span>)에 담은 뒤 실행하세요.</span>
+                <span>1단계로 Google Drive 폴더 출신 이미지를 앨범(기본 <span class="mono">to-nextcloud</span>)에 모은 뒤, Immich에서 남길 사진은 빼고 2단계를 실행하세요.</span>
               </div>
             </div>
             <div class="s-metric" style="border: 1px solid var(--border); border-radius: 6px; grid-column: 1 / -1;">
@@ -1560,13 +1561,19 @@
       const disAttr = isIdle ? '' : 'disabled';
 
       const anomalyCount = (d.repair_info && d.repair_info.nextcloud_anomaly_count) || 0;
+      const gdriveImmichCount = (d.repair_info && d.repair_info.gdrive_immich_count) || 0;
       const anomalyEl = document.getElementById('repairAnomalyCount');
       if (anomalyEl) anomalyEl.textContent = `${anomalyCount.toLocaleString()}건`;
       const btnAnomalies = document.getElementById('btnRepairAnomalies');
+      const btnStageGdrive = document.getElementById('btnStageGdriveAlbum');
       const btnAlbum = document.getElementById('btnRepairAlbum');
       const btnAll = document.getElementById('btnRepairAll');
       const btnMergeDupDryRun = document.getElementById('btnMergeDupDryRun');
       const btnMergeDupExecute = document.getElementById('btnMergeDupExecute');
+      if (btnStageGdrive) {
+        btnStageGdrive.textContent = `1단계: Google Drive 이미지 앨범에 담기 (${gdriveImmichCount.toLocaleString()}건)`;
+        btnStageGdrive.disabled = !isIdle;
+      }
       if (btnAnomalies) btnAnomalies.disabled = !isIdle;
       if (btnAlbum) btnAlbum.disabled = !isIdle;
       if (btnAll) btnAll.disabled = !isIdle;

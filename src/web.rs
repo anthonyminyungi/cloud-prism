@@ -3,7 +3,7 @@ use crate::limiter::{format_error_chain, RateLimiter};
 use crate::pipeline::{
     build_source_provider, build_target_providers, run_merge_immich_duplicates_with_limit,
     run_move_immich_album_to_nextcloud_with_limit, run_repair_nextcloud_anomalies_with_limit,
-    SyncPipeline,
+    run_stage_gdrive_to_immich_album_with_limit, SyncPipeline,
 };
 use crate::router::{SourceType, TargetType};
 use crate::sources::sanitize_filename;
@@ -318,6 +318,11 @@ async fn get_status(
         .count_nextcloud_repair_candidates()
         .await
         .unwrap_or(0);
+    let gdrive_immich_count = state
+        .db
+        .count_gdrive_immich_staging_candidates()
+        .await
+        .unwrap_or(0);
 
     (
         StatusCode::OK,
@@ -339,6 +344,7 @@ async fn get_status(
             },
             "repair_info": {
                 "nextcloud_anomaly_count": nextcloud_anomaly_count,
+                "gdrive_immich_count": gdrive_immich_count,
                 "default_album_name": "to-nextcloud"
             },
             "stats": stats,
@@ -1092,6 +1098,7 @@ async fn retry_failed(
 #[serde(rename_all = "snake_case")]
 pub enum RepairMode {
     Anomalies,
+    StageGdriveToAlbum,
     AlbumToNextcloud,
     ImmichDuplicates,
     All,
@@ -1130,8 +1137,10 @@ async fn start_repair_job(
         );
     }
 
-    if matches!(req.mode, RepairMode::ImmichDuplicates)
-        && (cfg.immich_url.trim().is_empty() || cfg.immich_api_key.trim().is_empty())
+    if matches!(
+        req.mode,
+        RepairMode::StageGdriveToAlbum | RepairMode::ImmichDuplicates
+    ) && (cfg.immich_url.trim().is_empty() || cfg.immich_api_key.trim().is_empty())
     {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -1163,6 +1172,15 @@ async fn start_repair_job(
         let res = match mode {
             RepairMode::Anomalies => {
                 run_repair_nextcloud_anomalies_with_limit(state_clone.clone(), cfg, limit).await
+            }
+            RepairMode::StageGdriveToAlbum => {
+                run_stage_gdrive_to_immich_album_with_limit(
+                    state_clone.clone(),
+                    cfg,
+                    &album_for_task,
+                    limit,
+                )
+                .await
             }
             RepairMode::AlbumToNextcloud => {
                 run_move_immich_album_to_nextcloud_with_limit(
@@ -1264,17 +1282,30 @@ mod tests {
     #[tokio::test]
     async fn test_status_includes_repair_info_and_repair_endpoint_validation() {
         let db = CheckpointDB::connect(":memory:").await.unwrap();
-        db.upsert_files(&[FileUpsert {
-            source_type: "mybox".to_string(),
-            resource_id: "res_lp_1".to_string(),
-            name: "livephoto.,zip".to_string(),
-            parent_path: "/2023".to_string(),
-            size: 100,
-            created_time: "2023-05-01T00:00:00Z".to_string(),
-            modified_time: "2023-05-01T00:00:00Z".to_string(),
-            target_type: "nextcloud".to_string(),
-            sha1_hash: None,
-        }])
+        db.upsert_files(&[
+            FileUpsert {
+                source_type: "mybox".to_string(),
+                resource_id: "res_lp_1".to_string(),
+                name: "livephoto.,zip".to_string(),
+                parent_path: "/2023".to_string(),
+                size: 100,
+                created_time: "2023-05-01T00:00:00Z".to_string(),
+                modified_time: "2023-05-01T00:00:00Z".to_string(),
+                target_type: "nextcloud".to_string(),
+                sha1_hash: None,
+            },
+            FileUpsert {
+                source_type: "takeout".to_string(),
+                resource_id: "Takeout/드라이브/업무/시안.png".to_string(),
+                name: "시안.png".to_string(),
+                parent_path: "/업무".to_string(),
+                size: 200,
+                created_time: "2025-05-01T00:00:00Z".to_string(),
+                modified_time: "2025-05-01T00:00:00Z".to_string(),
+                target_type: "immich".to_string(),
+                sha1_hash: Some("sha1_drive".to_string()),
+            },
+        ])
         .await
         .unwrap();
         db.mark_file_uploaded(
@@ -1283,6 +1314,15 @@ mod tests {
             "sha1",
             "/Cloud-Backup/MyBox/2023/livephoto.,zip",
             "UPLOADED",
+        )
+        .await
+        .unwrap();
+        db.mark_file_uploaded(
+            "takeout",
+            "Takeout/드라이브/업무/시안.png",
+            "sha1_drive",
+            "asset-drive-1",
+            "created",
         )
         .await
         .unwrap();
@@ -1311,6 +1351,7 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(val["repair_info"]["nextcloud_anomaly_count"], 1);
+        assert_eq!(val["repair_info"]["gdrive_immich_count"], 1);
         assert_eq!(val["repair_info"]["default_album_name"], "to-nextcloud");
 
         // 2. Check POST /api/jobs/repair rejects album_to_nextcloud when Nextcloud is disabled

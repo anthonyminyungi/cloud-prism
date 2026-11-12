@@ -19,6 +19,10 @@ use zip::ZipArchive;
 /// Strips the outer `Takeout/` wrapper and service root folder (`드라이브`, `Drive`, `Google 포토`, etc.)
 /// so Google Drive folder structures inside a Takeout ZIP map cleanly under `/GoogleDrive/...` in Nextcloud.
 pub fn normalize_takeout_parent_path(raw_parent: &str) -> String {
+    let raw_parent = raw_parent
+        .split_once("::")
+        .map(|(_, e)| e)
+        .unwrap_or(raw_parent);
     let mut segments: Vec<&str> = raw_parent
         .split(['/', '\\'])
         .map(str::trim)
@@ -55,6 +59,43 @@ pub fn normalize_takeout_parent_path(raw_parent: &str) -> String {
     } else {
         format!("/{}", segments.join("/"))
     }
+}
+
+/// Returns `true` if a Takeout ZIP entry path (`resource_id`) originated from the Google Drive
+/// service folder inside the archive (e.g. `Takeout/드라이브/...`, `Takeout/Drive/...`),
+/// excluding `Google 포토` / `Google Photos`.
+pub fn is_takeout_gdrive_entry(entry_name: &str) -> bool {
+    let entry_name = entry_name
+        .split_once("::")
+        .map(|(_, e)| e)
+        .unwrap_or(entry_name);
+    let mut segments: Vec<&str> = entry_name
+        .split(['/', '\\'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if segments
+        .first()
+        .map(|s| s.eq_ignore_ascii_case("takeout"))
+        .unwrap_or(false)
+    {
+        segments.remove(0);
+    }
+
+    let Some(&service_root) = segments.first() else {
+        return false;
+    };
+
+    matches!(
+        service_root.to_lowercase().as_str(),
+        "드라이브"
+            | "drive"
+            | "내 드라이브"
+            | "my drive"
+            | "google 드라이브"
+            | "google drive"
+    )
 }
 
 fn is_takeout_system_entry(entry_name: &str, filename: &str) -> bool {
@@ -760,5 +801,30 @@ mod tests {
         );
         assert_eq!(d1.size, 25);
         assert_eq!(d2.size, 29);
+    }
+
+    #[test]
+    fn test_is_takeout_gdrive_entry_identifies_only_drive_paths() {
+        assert!(is_takeout_gdrive_entry("Takeout/드라이브/업무/시안.jpg"));
+        assert!(is_takeout_gdrive_entry("Takeout/Drive/Trips/jeju.jpg"));
+        assert!(is_takeout_gdrive_entry("Takeout/내 드라이브/문서/스캔.png"));
+        assert!(is_takeout_gdrive_entry("Takeout/My Drive/Work/chart.webp"));
+        assert!(is_takeout_gdrive_entry("Takeout/Google 드라이브/a.jpg"));
+        assert!(is_takeout_gdrive_entry("Takeout/Google Drive/b.jpg"));
+        assert!(is_takeout_gdrive_entry(
+            "takeout-001.zip::Takeout/드라이브/업무/시안.jpg"
+        ));
+
+        assert!(!is_takeout_gdrive_entry(
+            "Takeout/Google 포토/Photos from 2025/sunset.jpg"
+        ));
+        assert!(!is_takeout_gdrive_entry(
+            "takeout-001.zip::Takeout/Google 포토/Photos from 2025/sunset.jpg"
+        ));
+        assert!(!is_takeout_gdrive_entry(
+            "Takeout/Google Photos/2026/beach.jpg"
+        ));
+        assert!(!is_takeout_gdrive_entry("Takeout/archive_browser.html"));
+        assert!(!is_takeout_gdrive_entry(""));
     }
 }

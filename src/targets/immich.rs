@@ -1653,6 +1653,59 @@ impl ImmichTarget {
         Ok(())
     }
 
+    pub async fn ensure_album_by_name(&self, album_name: &str) -> Result<String> {
+        let clean_name = album_name.trim();
+        if clean_name.is_empty() {
+            return Err(anyhow!("생성하거나 조회할 Immich 앨범 이름이 비어 있습니다."));
+        }
+
+        let target_lower = clean_name.to_lowercase();
+        let albums = self.list_all_albums().await?;
+        let mut matched: Vec<ImmichAlbumSummaryDto> = albums
+            .into_iter()
+            .filter(|a| a.album_name.trim().to_lowercase() == target_lower && !a.id.is_empty())
+            .collect();
+
+        if !matched.is_empty() {
+            matched.sort_by(|a, b| b.asset_count.cmp(&a.asset_count));
+            return Ok(matched[0].id.clone());
+        }
+
+        let url = self.endpoint(ENDPOINT_ALBUMS);
+        let payload = json!({
+            "albumName": clean_name
+        });
+        let resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .header(HEADER_API_KEY, &self.api_key)
+                    .json(&payload)
+            })
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Immich 앨범('{}') 생성 실패 (HTTP {}): {}",
+                clean_name,
+                status,
+                text
+            ));
+        }
+
+        let created: ImmichAlbumSummaryDto = resp.json().await?;
+        if created.id.trim().is_empty() {
+            return Err(anyhow!(
+                "Immich 앨범('{}') 생성 응답에 ID가 없습니다.",
+                clean_name
+            ));
+        }
+        Ok(created.id)
+    }
+
     pub async fn add_assets_to_album(&self, album_id: &str, asset_ids: &[String]) -> Result<()> {
         if asset_ids.is_empty() {
             return Ok(());

@@ -820,6 +820,111 @@ impl CheckpointDB {
         Ok(self.get_nextcloud_repair_candidates().await?.len() as u64)
     }
 
+    pub fn is_gdrive_origin_pair(source_type: &str, resource_id: &str) -> bool {
+        if source_type.eq_ignore_ascii_case("gdrive") {
+            return true;
+        }
+        if source_type.eq_ignore_ascii_case("takeout") {
+            return crate::sources::takeout::is_takeout_gdrive_entry(resource_id);
+        }
+        false
+    }
+
+    pub fn is_gdrive_origin_record(record: &FileRecord) -> bool {
+        Self::is_gdrive_origin_pair(&record.source_type, &record.resource_id)
+    }
+
+    pub async fn get_gdrive_immich_staging_candidates(&self) -> Result<Vec<FileRecord>> {
+        let rows = file_entity::Entity::find()
+            .filter(file_entity::Column::SourceType.is_in(["gdrive", "takeout"]))
+            .filter(file_entity::Column::TargetType.eq(TargetType::Immich.as_str()))
+            .filter(
+                file_entity::Column::Status
+                    .is_in([FileStatus::Uploaded.as_str(), FileStatus::Deleted.as_str()]),
+            )
+            .order_by_asc(file_entity::Column::ParentPath)
+            .order_by_asc(file_entity::Column::Name)
+            .order_by_asc(file_entity::Column::ResourceId)
+            .all(&self.conn)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter(Self::is_gdrive_origin_record)
+            .collect())
+    }
+
+    pub async fn count_gdrive_immich_staging_candidates(&self) -> Result<u64> {
+        let pairs: Vec<(String, String)> = file_entity::Entity::find()
+            .select_only()
+            .column(file_entity::Column::SourceType)
+            .column(file_entity::Column::ResourceId)
+            .filter(file_entity::Column::SourceType.is_in(["gdrive", "takeout"]))
+            .filter(file_entity::Column::TargetType.eq(TargetType::Immich.as_str()))
+            .filter(
+                file_entity::Column::Status
+                    .is_in([FileStatus::Uploaded.as_str(), FileStatus::Deleted.as_str()]),
+            )
+            .into_tuple()
+            .all(&self.conn)
+            .await?;
+
+        Ok(pairs
+            .into_iter()
+            .filter(|(src, res_id)| Self::is_gdrive_origin_pair(src, res_id))
+            .count() as u64)
+    }
+
+    pub async fn heal_immich_remote_target_ids(
+        &self,
+        resolved: &[(String, String, String)],
+    ) -> Result<u64> {
+        if resolved.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let txn = self.conn.begin().await?;
+        let mut updated = 0u64;
+        for (source_type, resource_id, asset_id) in resolved {
+            let res = file_entity::Entity::update_many()
+                .col_expr(
+                    file_entity::Column::RemoteTargetId,
+                    Expr::value(Some(asset_id.clone())),
+                )
+                .col_expr(file_entity::Column::UpdatedAt, Expr::value(now.clone()))
+                .filter(file_entity::Column::SourceType.eq(source_type.as_str()))
+                .filter(file_entity::Column::ResourceId.eq(resource_id.as_str()))
+                .exec(&txn)
+                .await?;
+            updated += res.rows_affected;
+        }
+        txn.commit().await?;
+        Ok(updated)
+    }
+
+    async fn prefer_gdrive_sibling_by_sha1(&self, candidate: FileRecord) -> Result<FileRecord> {
+        if Self::is_gdrive_origin_record(&candidate) {
+            return Ok(candidate);
+        }
+        if let Some(sha1) = candidate
+            .sha1_hash
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let siblings = file_entity::Entity::find()
+                .filter(file_entity::Column::SourceType.is_in(["gdrive", "takeout"]))
+                .filter(file_entity::Column::TargetType.eq(TargetType::Immich.as_str()))
+                .filter(file_entity::Column::Sha1Hash.eq(sha1))
+                .all(&self.conn)
+                .await?;
+            if let Some(gdrive_rec) = siblings.into_iter().find(Self::is_gdrive_origin_record) {
+                return Ok(gdrive_rec);
+            }
+        }
+        Ok(candidate)
+    }
+
     pub async fn find_file_for_immich_asset(
         &self,
         asset_id: &str,
@@ -828,12 +933,17 @@ impl CheckpointDB {
     ) -> Result<Option<FileRecord>> {
         let trimmed_asset = asset_id.trim();
         if !trimmed_asset.is_empty() {
-            if let Some(found) = file_entity::Entity::find()
+            let matches = file_entity::Entity::find()
                 .filter(file_entity::Column::RemoteTargetId.eq(trimmed_asset))
-                .one(&self.conn)
-                .await?
-            {
-                return Ok(Some(found));
+                .all(&self.conn)
+                .await?;
+            if !matches.is_empty() {
+                if let Some(gdrive_rec) = matches.iter().find(|r| Self::is_gdrive_origin_record(r)) {
+                    return Ok(Some(gdrive_rec.clone()));
+                }
+                if let Some(first) = matches.into_iter().next() {
+                    return Ok(Some(self.prefer_gdrive_sibling_by_sha1(first).await?));
+                }
             }
         }
 
@@ -844,20 +954,25 @@ impl CheckpointDB {
                 .one(&self.conn)
                 .await?
             {
-                return Ok(Some(found));
+                return Ok(Some(self.prefer_gdrive_sibling_by_sha1(found).await?));
             }
         }
 
         let trimmed_name = original_file_name.trim();
         if !trimmed_name.is_empty() {
-            if let Some(found) = file_entity::Entity::find()
+            let matches = file_entity::Entity::find()
                 .filter(file_entity::Column::TargetType.eq(TargetType::Immich.as_str()))
                 .filter(file_entity::Column::Name.eq(trimmed_name))
                 .order_by_desc(file_entity::Column::UpdatedAt)
-                .one(&self.conn)
-                .await?
-            {
-                return Ok(Some(found));
+                .all(&self.conn)
+                .await?;
+            if !matches.is_empty() {
+                if let Some(gdrive_rec) = matches.iter().find(|r| Self::is_gdrive_origin_record(r)) {
+                    return Ok(Some(gdrive_rec.clone()));
+                }
+                if let Some(first) = matches.into_iter().next() {
+                    return Ok(Some(self.prefer_gdrive_sibling_by_sha1(first).await?));
+                }
             }
         }
 
@@ -911,6 +1026,54 @@ impl CheckpointDB {
             .exec(&self.conn)
             .await?;
         Ok(())
+    }
+
+    pub async fn reclassify_sibling_immich_records(
+        &self,
+        immich_asset_id: &str,
+        sha1_hash: &str,
+        new_target_type: TargetType,
+        new_remote_target_id: &str,
+    ) -> Result<u64> {
+        let trimmed_asset = immich_asset_id.trim();
+        let trimmed_sha1 = sha1_hash.trim();
+        if trimmed_asset.is_empty() && trimmed_sha1.is_empty() {
+            return Ok(0);
+        }
+
+        let mut cond = sea_orm::Condition::any();
+        if !trimmed_asset.is_empty() {
+            cond = cond.add(file_entity::Column::RemoteTargetId.eq(trimmed_asset));
+        }
+        if !trimmed_sha1.is_empty() {
+            cond = cond.add(file_entity::Column::Sha1Hash.eq(trimmed_sha1));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let res = file_entity::Entity::update_many()
+            .col_expr(
+                file_entity::Column::TargetType,
+                Expr::value(new_target_type.as_str().to_string()),
+            )
+            .col_expr(
+                file_entity::Column::RemoteTargetId,
+                Expr::value(Some(new_remote_target_id.to_string())),
+            )
+            .col_expr(
+                file_entity::Column::SyncResult,
+                Expr::value(Some(SyncResultKind::Duplicate.as_str().to_string())),
+            )
+            .col_expr(
+                file_entity::Column::ErrorMsg,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now))
+            .filter(file_entity::Column::TargetType.eq(TargetType::Immich.as_str()))
+            .filter(cond)
+            .exec(&self.conn)
+            .await?;
+
+        Ok(res.rows_affected)
     }
 
     pub async fn remap_merged_immich_assets(
@@ -1023,5 +1186,151 @@ mod tests {
         );
         assert_eq!(rows[0].sha1_hash.as_deref(), Some("new_winner_sha1_hex"));
         assert_eq!(rows[0].sync_result.as_deref(), Some("duplicate"));
+    }
+
+    #[tokio::test]
+    async fn test_get_gdrive_immich_staging_candidates_and_folder_priority() {
+        let db = CheckpointDB::connect(":memory:").await.unwrap();
+        db.upsert_files(&[
+            // 1. Google Photos entry inside Takeout -> must NOT be included
+            FileUpsert {
+                source_type: "takeout".to_string(),
+                resource_id: "Takeout/Google 포토/Photos from 2025/shared.jpg".to_string(),
+                name: "shared.jpg".to_string(),
+                parent_path: "/Photos from 2025".to_string(),
+                size: 1000,
+                created_time: "2025-05-01T00:00:00Z".to_string(),
+                modified_time: "2025-05-01T00:00:00Z".to_string(),
+                target_type: "immich".to_string(),
+                sha1_hash: Some("sha1_shared".to_string()),
+            },
+            // 2. Google Drive entry inside Takeout (duplicate of shared.jpg) -> MUST be included
+            FileUpsert {
+                source_type: "takeout".to_string(),
+                resource_id: "Takeout/드라이브/업무자료/시안/shared.jpg".to_string(),
+                name: "shared.jpg".to_string(),
+                parent_path: "/업무자료/시안".to_string(),
+                size: 1000,
+                created_time: "2025-05-01T00:00:00Z".to_string(),
+                modified_time: "2025-05-01T00:00:00Z".to_string(),
+                target_type: "immich".to_string(),
+                sha1_hash: Some("sha1_shared".to_string()),
+            },
+            // 3. Google Drive entry inside Takeout (created, status DELETED after ZIP cleanup) -> MUST be included
+            FileUpsert {
+                source_type: "takeout".to_string(),
+                resource_id: "Takeout/Drive/Scans/receipt.png".to_string(),
+                name: "receipt.png".to_string(),
+                parent_path: "/Scans".to_string(),
+                size: 2000,
+                created_time: "2025-06-01T00:00:00Z".to_string(),
+                modified_time: "2025-06-01T00:00:00Z".to_string(),
+                target_type: "immich".to_string(),
+                sha1_hash: Some("sha1_receipt".to_string()),
+            },
+            // 4. MYBOX entry -> must NOT be included
+            FileUpsert {
+                source_type: "mybox".to_string(),
+                resource_id: "mybox_1".to_string(),
+                name: "family.jpg".to_string(),
+                parent_path: "/가족".to_string(),
+                size: 3000,
+                created_time: "2025-07-01T00:00:00Z".to_string(),
+                modified_time: "2025-07-01T00:00:00Z".to_string(),
+                target_type: "immich".to_string(),
+                sha1_hash: Some("sha1_family".to_string()),
+            },
+        ])
+        .await
+        .unwrap();
+
+        db.mark_file_uploaded(
+            "takeout",
+            "Takeout/Google 포토/Photos from 2025/shared.jpg",
+            "sha1_shared",
+            "asset-shared-uuid",
+            "created",
+        )
+        .await
+        .unwrap();
+        db.mark_file_uploaded(
+            "takeout",
+            "Takeout/드라이브/업무자료/시안/shared.jpg",
+            "sha1_shared",
+            "existing_immich_asset",
+            "duplicate",
+        )
+        .await
+        .unwrap();
+        db.mark_file_uploaded(
+            "takeout",
+            "Takeout/Drive/Scans/receipt.png",
+            "sha1_receipt",
+            "asset-receipt-uuid",
+            "created",
+        )
+        .await
+        .unwrap();
+        db.mark_file_deleted("takeout", "Takeout/Drive/Scans/receipt.png")
+            .await
+            .unwrap();
+        db.mark_file_uploaded("mybox", "mybox_1", "sha1_family", "asset-family-uuid", "created")
+            .await
+            .unwrap();
+
+        let candidates = db.get_gdrive_immich_staging_candidates().await.unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(db.count_gdrive_immich_staging_candidates().await.unwrap(), 2);
+        assert_eq!(candidates[0].resource_id, "Takeout/Drive/Scans/receipt.png");
+        assert_eq!(
+            candidates[1].resource_id,
+            "Takeout/드라이브/업무자료/시안/shared.jpg"
+        );
+
+        // Even before healing `remote_target_id` ("existing_immich_asset"),
+        // `find_file_for_immich_asset` must prefer the Google Drive sibling via SHA-1
+        // over the Google Photos record (`/Photos from 2025`).
+        let matched = db
+            .find_file_for_immich_asset("asset-shared-uuid", None, "shared.jpg")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.parent_path, "/업무자료/시안");
+
+        // Healing placeholder `remote_target_id` persists the real UUID to SQLite.
+        let healed = db
+            .heal_immich_remote_target_ids(&[(
+                "takeout".to_string(),
+                "Takeout/드라이브/업무자료/시안/shared.jpg".to_string(),
+                "asset-shared-uuid".to_string(),
+            )])
+            .await
+            .unwrap();
+        assert_eq!(healed, 1);
+
+        // Reclassifying the Google Drive row and its siblings updates both `shared.jpg` rows to Nextcloud.
+        db.update_file_reclassified(
+            "takeout",
+            "Takeout/드라이브/업무자료/시안/shared.jpg",
+            "shared.jpg",
+            TargetType::Nextcloud,
+            "/GoogleDrive/업무자료/시안/shared.jpg",
+            "sha1_shared",
+            1000,
+            "created",
+        )
+        .await
+        .unwrap();
+        let siblings = db
+            .reclassify_sibling_immich_records(
+                "asset-shared-uuid",
+                "sha1_shared",
+                TargetType::Nextcloud,
+                "/GoogleDrive/업무자료/시안/shared.jpg",
+            )
+            .await
+            .unwrap();
+        assert_eq!(siblings, 1);
+        assert_eq!(db.count_gdrive_immich_staging_candidates().await.unwrap(), 1);
     }
 }

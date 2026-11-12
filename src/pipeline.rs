@@ -1464,6 +1464,200 @@ pub async fn run_repair_nextcloud_anomalies_with_limit(
     Ok(repaired_count)
 }
 
+fn is_valid_immich_asset_id(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty()
+        || trimmed == "existing_immich_asset"
+        || trimmed == "immich_uploaded_id"
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+pub async fn run_stage_gdrive_to_immich_album(
+    state: Arc<AppState>,
+    config: AppConfig,
+    album_name: &str,
+) -> Result<u64> {
+    run_stage_gdrive_to_immich_album_with_limit(state, config, album_name, None).await
+}
+
+pub async fn run_stage_gdrive_to_immich_album_with_limit(
+    state: Arc<AppState>,
+    config: AppConfig,
+    album_name: &str,
+    limit: Option<u64>,
+) -> Result<u64> {
+    if config.immich_url.trim().is_empty() || config.immich_api_key.trim().is_empty() {
+        return Err(anyhow!(
+            "Immich 서버 URL 또는 API Key가 설정되지 않았습니다."
+        ));
+    }
+
+    let mut candidates = state.db.get_gdrive_immich_staging_candidates().await?;
+    if let Some(n) = limit.filter(|&n| n > 0) {
+        candidates.truncate(n as usize);
+    }
+    if candidates.is_empty() {
+        state
+            .finish_job(
+                "repair",
+                "[Google Drive 앨범 수집] DB에서 Google Drive 출신으로 식별된 Immich 항목이 0건입니다.",
+            )
+            .await;
+        return Ok(0);
+    }
+
+    state
+        .begin_phase("repair", JobState::Syncing, candidates.len() as u64)
+        .await;
+    state
+        .emit_event(
+            "repair",
+            JobState::Syncing,
+            None,
+            format!(
+                "[Google Drive 앨범 수집] Google Drive 출신 Immich 항목 {}건을 '{}' 앨범으로 모으는 중...",
+                candidates.len(),
+                album_name
+            ),
+        )
+        .await;
+
+    let target_limiter =
+        RateLimiter::new((config.rate_limit_rps * 10.0).max(50.0), config.max_retries);
+    let immich_target = ImmichTarget::new(
+        config.immich_url.clone(),
+        config.immich_api_key.clone(),
+        target_limiter,
+    );
+
+    let album_id = immich_target.ensure_album_by_name(album_name).await?;
+
+    // Resolve placeholder/missing remote_target_id via bulk hash check when sha1_hash is available
+    let mut unresolved_hashes: Vec<(String, String)> = Vec::new();
+    for file in &candidates {
+        if is_valid_immich_asset_id(file.remote_target_id.as_deref()).is_none() {
+            if let Some(ref sha1) = file.sha1_hash {
+                if !sha1.trim().is_empty() {
+                    unresolved_hashes.push((file.resource_id.clone(), sha1.trim().to_string()));
+                }
+            }
+        }
+    }
+
+    let mut resolved_by_resource: HashMap<String, String> = HashMap::new();
+    for chunk in unresolved_hashes.chunks(500) {
+        if state.is_stopping() {
+            break;
+        }
+        match immich_target.check_bulk_hashes(chunk).await {
+            Ok(map) => {
+                for (res_id, opt_asset_id) in map {
+                    if let Some(valid_id) = is_valid_immich_asset_id(opt_asset_id.as_deref()) {
+                        resolved_by_resource.insert(res_id, valid_id);
+                    }
+                }
+            }
+            Err(err) => {
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        None,
+                        format!(
+                            "[Google Drive 앨범 수집] Immich 해시 일괄 조회 실패: {}",
+                            err
+                        ),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    if !resolved_by_resource.is_empty() {
+        let healed_triples: Vec<(String, String, String)> = candidates
+            .iter()
+            .filter_map(|file| {
+                resolved_by_resource
+                    .get(&file.resource_id)
+                    .map(|asset_id| {
+                        (
+                            file.source_type.clone(),
+                            file.resource_id.clone(),
+                            asset_id.clone(),
+                        )
+                    })
+            })
+            .collect();
+        let _ = state.db.heal_immich_remote_target_ids(&healed_triples).await;
+    }
+
+    let mut unique_asset_ids: Vec<String> = Vec::new();
+    let mut seen_asset_ids = std::collections::HashSet::new();
+    let mut staged_records = 0u64;
+
+    for file in &candidates {
+        if state.is_stopping() {
+            break;
+        }
+        let resolved_id = is_valid_immich_asset_id(file.remote_target_id.as_deref())
+            .or_else(|| resolved_by_resource.get(&file.resource_id).cloned());
+
+        match resolved_id {
+            Some(asset_id) => {
+                staged_records += 1;
+                if seen_asset_ids.insert(asset_id.clone()) {
+                    unique_asset_ids.push(asset_id);
+                }
+            }
+            None => {
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(file.name.clone()),
+                        format!(
+                            "[Google Drive 앨범 수집] Immich 자산 ID를 확인할 수 없어 건너뜀: {}/{}",
+                            file.parent_path.trim_end_matches('/'),
+                            file.name
+                        ),
+                    )
+                    .await;
+            }
+        }
+        state.processed_files.fetch_add(1, Ordering::SeqCst);
+    }
+
+    for chunk in unique_asset_ids.chunks(500) {
+        if state.is_stopping() {
+            break;
+        }
+        immich_target.add_assets_to_album(&album_id, chunk).await?;
+    }
+
+    let album_url = format!(
+        "{}/albums/{}",
+        config.immich_url.trim_end_matches('/'),
+        album_id
+    );
+    state
+        .finish_job(
+            "repair",
+            format!(
+                "[Google Drive 앨범 수집] '{}' 앨범에 Google Drive 출신 항목 {}건(고유 자산 {}개) 담기 완료 — 앨범에서 남길 사진을 뺀 뒤 2단계 이동을 실행하세요 (확인: {})",
+                album_name,
+                staged_records,
+                unique_asset_ids.len(),
+                album_url
+            ),
+        )
+        .await;
+
+    Ok(staged_records)
+}
+
 pub async fn run_move_immich_album_to_nextcloud(
     state: Arc<AppState>,
     config: AppConfig,
@@ -1702,6 +1896,15 @@ pub async fn run_move_immich_album_to_nextcloud_with_limit(
                 )
                 .await?;
         }
+        state
+            .db
+            .reclassify_sibling_immich_records(
+                &asset.id,
+                &downloaded.sha1_hash,
+                TargetType::Nextcloud,
+                &outcome.remote_target_id,
+            )
+            .await?;
 
         moved_count += 1;
         state.processed_files.fetch_add(1, Ordering::SeqCst);

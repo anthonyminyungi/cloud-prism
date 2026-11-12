@@ -1394,3 +1394,163 @@ async fn test_post_migration_repair_and_album_pinpoint_move() {
     assert_eq!(gdrive_stats.uploaded_nextcloud, 1);
     assert_eq!(gdrive_stats.uploaded_immich_created, 0);
 }
+
+#[tokio::test]
+async fn test_stage_gdrive_origin_immich_assets_to_album_auto_creates_and_filters_only_drive() {
+    use mybox_immich_sync::db::FileUpsert;
+    use mybox_immich_sync::pipeline::run_stage_gdrive_to_immich_album;
+    use wiremock::matchers::body_json;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_stage_gdrive_album.db");
+
+    // 1. GET /api/albums returns empty list -> triggers auto-creation via POST /api/albums
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .and(body_json(json!({ "albumName": "to-nextcloud" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "created-album-99",
+            "albumName": "to-nextcloud",
+            "assetCount": 0
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 2. Placeholder `existing_immich_asset` is resolved via POST /api/assets/bulk-upload-check
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                {
+                    "id": "Takeout/Drive/Shared/dup.jpg",
+                    "action": "reject",
+                    "assetId": "asset-dup-resolved"
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 3. PUT /api/albums/created-album-99/assets receives ONLY the 2 Google Drive assets (ordered by parent_path)
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/created-album-99/assets"))
+        .and(body_json(json!({
+            "ids": ["asset-dup-resolved", "asset-diagram-1"]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_key".to_string(),
+        rate_limit_rps: 100.0,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    db.upsert_files(&[
+        // Takeout Google Photos entry -> must NOT be added to album
+        FileUpsert {
+            source_type: "takeout".to_string(),
+            resource_id: "Takeout/Google 포토/Photos from 2025/photo_only.jpg".to_string(),
+            name: "photo_only.jpg".to_string(),
+            parent_path: "/Photos from 2025".to_string(),
+            size: 100,
+            created_time: "2025-01-01T00:00:00Z".to_string(),
+            modified_time: "2025-01-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: Some("sha_photo".to_string()),
+        },
+        // Takeout Google Drive entry (created) -> MUST be added
+        FileUpsert {
+            source_type: "takeout".to_string(),
+            resource_id: "Takeout/드라이브/업무/diagram.png".to_string(),
+            name: "diagram.png".to_string(),
+            parent_path: "/업무".to_string(),
+            size: 200,
+            created_time: "2025-02-01T00:00:00Z".to_string(),
+            modified_time: "2025-02-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: Some("sha_diagram".to_string()),
+        },
+        // Takeout Google Drive entry (duplicate with placeholder ID) -> MUST be resolved and added
+        FileUpsert {
+            source_type: "takeout".to_string(),
+            resource_id: "Takeout/Drive/Shared/dup.jpg".to_string(),
+            name: "dup.jpg".to_string(),
+            parent_path: "/Shared".to_string(),
+            size: 300,
+            created_time: "2025-03-01T00:00:00Z".to_string(),
+            modified_time: "2025-03-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: Some("sha_dup".to_string()),
+        },
+    ])
+    .await
+    .unwrap();
+
+    db.mark_file_uploaded(
+        "takeout",
+        "Takeout/Google 포토/Photos from 2025/photo_only.jpg",
+        "sha_photo",
+        "asset-gphotos-only",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "takeout",
+        "Takeout/드라이브/업무/diagram.png",
+        "sha_diagram",
+        "asset-diagram-1",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "takeout",
+        "Takeout/Drive/Shared/dup.jpg",
+        "sha_dup",
+        "existing_immich_asset",
+        "duplicate",
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::new(db, cfg.clone());
+    let staged = run_stage_gdrive_to_immich_album(state.clone(), cfg, "to-nextcloud")
+        .await
+        .unwrap();
+    assert_eq!(staged, 2);
+
+    // Non-destructive: records remain target_type = "immich" until user runs step 2,
+    // and placeholder `remote_target_id` on `dup.jpg` was healed in SQLite to `"asset-dup-resolved"`
+    let takeout_stats = state.db.get_stats("takeout").await.unwrap();
+    assert_eq!(takeout_stats.uploaded_immich_created, 2);
+    assert_eq!(takeout_stats.uploaded_immich_duplicate, 1);
+    assert_eq!(takeout_stats.uploaded_nextcloud, 0);
+
+    let healed_dup = state
+        .db
+        .find_file_for_immich_asset("asset-dup-resolved", None, "dup.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(healed_dup.resource_id, "Takeout/Drive/Shared/dup.jpg");
+    assert_eq!(
+        healed_dup.remote_target_id.as_deref(),
+        Some("asset-dup-resolved")
+    );
+}
