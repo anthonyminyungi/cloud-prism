@@ -1,8 +1,9 @@
 use crate::config::SettingsUpdateRequest;
 use crate::limiter::{format_error_chain, RateLimiter};
 use crate::pipeline::{
-    build_source_provider, build_target_providers, run_move_immich_album_to_nextcloud_with_limit,
-    run_repair_nextcloud_anomalies_with_limit, SyncPipeline,
+    build_source_provider, build_target_providers, run_merge_immich_duplicates_with_limit,
+    run_move_immich_album_to_nextcloud_with_limit, run_repair_nextcloud_anomalies_with_limit,
+    SyncPipeline,
 };
 use crate::router::{SourceType, TargetType};
 use crate::sources::sanitize_filename;
@@ -1092,6 +1093,7 @@ async fn retry_failed(
 pub enum RepairMode {
     Anomalies,
     AlbumToNextcloud,
+    ImmichDuplicates,
     All,
 }
 
@@ -1100,6 +1102,8 @@ struct StartRepairRequest {
     mode: RepairMode,
     #[serde(default)]
     album_name: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
     #[serde(default)]
     limit: Option<u64>,
 }
@@ -1116,12 +1120,22 @@ async fn start_repair_job(
         .filter(|s| !s.is_empty())
         .unwrap_or("to-nextcloud")
         .to_string();
+    let dry_run = req.dry_run;
     let limit = req.limit.filter(|&n| n > 0);
 
     if matches!(req.mode, RepairMode::AlbumToNextcloud | RepairMode::All) && !cfg.enable_nextcloud {
         return error_response(
             StatusCode::BAD_REQUEST,
             "Nextcloud 연동이 활성화되어 있지 않습니다. 설정 탭에서 Nextcloud를 먼저 활성화해 주세요.",
+        );
+    }
+
+    if matches!(req.mode, RepairMode::ImmichDuplicates)
+        && (cfg.immich_url.trim().is_empty() || cfg.immich_api_key.trim().is_empty())
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Immich 서버 URL 또는 API Key가 설정되어 있지 않습니다.",
         );
     }
 
@@ -1158,6 +1172,10 @@ async fn start_repair_job(
                     limit,
                 )
                 .await
+            }
+            RepairMode::ImmichDuplicates => {
+                run_merge_immich_duplicates_with_limit(state_clone.clone(), cfg, dry_run, limit)
+                    .await
             }
             RepairMode::All => {
                 state_clone.batch_active.store(true, Ordering::SeqCst);
@@ -1208,6 +1226,7 @@ async fn start_repair_job(
             "started": true,
             "mode": req.mode,
             "album_name": album_name,
+            "dry_run": dry_run,
             "limit": limit
         })),
     )
@@ -1296,6 +1315,7 @@ mod tests {
 
         // 2. Check POST /api/jobs/repair rejects album_to_nextcloud when Nextcloud is disabled
         let resp2 = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1313,5 +1333,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+
+        // 3. Check POST /api/jobs/repair rejects immich_duplicates when Immich is unconfigured
+        let resp3 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs/repair")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "mode": "immich_duplicates",
+                            "dry_run": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp3.status(), StatusCode::BAD_REQUEST);
     }
 }

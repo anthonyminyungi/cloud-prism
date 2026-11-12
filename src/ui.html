@@ -866,7 +866,7 @@
             <span class="role-tag">마이그레이션 완료 후 보정</span>
           </div>
           <div class="action-toolbar">
-            <button id="btnRepairAll" class="btn" onclick="startRepairJob('all')">전체 일괄 보정 실행</button>
+            <button id="btnRepairAll" class="btn" onclick="startRepairJob('all')">1·2번 일괄 보정 실행</button>
           </div>
         </div>
         <div class="integration-body">
@@ -883,10 +883,20 @@
               <div class="s-metric-label">2. Immich 특정 앨범 → Nextcloud 원래 폴더로 핀포인트 이동</div>
               <div style="display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap: wrap;">
                 <input id="repairAlbumInput" type="text" class="input-text mono" value="to-nextcloud" placeholder="to-nextcloud" style="max-width: 180px;" />
-                <button id="btnRepairAlbum" class="btn btn-primary" onclick="startRepairJob('album_to_nextcloud')">앨범 항목 → Nextcloud 원래 폴더로 이동</button>
+                <button id="btnRepairAlbum" class="btn btn-primary" onclick="startRepairJob('album_to_nextcloud', false)">앨범 항목 → Nextcloud 원래 폴더로 이동</button>
               </div>
               <div class="s-metric-sub" style="margin-top: 6px;">
                 <span>Immich에서 옮길 이미지를 앨범(기본 <span class="mono">to-nextcloud</span>)에 담은 뒤 실행하세요.</span>
+              </div>
+            </div>
+            <div class="s-metric" style="border: 1px solid var(--border); border-radius: 6px; grid-column: 1 / -1;">
+              <div class="s-metric-label">3. Immich 중복 사진 스마트 병합 (원본 화질 유지 + 촬영일·앨범·GPS·태그·라이브포토 통합)</div>
+              <div style="display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap: wrap;">
+                <button id="btnMergeDupDryRun" class="btn" onclick="startRepairJob('immich_duplicates', true)">1단계: 병합 Dry-run (미리보기)</button>
+                <button id="btnMergeDupExecute" class="btn btn-primary" onclick="startRepairJob('immich_duplicates', false)">2단계: 메타데이터 병합 후 중복 휴지통 이동</button>
+              </div>
+              <div class="s-metric-sub" style="margin-top: 6px;">
+                <span>해상도·포맷 등급(<span class="mono">RAW &gt; HEIC &gt; PNG &gt; JPG</span>)·용량 기준 최적 원본(Winner)을 남기고 가장 오래된 촬영일·앨범·GPS·태그를 흡수한 뒤 중복본만 Immich 휴지통으로 이동합니다. (연속 촬영 사진은 자동 보호)</span>
               </div>
             </div>
           </div>
@@ -1555,9 +1565,13 @@
       const btnAnomalies = document.getElementById('btnRepairAnomalies');
       const btnAlbum = document.getElementById('btnRepairAlbum');
       const btnAll = document.getElementById('btnRepairAll');
+      const btnMergeDupDryRun = document.getElementById('btnMergeDupDryRun');
+      const btnMergeDupExecute = document.getElementById('btnMergeDupExecute');
       if (btnAnomalies) btnAnomalies.disabled = !isIdle;
       if (btnAlbum) btnAlbum.disabled = !isIdle;
       if (btnAll) btnAll.disabled = !isIdle;
+      if (btnMergeDupDryRun) btnMergeDupDryRun.disabled = !isIdle;
+      if (btnMergeDupExecute) btnMergeDupExecute.disabled = !isIdle;
 
       const globalBtn = document.getElementById('globalSyncBtn');
       if (!isIdle) {
@@ -1844,14 +1858,14 @@
       fetchStatus();
     }
 
-    async function startRepairJob(mode) {
+    async function startRepairJob(mode, dryRun = false) {
       const albumInput = document.getElementById('repairAlbumInput');
       const album_name = (albumInput && albumInput.value ? albumInput.value.trim() : 'to-nextcloud') || 'to-nextcloud';
       const limit = getSelectedSampleLimit();
       const res = await fetch('/api/jobs/repair', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode, album_name, limit })
+        body: JSON.stringify({ mode, album_name, dry_run: Boolean(dryRun), limit })
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {

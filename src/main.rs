@@ -4,8 +4,8 @@ use comfy_table::Table;
 use mybox_immich_sync::config::AppConfig;
 use mybox_immich_sync::db::CheckpointDB;
 use mybox_immich_sync::pipeline::{
-    run_move_immich_album_to_nextcloud_with_limit, run_repair_nextcloud_anomalies_with_limit,
-    spawn_auto_sync_scheduler, SyncPipeline,
+    run_merge_immich_duplicates_with_limit, run_move_immich_album_to_nextcloud_with_limit,
+    run_repair_nextcloud_anomalies_with_limit, spawn_auto_sync_scheduler, SyncPipeline,
 };
 use mybox_immich_sync::state::AppState;
 use mybox_immich_sync::web::{build_router, verify_all_configured};
@@ -61,10 +61,14 @@ enum Commands {
         #[arg(long, default_value = "mybox")]
         source: String,
     },
-    /// Post-migration repair: recover Nextcloud livephoto.zip & (null) files and move Immich album items to Nextcloud
+    /// Post-migration repair: recover Nextcloud livephoto.zip & (null) files, move Immich album items, or smart-merge Immich duplicates
     Repair {
         #[arg(long, default_value = "to-nextcloud")]
         album: String,
+        #[arg(long, default_value_t = false)]
+        merge_duplicates: bool,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
         #[arg(long)]
         limit: Option<u64>,
     },
@@ -142,19 +146,34 @@ async fn main() -> Result<()> {
             table.add_row(vec!["실패 항목 (FAILED)", &stats.failed_files.to_string()]);
             println!("{table}");
         }
-        Commands::Repair { album, limit } => {
-            let repaired =
-                run_repair_nextcloud_anomalies_with_limit(state.clone(), cfg.clone(), limit)
-                    .await?;
-            let moved = if cfg.enable_nextcloud {
-                run_move_immich_album_to_nextcloud_with_limit(state, cfg, &album, limit).await?
+        Commands::Repair {
+            album,
+            merge_duplicates,
+            dry_run,
+            limit,
+        } => {
+            if merge_duplicates {
+                let merged =
+                    run_merge_immich_duplicates_with_limit(state, cfg, dry_run, limit).await?;
+                println!(
+                    "Duplicate smart-merge (dry_run={}) completed: groups_merged={}",
+                    dry_run, merged
+                );
             } else {
-                0
-            };
-            println!(
-                "Repair completed: anomalies_repaired={}, album_moved={}",
-                repaired, moved
-            );
+                let repaired =
+                    run_repair_nextcloud_anomalies_with_limit(state.clone(), cfg.clone(), limit)
+                        .await?;
+                let moved = if cfg.enable_nextcloud {
+                    run_move_immich_album_to_nextcloud_with_limit(state, cfg, &album, limit)
+                        .await?
+                } else {
+                    0
+                };
+                println!(
+                    "Repair completed: anomalies_repaired={}, album_moved={}",
+                    repaired, moved
+                );
+            }
         }
     }
 

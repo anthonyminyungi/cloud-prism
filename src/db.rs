@@ -912,4 +912,116 @@ impl CheckpointDB {
             .await?;
         Ok(())
     }
+
+    pub async fn remap_merged_immich_assets(
+        &self,
+        loser_asset_ids: &[String],
+        loser_device_asset_ids: &[String],
+        winner_asset_id: &str,
+        winner_sha1_hex: Option<&str>,
+    ) -> Result<u64> {
+        let clean_loser_ids: Vec<String> = loser_asset_ids
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let clean_dev_ids: Vec<String> = loser_device_asset_ids
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split_once('#').map(|(base, _)| base).unwrap_or(s).to_string())
+            .collect();
+
+        if clean_loser_ids.is_empty() && clean_dev_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut cond = sea_orm::Condition::any();
+        if !clean_loser_ids.is_empty() {
+            cond = cond.add(file_entity::Column::RemoteTargetId.is_in(clean_loser_ids));
+        }
+        if !clean_dev_ids.is_empty() {
+            cond = cond.add(file_entity::Column::ResourceId.is_in(clean_dev_ids));
+        }
+
+        let mut update = file_entity::Entity::update_many()
+            .col_expr(
+                file_entity::Column::RemoteTargetId,
+                Expr::value(Some(winner_asset_id.to_string())),
+            )
+            .col_expr(
+                file_entity::Column::SyncResult,
+                Expr::value(Some(SyncResultKind::Duplicate.as_str().to_string())),
+            )
+            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now));
+
+        if let Some(sha1) = winner_sha1_hex.map(str::trim).filter(|s| !s.is_empty()) {
+            update = update.col_expr(
+                file_entity::Column::Sha1Hash,
+                Expr::value(Some(sha1.to_string())),
+            );
+        }
+
+        let res = update
+            .filter(file_entity::Column::TargetType.eq(TargetType::Immich.as_str()))
+            .filter(cond)
+            .exec(&self.conn)
+            .await?;
+
+        Ok(res.rows_affected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_remap_merged_immich_assets_updates_target_id_and_sha1() {
+        let db = CheckpointDB::connect(":memory:").await.unwrap();
+        db.upsert_files(&[FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "mybox_res_9112".to_string(),
+            name: "IMG_9112.HEIC".to_string(),
+            parent_path: "/2023/10".to_string(),
+            size: 1851777,
+            created_time: "2023-10-25T05:12:30Z".to_string(),
+            modified_time: "2023-10-25T05:12:30Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: Some("old_loser_sha1".to_string()),
+        }])
+        .await
+        .unwrap();
+
+        db.mark_file_uploaded(
+            "mybox",
+            "mybox_res_9112",
+            "old_loser_sha1",
+            "asset-mybox-loser",
+            SyncResultKind::Created.as_str(),
+        )
+        .await
+        .unwrap();
+
+        let affected = db
+            .remap_merged_immich_assets(
+                &["asset-mybox-loser".to_string()],
+                &["mybox_res_9112".to_string()],
+                "asset-icloud-winner",
+                Some("new_winner_sha1_hex"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = db.get_uploaded_files_for_delete("mybox", 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].remote_target_id.as_deref(),
+            Some("asset-icloud-winner")
+        );
+        assert_eq!(rows[0].sha1_hash.as_deref(), Some("new_winner_sha1_hex"));
+        assert_eq!(rows[0].sync_result.as_deref(), Some("duplicate"));
+    }
 }

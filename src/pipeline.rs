@@ -11,7 +11,9 @@ use crate::sources::mybox::MyboxProvider;
 use crate::sources::takeout::{list_takeout_archives, GoogleTakeoutProvider};
 use crate::sources::{try_extract_livephoto_zip, SourceProvider};
 use crate::state::{AppState, JobState};
-use crate::targets::immich::ImmichTarget;
+use crate::targets::immich::{
+    decode_immich_checksum_to_hex, evaluate_duplicate_group, DuplicateGroupEvaluation, ImmichTarget,
+};
 use crate::targets::nextcloud::NextcloudTarget;
 use crate::targets::{TargetProvider, UploadContext, UploadOutcome};
 use anyhow::{anyhow, Result};
@@ -1729,6 +1731,444 @@ pub async fn run_move_immich_album_to_nextcloud_with_limit(
     Ok(moved_count)
 }
 
+pub async fn run_merge_immich_duplicates(
+    state: Arc<AppState>,
+    config: AppConfig,
+    dry_run: bool,
+) -> Result<u64> {
+    run_merge_immich_duplicates_with_limit(state, config, dry_run, None).await
+}
+
+pub async fn run_merge_immich_duplicates_with_limit(
+    state: Arc<AppState>,
+    config: AppConfig,
+    dry_run: bool,
+    limit: Option<u64>,
+) -> Result<u64> {
+    if config.immich_url.trim().is_empty() || config.immich_api_key.trim().is_empty() {
+        return Err(anyhow!(
+            "Immich 서버 URL 또는 API Key가 설정되지 않았습니다."
+        ));
+    }
+
+    let target_limiter =
+        RateLimiter::new((config.rate_limit_rps * 10.0).max(50.0), config.max_retries);
+    let immich_target = ImmichTarget::new(
+        config.immich_url.clone(),
+        config.immich_api_key.clone(),
+        target_limiter,
+    );
+
+    let mut groups = immich_target.get_duplicates().await?;
+    if groups.is_empty() {
+        state
+            .finish_job(
+                "repair",
+                "[중복 스마트 병합] Immich에서 감지된 중복 사진 그룹이 없습니다.",
+            )
+            .await;
+        return Ok(0);
+    }
+
+    if let Some(n) = limit.filter(|&n| n > 0) {
+        groups.truncate(n as usize);
+    }
+
+    let mode_tag = if dry_run {
+        "중복 스마트 병합 Dry-Run"
+    } else {
+        "중복 스마트 병합"
+    };
+
+    state
+        .begin_phase("repair", JobState::Syncing, groups.len() as u64)
+        .await;
+    state
+        .emit_event(
+            "repair",
+            JobState::Syncing,
+            None,
+            format!(
+                "[{}] Immich 중복 그룹 {}건 분석 및 선택적 메타데이터 병합을 시작합니다.",
+                mode_tag,
+                groups.len()
+            ),
+        )
+        .await;
+
+    let all_albums = immich_target.list_all_albums().await?;
+    let has_non_empty_albums = !all_albums.is_empty();
+
+    let mut merged_groups = 0u64;
+    let mut skipped_burst_groups = 0u64;
+    let mut trashed_assets = 0u64;
+
+    for group in groups {
+        if state.is_stopping() {
+            break;
+        }
+
+        let eval = evaluate_duplicate_group(&group);
+        let plan = match eval {
+            DuplicateGroupEvaluation::SkippedInsufficientAssets => {
+                state.processed_files.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            DuplicateGroupEvaluation::SkippedBurst { reason, .. } => {
+                skipped_burst_groups += 1;
+                state.processed_files.fetch_add(1, Ordering::SeqCst);
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        None,
+                        format!("[{}] 자동 보호 (Skip): {}", mode_tag, reason),
+                    )
+                    .await;
+                continue;
+            }
+            DuplicateGroupEvaluation::Merge(p) => p,
+        };
+
+        let mut albums_to_join: Vec<(String, String)> = Vec::new();
+        if has_non_empty_albums {
+            let winner_albums = match immich_target.get_albums_for_asset(&plan.winner.id).await {
+                Ok(list) => list,
+                Err(err) => {
+                    state
+                        .emit_event(
+                            "repair",
+                            JobState::Syncing,
+                            Some(plan.winner.original_file_name.clone()),
+                            format!(
+                                "[{}] Winner 소속 앨범 조회 실패로 삭제 보류 ({}): {}",
+                                mode_tag, plan.winner.original_file_name, err
+                            ),
+                        )
+                        .await;
+                    state.processed_files.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+            };
+
+            let mut seen_album_ids: std::collections::HashSet<String> = winner_albums
+                .into_iter()
+                .map(|a| a.id.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let mut album_query_failed = false;
+            for loser in &plan.losers {
+                match immich_target.get_albums_for_asset(&loser.id).await {
+                    Ok(loser_albums) => {
+                        for album in loser_albums {
+                            let aid = album.id.trim().to_string();
+                            if !aid.is_empty() && seen_album_ids.insert(aid.clone()) {
+                                albums_to_join.push((aid, album.album_name));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        album_query_failed = true;
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(loser.original_file_name.clone()),
+                                format!(
+                                    "[{}] 중복본 소속 앨범 조회 실패로 삭제 보류 ({}): {}",
+                                    mode_tag, loser.original_file_name, err
+                                ),
+                            )
+                            .await;
+                        break;
+                    }
+                }
+            }
+            if album_query_failed {
+                state.processed_files.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+        }
+
+        let mut absorbed_parts: Vec<String> = Vec::new();
+        if let Some(ref dt) = plan.metadata_update.date_time_original {
+            absorbed_parts.push(format!("촬영일={}", &dt[..dt.len().min(19)]));
+        }
+        if let Some(ref tz) = plan.metadata_update.time_zone {
+            absorbed_parts.push(format!("시간대={}", tz));
+        }
+        if !albums_to_join.is_empty() {
+            let names: Vec<&str> = albums_to_join.iter().map(|(_, n)| n.as_str()).collect();
+            absorbed_parts.push(format!("앨범 {}개({})", albums_to_join.len(), names.join(", ")));
+        }
+        if !plan.tag_ids_to_add.is_empty() {
+            absorbed_parts.push(format!("태그 {}개", plan.tag_ids_to_add.len()));
+        }
+        if plan.metadata_update.latitude.is_some() && plan.metadata_update.longitude.is_some() {
+            absorbed_parts.push("GPS 좌표".to_string());
+        }
+        if plan.metadata_update.is_favorite == Some(true) {
+            absorbed_parts.push("즐겨찾기".to_string());
+        }
+        if plan.metadata_update.visibility.as_deref() == Some("archive") {
+            absorbed_parts.push("보관함".to_string());
+        }
+        if plan.metadata_update.description.is_some() {
+            absorbed_parts.push("설명".to_string());
+        }
+        if plan.metadata_update.rating.is_some() {
+            absorbed_parts.push("별점".to_string());
+        }
+        if plan.merged_live_photo_video_id.is_some() {
+            absorbed_parts.push("라이브포토 영상".to_string());
+        }
+
+        let absorbed_summary = if absorbed_parts.is_empty() {
+            "Winner에 이미 모든 최신/최적 메타데이터 보유".to_string()
+        } else {
+            format!("흡수 병합: {}", absorbed_parts.join(", "))
+        };
+
+        let winner_mb = plan
+            .winner
+            .exif_info
+            .as_ref()
+            .and_then(|e| e.file_size_in_byte)
+            .unwrap_or(0) as f64
+            / (1024.0 * 1024.0);
+        let loser_names: Vec<&str> = plan
+            .losers
+            .iter()
+            .map(|l| l.original_file_name.as_str())
+            .collect();
+
+        if dry_run {
+            merged_groups += 1;
+            trashed_assets += plan.loser_ids.len() as u64;
+            state.processed_files.fetch_add(1, Ordering::SeqCst);
+            state
+                .emit_event(
+                    "repair",
+                    JobState::Syncing,
+                    Some(plan.winner.original_file_name.clone()),
+                    format!(
+                        "[{}] 유지: {} ({:.2} MB) | {} | 휴지통 이동 예정: {}건 ({})",
+                        mode_tag,
+                        plan.winner.original_file_name,
+                        winner_mb,
+                        absorbed_summary,
+                        plan.loser_ids.len(),
+                        loser_names.join(", ")
+                    ),
+                )
+                .await;
+            continue;
+        }
+
+        if plan.metadata_update.has_updates() {
+            if let Err(err) = immich_target
+                .update_asset_metadata(&plan.metadata_update)
+                .await
+            {
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(plan.winner.original_file_name.clone()),
+                        format!(
+                            "[{}] 메타데이터 병합 실패로 삭제 보류 ({}): {}",
+                            mode_tag, plan.winner.original_file_name, err
+                        ),
+                    )
+                    .await;
+                state.processed_files.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+        }
+
+        if let Some(ref vid_id) = plan.merged_live_photo_video_id {
+            if let Err(err) = immich_target
+                .link_live_photo_video(&plan.winner.id, vid_id)
+                .await
+            {
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(plan.winner.original_file_name.clone()),
+                        format!(
+                            "[{}] 라이브포토 영상 연결 실패로 삭제 보류 ({}): {}",
+                            mode_tag, plan.winner.original_file_name, err
+                        ),
+                    )
+                    .await;
+                state.processed_files.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+        }
+
+        let mut album_transfer_failed = false;
+        for (album_id, album_name) in &albums_to_join {
+            if let Err(err) = immich_target
+                .add_assets_to_album(album_id, std::slice::from_ref(&plan.winner.id))
+                .await
+            {
+                album_transfer_failed = true;
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(plan.winner.original_file_name.clone()),
+                        format!(
+                            "[{}] 앨범('{}') 편입 실패로 삭제 보류 ({}): {}",
+                            mode_tag, album_name, plan.winner.original_file_name, err
+                        ),
+                    )
+                    .await;
+                break;
+            }
+        }
+        if album_transfer_failed {
+            state.processed_files.fetch_add(1, Ordering::SeqCst);
+            continue;
+        }
+
+        let mut tag_transfer_failed = false;
+        for tag_id in &plan.tag_ids_to_add {
+            if let Err(err) = immich_target
+                .add_assets_to_tag(tag_id, std::slice::from_ref(&plan.winner.id))
+                .await
+            {
+                tag_transfer_failed = true;
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(plan.winner.original_file_name.clone()),
+                        format!(
+                            "[{}] 태그 편입 실패로 삭제 보류 ({}): {}",
+                            mode_tag, plan.winner.original_file_name, err
+                        ),
+                    )
+                    .await;
+                break;
+            }
+        }
+        if tag_transfer_failed {
+            state.processed_files.fetch_add(1, Ordering::SeqCst);
+            continue;
+        }
+
+        let mut unlink_failed = false;
+        for loser_id in &plan.loser_ids_to_unlink_live_video {
+            if let Err(err) = immich_target.unlink_live_photo_video(loser_id).await {
+                unlink_failed = true;
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(plan.winner.original_file_name.clone()),
+                        format!(
+                            "[{}] 중복본 라이브포토 연결 해제 실패로 삭제 보류 ({}): {}",
+                            mode_tag, plan.winner.original_file_name, err
+                        ),
+                    )
+                    .await;
+                break;
+            }
+        }
+        if unlink_failed {
+            state.processed_files.fetch_add(1, Ordering::SeqCst);
+            continue;
+        }
+
+        if let Err(err) = immich_target.trash_assets(&plan.loser_ids).await {
+            state
+                .emit_event(
+                    "repair",
+                    JobState::Syncing,
+                    Some(plan.winner.original_file_name.clone()),
+                    format!(
+                        "[{}] 중복본 휴지통 이동 실패 ({}): {}",
+                        mode_tag, plan.winner.original_file_name, err
+                    ),
+                )
+                .await;
+            state.processed_files.fetch_add(1, Ordering::SeqCst);
+            continue;
+        }
+
+        let loser_device_ids: Vec<String> = plan
+            .losers
+            .iter()
+            .filter_map(|l| l.device_asset_id.clone())
+            .collect();
+        let winner_sha1_hex = decode_immich_checksum_to_hex(plan.winner.checksum.as_deref());
+        if let Err(err) = state
+            .db
+            .remap_merged_immich_assets(
+                &plan.loser_ids,
+                &loser_device_ids,
+                &plan.winner.id,
+                winner_sha1_hex.as_deref(),
+            )
+            .await
+        {
+            state
+                .emit_event(
+                    "repair",
+                    JobState::Syncing,
+                    Some(plan.winner.original_file_name.clone()),
+                    format!(
+                        "[{}] 로컬 DB 매핑 갱신 경고 ({}): {}",
+                        mode_tag, plan.winner.original_file_name, err
+                    ),
+                )
+                .await;
+        }
+
+        merged_groups += 1;
+        trashed_assets += plan.loser_ids.len() as u64;
+        state.processed_files.fetch_add(1, Ordering::SeqCst);
+        state
+            .emit_event(
+                "repair",
+                JobState::Syncing,
+                Some(plan.winner.original_file_name.clone()),
+                format!(
+                    "[{}] 병합 완료: {} ({:.2} MB) 유지 | {} | 중복 {}건 휴지통 이동",
+                    mode_tag,
+                    plan.winner.original_file_name,
+                    winner_mb,
+                    absorbed_summary,
+                    plan.loser_ids.len()
+                ),
+            )
+            .await;
+    }
+
+    state
+        .finish_job(
+            "repair",
+            format!(
+                "[{}] 완료 — 병합 {}그룹 (중복 자산 {}건 {}) · 연속 촬영 자동 보호 {}그룹",
+                mode_tag,
+                merged_groups,
+                trashed_assets,
+                if dry_run {
+                    "휴지통 이동 예정"
+                } else {
+                    "휴지통 이동됨"
+                },
+                skipped_burst_groups
+            ),
+        )
+        .await;
+
+    Ok(merged_groups)
+}
+
 pub fn spawn_auto_sync_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
@@ -1837,5 +2277,23 @@ mod tests {
 
         let count = run_repair_nextcloud_anomalies(state, cfg).await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_merge_immich_duplicates_requires_configured_immich() {
+        let db = CheckpointDB::connect(":memory:").await.unwrap();
+        let cfg = AppConfig {
+            immich_url: String::new(),
+            immich_api_key: String::new(),
+            ..Default::default()
+        };
+        let state = AppState::new(db, cfg.clone());
+
+        let res = run_merge_immich_duplicates(state, cfg, true).await;
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Immich 서버 URL 또는 API Key가 설정되지 않았습니다"));
     }
 }
