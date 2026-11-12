@@ -237,10 +237,6 @@ pub struct DuplicateMergePlan {
 #[derive(Debug, Clone)]
 pub enum DuplicateGroupEvaluation {
     Merge(Box<DuplicateMergePlan>),
-    SkippedBurst {
-        duplicate_id: String,
-        reason: String,
-    },
     SkippedInsufficientAssets,
 }
 
@@ -294,95 +290,6 @@ pub fn format_quality_tier(filename: &str) -> u8 {
     }
 }
 
-pub fn normalize_photo_stem(filename: &str) -> String {
-    let trimmed = filename.trim();
-    let stem = match trimmed.rsplit_once('.') {
-        Some((s, _)) if !s.is_empty() => s,
-        _ => trimmed,
-    };
-    let mut s = stem.trim().to_ascii_lowercase();
-
-    loop {
-        let prev = s.clone();
-        s = s.trim().to_string();
-
-        for suffix in ["-edited", "_edited", "-복사본", "_복사본", " copy"] {
-            if let Some(stripped) = s.strip_suffix(suffix) {
-                if !stripped.trim().is_empty() {
-                    s = stripped.trim().to_string();
-                }
-            }
-        }
-
-        // Strip trailing `+<digits>` (e.g. `img_9112+1` -> `img_9112`)
-        if let Some((base, num)) = s.rsplit_once('+') {
-            if !base.is_empty() && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) {
-                s = base.to_string();
-            }
-        }
-
-        // Strip trailing `(<digits_or_id>)` (e.g. `img_9112 (1)` -> `img_9112`)
-        if s.ends_with(')') {
-            if let Some(open_idx) = s.rfind('(') {
-                let base = s[..open_idx].trim();
-                let inside = &s[open_idx + 1..s.len() - 1];
-                if !base.is_empty() && !inside.is_empty() {
-                    s = base.to_string();
-                }
-            }
-        }
-
-        if s == prev {
-            break;
-        }
-    }
-
-    s
-}
-
-fn are_stems_copy_variants(stem_a: &str, stem_b: &str) -> bool {
-    if stem_a.is_empty() || stem_b.is_empty() {
-        return false;
-    }
-    if stem_a == stem_b {
-        return true;
-    }
-    // Allow unsuffixed base vs `_1` or `-1` copy suffix (e.g. `img_9112` vs `img_9112_1`),
-    // while keeping `_01` vs `_02` or `_1` vs `_2` distinct as Samsung/Android burst shots.
-    for (short, long) in [(stem_a, stem_b), (stem_b, stem_a)] {
-        let trailing_digits = short
-            .bytes()
-            .rev()
-            .take_while(|b| b.is_ascii_digit())
-            .count();
-        if trailing_digits >= 3
-            && (long == format!("{}_1", short) || long == format!("{}-1", short))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn split_camera_sequence_stem(stem: &str) -> Option<(&str, u64)> {
-    let digit_len = stem
-        .bytes()
-        .rev()
-        .take_while(|b| b.is_ascii_digit())
-        .count();
-    if !(1..=9).contains(&digit_len) {
-        return None;
-    }
-    let split_idx = stem.len() - digit_len;
-    let prefix = &stem[..split_idx];
-    if prefix.is_empty() {
-        return None;
-    }
-    let num_str = &stem[split_idx..];
-    let num = num_str.parse::<u64>().ok()?;
-    Some((prefix, num))
-}
-
 fn is_exact_hour_tz_offset(diff_secs: i64) -> bool {
     (3540..=14 * 3600 + 60).contains(&diff_secs) && ((diff_secs + 60) % 3600) <= 120
 }
@@ -412,19 +319,14 @@ fn parse_plausible_dt(raw: Option<&str>) -> Option<(String, DateTime<FixedOffset
     Some((s.to_string(), dt))
 }
 
-fn asset_exif_capture_dt(
-    asset: &ImmichDuplicateAssetDto,
-) -> Option<(String, DateTime<FixedOffset>)> {
-    asset
-        .exif_info
-        .as_ref()
-        .and_then(|e| parse_plausible_dt(e.date_time_original.as_deref()))
-}
-
 fn asset_primary_capture_dt(
     asset: &ImmichDuplicateAssetDto,
 ) -> Option<(String, DateTime<FixedOffset>)> {
-    if let Some(parsed) = asset_exif_capture_dt(asset) {
+    if let Some(parsed) = asset
+        .exif_info
+        .as_ref()
+        .and_then(|e| parse_plausible_dt(e.date_time_original.as_deref()))
+    {
         return Some(parsed);
     }
     if let Some(fn_iso) = extract_timestamp_from_filename(&asset.original_file_name) {
@@ -458,96 +360,6 @@ fn has_camera_exif(asset: &ImmichDuplicateAssetDto) -> bool {
             .unwrap_or(false)
 }
 
-fn check_same_photo_copy(assets: &[ImmichDuplicateAssetDto]) -> Result<(), String> {
-    let stems: Vec<String> = assets
-        .iter()
-        .map(|a| normalize_photo_stem(&a.original_file_name))
-        .collect();
-
-    for i in 0..assets.len() {
-        for j in (i + 1)..assets.len() {
-            let a = &assets[i];
-            let b = &assets[j];
-            let stem_a = &stems[i];
-            let stem_b = &stems[j];
-            let same_stem = are_stems_copy_variants(stem_a, stem_b);
-
-            // Even if stems match, if both have genuine EXIF dateTimeOriginal separated by 1..=120s, treat as burst
-            if let (Some((_, exif_dt_a)), Some((_, exif_dt_b))) =
-                (asset_exif_capture_dt(a), asset_exif_capture_dt(b))
-            {
-                let exif_diff = (exif_dt_a - exif_dt_b).num_seconds().abs();
-                if (1..=120).contains(&exif_diff) {
-                    return Err(format!(
-                        "EXIF 촬영 시각이 {}초 차이 나는 연속 촬영 추정 ({} vs {})",
-                        exif_diff, a.original_file_name, b.original_file_name
-                    ));
-                }
-            }
-
-            if same_stem {
-                continue;
-            }
-
-            // Different stems: check sequential/different camera numbers under same prefix (e.g. IMG_9112 vs IMG_9113, _01 vs _02, PXL 9-digit)
-            if let (Some((pref_a, num_a)), Some((pref_b, num_b))) = (
-                split_camera_sequence_stem(stem_a),
-                split_camera_sequence_stem(stem_b),
-            ) {
-                if pref_a == pref_b && num_a != num_b {
-                    return Err(format!(
-                        "파일 번호가 다른 연속/별개 촬영 추정 ({} vs {})",
-                        a.original_file_name, b.original_file_name
-                    ));
-                }
-            }
-
-            // Different stems: if both filenames contain embedded timestamps that differ (not an exact timezone offset), reject
-            if let (Some(fn_iso_a), Some(fn_iso_b)) = (
-                extract_timestamp_from_filename(&a.original_file_name),
-                extract_timestamp_from_filename(&b.original_file_name),
-            ) {
-                if let (Some((_, fn_dt_a)), Some((_, fn_dt_b))) = (
-                    parse_plausible_dt(Some(&fn_iso_a)),
-                    parse_plausible_dt(Some(&fn_iso_b)),
-                ) {
-                    let fn_diff = (fn_dt_a - fn_dt_b).num_seconds().abs();
-                    if fn_diff > 0 && !is_exact_hour_tz_offset(fn_diff) {
-                        return Err(format!(
-                            "파일명 내장 촬영 시각이 서로 다른 별개 사진 추정 ({} vs {})",
-                            a.original_file_name, b.original_file_name
-                        ));
-                    }
-                }
-            }
-
-            if let (Some((_, dt_a)), Some((_, dt_b))) =
-                (asset_primary_capture_dt(a), asset_primary_capture_dt(b))
-            {
-                let diff_secs = (dt_a - dt_b).num_seconds().abs();
-                if (1..=120).contains(&diff_secs) {
-                    return Err(format!(
-                        "촬영 시각이 {}초 차이 나는 연속 촬영 추정 ({} vs {})",
-                        diff_secs, a.original_file_name, b.original_file_name
-                    ));
-                }
-                if diff_secs > 120
-                    && has_camera_exif(a)
-                    && has_camera_exif(b)
-                    && !is_exact_hour_tz_offset(diff_secs)
-                {
-                    return Err(format!(
-                        "파일명과 카메라 EXIF 촬영 시각이 모두 다른 별개 사진 추정 ({} vs {})",
-                        a.original_file_name, b.original_file_name
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 pub fn evaluate_duplicate_group(group: &ImmichDuplicateGroupDto) -> DuplicateGroupEvaluation {
     let active_assets: Vec<ImmichDuplicateAssetDto> = group
         .assets
@@ -558,13 +370,6 @@ pub fn evaluate_duplicate_group(group: &ImmichDuplicateGroupDto) -> DuplicateGro
 
     if active_assets.len() < 2 {
         return DuplicateGroupEvaluation::SkippedInsufficientAssets;
-    }
-
-    if let Err(reason) = check_same_photo_copy(&active_assets) {
-        return DuplicateGroupEvaluation::SkippedBurst {
-            duplicate_id: group.duplicate_id.clone(),
-            reason,
-        };
     }
 
     let mut sorted = active_assets;
@@ -2022,12 +1827,12 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_duplicate_group_skips_burst_shots_with_different_numbers() {
+    fn test_evaluate_duplicate_group_merges_any_immich_classified_duplicate_group() {
         let raw_burst = r#"{
-            "duplicateId": "dup-burst-1",
+            "duplicateId": "dup-any-immich-group",
             "assets": [
                 {
-                    "id": "asset-burst-1",
+                    "id": "asset-1",
                     "originalFileName": "IMG_9112.HEIC",
                     "fileCreatedAt": "2023-10-25T05:12:30.000Z",
                     "exifInfo": {
@@ -2038,22 +1843,29 @@ mod tests {
                     }
                 },
                 {
-                    "id": "asset-burst-2",
-                    "originalFileName": "IMG_9113.HEIC",
-                    "fileCreatedAt": "2023-10-25T05:12:31.000Z",
+                    "id": "asset-2",
+                    "originalFileName": "20231025_141230_02.HEIC",
+                    "fileCreatedAt": "2026-07-02T09:00:00.000Z",
                     "exifInfo": {
                         "fileSizeInByte": 1920000,
                         "exifImageWidth": 4032,
                         "exifImageHeight": 3024,
-                        "dateTimeOriginal": "2023-10-25T05:12:31.000Z"
+                        "dateTimeOriginal": "2026-07-02T09:00:00.000Z"
                     }
                 }
             ]
         }"#;
 
         let group: ImmichDuplicateGroupDto = serde_json::from_str(raw_burst).unwrap();
-        let eval = evaluate_duplicate_group(&group);
-        assert!(matches!(eval, DuplicateGroupEvaluation::SkippedBurst { .. }));
+        let DuplicateGroupEvaluation::Merge(plan) = evaluate_duplicate_group(&group) else {
+            panic!("Expected Merge plan for Immich-classified duplicate group");
+        };
+        assert_eq!(plan.winner.id, "asset-2");
+        assert_eq!(plan.loser_ids, vec!["asset-1".to_string()]);
+        assert_eq!(
+            plan.metadata_update.date_time_original.as_deref(),
+            Some("2023-10-25T05:12:30.000Z")
+        );
     }
 
     #[test]
@@ -2096,76 +1908,5 @@ mod tests {
         };
         assert_eq!(plan.winner.id, "asset-with-tz");
         assert_eq!(plan.metadata_update.date_time_original, None);
-    }
-
-    #[test]
-    fn test_evaluate_duplicate_group_skips_samsung_pixel_and_different_day_clip_false_positives() {
-        // 1. Samsung _01 vs _02 burst
-        let raw_samsung = r#"{
-            "duplicateId": "dup-samsung-burst",
-            "assets": [
-                {
-                    "id": "sam-1",
-                    "originalFileName": "20231025_141230_01.jpg",
-                    "fileCreatedAt": "2023-10-25T14:12:30.000Z"
-                },
-                {
-                    "id": "sam-2",
-                    "originalFileName": "20231025_141230_02.jpg",
-                    "fileCreatedAt": "2023-10-25T14:12:30.000Z"
-                }
-            ]
-        }"#;
-        let group_sam: ImmichDuplicateGroupDto = serde_json::from_str(raw_samsung).unwrap();
-        assert!(matches!(
-            evaluate_duplicate_group(&group_sam),
-            DuplicateGroupEvaluation::SkippedBurst { .. }
-        ));
-
-        // 2. Pixel 9-digit millisecond burst
-        let raw_pixel = r#"{
-            "duplicateId": "dup-pixel-burst",
-            "assets": [
-                {
-                    "id": "pxl-1",
-                    "originalFileName": "PXL_20231025_141230123.jpg",
-                    "fileCreatedAt": "2023-10-25T14:12:30.123Z"
-                },
-                {
-                    "id": "pxl-2",
-                    "originalFileName": "PXL_20231025_141230456.jpg",
-                    "fileCreatedAt": "2023-10-25T14:12:30.456Z"
-                }
-            ]
-        }"#;
-        let group_pxl: ImmichDuplicateGroupDto = serde_json::from_str(raw_pixel).unwrap();
-        assert!(matches!(
-            evaluate_duplicate_group(&group_pxl),
-            DuplicateGroupEvaluation::SkippedBurst { .. }
-        ));
-
-        // 3. CLIP visually similar photos taken on different days
-        let raw_clip_diff_day = r#"{
-            "duplicateId": "dup-clip-diff-day",
-            "assets": [
-                {
-                    "id": "day-1",
-                    "originalFileName": "20231025_140000.jpg",
-                    "fileCreatedAt": "2023-10-25T14:00:00.000Z",
-                    "exifInfo": { "dateTimeOriginal": "2023-10-25T14:00:00.000Z" }
-                },
-                {
-                    "id": "day-2",
-                    "originalFileName": "20231026_150000.jpg",
-                    "fileCreatedAt": "2023-10-26T15:00:00.000Z",
-                    "exifInfo": { "dateTimeOriginal": "2023-10-26T15:00:00.000Z" }
-                }
-            ]
-        }"#;
-        let group_clip: ImmichDuplicateGroupDto = serde_json::from_str(raw_clip_diff_day).unwrap();
-        assert!(matches!(
-            evaluate_duplicate_group(&group_clip),
-            DuplicateGroupEvaluation::SkippedBurst { .. }
-        ));
     }
 }

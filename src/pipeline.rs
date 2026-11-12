@@ -1962,8 +1962,16 @@ pub async fn run_merge_immich_duplicates_with_limit(
         target_limiter,
     );
 
-    let mut groups = immich_target.get_duplicates().await?;
-    if groups.is_empty() {
+    let groups = immich_target.get_duplicates().await?;
+    let mut plans: Vec<Box<crate::targets::immich::DuplicateMergePlan>> = groups
+        .into_iter()
+        .filter_map(|g| match evaluate_duplicate_group(&g) {
+            DuplicateGroupEvaluation::Merge(p) => Some(p),
+            DuplicateGroupEvaluation::SkippedInsufficientAssets => None,
+        })
+        .collect();
+
+    if plans.is_empty() {
         state
             .finish_job(
                 "repair",
@@ -1974,7 +1982,7 @@ pub async fn run_merge_immich_duplicates_with_limit(
     }
 
     if let Some(n) = limit.filter(|&n| n > 0) {
-        groups.truncate(n as usize);
+        plans.truncate(n as usize);
     }
 
     let mode_tag = if dry_run {
@@ -1984,7 +1992,7 @@ pub async fn run_merge_immich_duplicates_with_limit(
     };
 
     state
-        .begin_phase("repair", JobState::Syncing, groups.len() as u64)
+        .begin_phase("repair", JobState::Syncing, plans.len() as u64)
         .await;
     state
         .emit_event(
@@ -1994,7 +2002,7 @@ pub async fn run_merge_immich_duplicates_with_limit(
             format!(
                 "[{}] Immich 중복 그룹 {}건 분석 및 선택적 메타데이터 병합을 시작합니다.",
                 mode_tag,
-                groups.len()
+                plans.len()
             ),
         )
         .await;
@@ -2003,35 +2011,12 @@ pub async fn run_merge_immich_duplicates_with_limit(
     let has_non_empty_albums = !all_albums.is_empty();
 
     let mut merged_groups = 0u64;
-    let mut skipped_burst_groups = 0u64;
     let mut trashed_assets = 0u64;
 
-    for group in groups {
+    for plan in plans {
         if state.is_stopping() {
             break;
         }
-
-        let eval = evaluate_duplicate_group(&group);
-        let plan = match eval {
-            DuplicateGroupEvaluation::SkippedInsufficientAssets => {
-                state.processed_files.fetch_add(1, Ordering::SeqCst);
-                continue;
-            }
-            DuplicateGroupEvaluation::SkippedBurst { reason, .. } => {
-                skipped_burst_groups += 1;
-                state.processed_files.fetch_add(1, Ordering::SeqCst);
-                state
-                    .emit_event(
-                        "repair",
-                        JobState::Syncing,
-                        None,
-                        format!("[{}] 자동 보호 (Skip): {}", mode_tag, reason),
-                    )
-                    .await;
-                continue;
-            }
-            DuplicateGroupEvaluation::Merge(p) => p,
-        };
 
         let mut albums_to_join: Vec<(String, String)> = Vec::new();
         if has_non_empty_albums {
@@ -2355,7 +2340,7 @@ pub async fn run_merge_immich_duplicates_with_limit(
         .finish_job(
             "repair",
             format!(
-                "[{}] 완료 — 병합 {}그룹 (중복 자산 {}건 {}) · 연속 촬영 자동 보호 {}그룹",
+                "[{}] 완료 — 병합 {}그룹 (중복 자산 {}건 {})",
                 mode_tag,
                 merged_groups,
                 trashed_assets,
@@ -2363,8 +2348,7 @@ pub async fn run_merge_immich_duplicates_with_limit(
                     "휴지통 이동 예정"
                 } else {
                     "휴지통 이동됨"
-                },
-                skipped_burst_groups
+                }
             ),
         )
         .await;
