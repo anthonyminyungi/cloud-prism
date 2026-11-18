@@ -7,12 +7,14 @@ use crate::router::{
 };
 use crate::sources::{
     build_target_http_client, stream_response_to_temp, DownloadedSourceFile, ExtractedLivePhoto,
+    IO_STREAM_BUFFER_SIZE,
 };
-use crate::targets::{TargetProvider, UploadContext, UploadOutcome};
+use crate::targets::{TargetProvider, UploadContext, UploadOutcome, VerifyStatus};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::{DateTime, FixedOffset};
+use futures::stream::{self, StreamExt};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -765,6 +767,29 @@ struct AssetUploadResponse {
     status: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImmichAssetStatusDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    is_trashed: bool,
+    #[serde(default)]
+    checksum: Option<String>,
+}
+
+fn is_valid_immich_asset_id_candidate(raw: Option<&str>) -> Option<&str> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty()
+        || trimmed == "existing_immich_asset"
+        || trimmed == "immich_uploaded_id"
+        || trimmed.starts_with('/')
+    {
+        return None;
+    }
+    Some(trimmed)
+}
+
 pub struct ImmichTarget {
     base_url: String,
     api_key: String,
@@ -885,7 +910,8 @@ impl ImmichTarget {
                 let std_file =
                     std::fs::File::open(file_path).expect("temp file must exist during upload");
                 let async_file = tokio::fs::File::from_std(std_file);
-                let reader_stream = tokio_util::io::ReaderStream::new(async_file);
+                let reader_stream =
+                    tokio_util::io::ReaderStream::with_capacity(async_file, IO_STREAM_BUFFER_SIZE);
                 let body = reqwest::Body::wrap_stream(reader_stream);
                 let mut part = Part::stream_with_length(body, file_len)
                     .file_name(effective_filename.clone());
@@ -1079,46 +1105,7 @@ impl ImmichTarget {
         let mut seen_ids = std::collections::HashSet::new();
 
         for matched in matched_albums {
-            let detail_url = format!("{}/{}", self.endpoint(ENDPOINT_ALBUMS), matched.id);
-            let detail_resp = self
-                .limiter
-                .send_with_retry(|| {
-                    self.client
-                        .get(&detail_url)
-                        .header(HEADER_API_KEY, &self.api_key)
-                })
-                .await?;
-
-            if !detail_resp.status().is_success() {
-                let status = detail_resp.status();
-                let text = detail_resp.text().await.unwrap_or_default();
-                return Err(anyhow!(
-                    "Immich 앨범 상세 조회 실패 ({} / HTTP {}): {}",
-                    matched.id,
-                    status,
-                    text
-                ));
-            }
-
-            let detail: ImmichAlbumDetailDto = detail_resp.json().await?;
-            let mut album_assets = detail.assets;
-
-            if album_assets.is_empty() {
-                if let Ok(search_assets) = self.fetch_album_assets_via_search(&matched.id).await {
-                    if !search_assets.is_empty() {
-                        album_assets = search_assets;
-                    }
-                }
-            }
-
-            if album_assets.is_empty() {
-                if let Ok(tl_assets) = self.fetch_album_assets_via_timeline(&matched.id).await {
-                    if !tl_assets.is_empty() {
-                        album_assets = tl_assets;
-                    }
-                }
-            }
-
+            let album_assets = self.get_album_assets(&matched.id).await?;
             for asset in album_assets {
                 if !asset.id.is_empty() && seen_ids.insert(asset.id.clone()) {
                     collected.push(asset);
@@ -1127,6 +1114,50 @@ impl ImmichTarget {
         }
 
         Ok(Some((primary_id, collected)))
+    }
+
+    pub async fn get_album_assets(&self, album_id: &str) -> Result<Vec<ImmichAlbumAsset>> {
+        let detail_url = format!("{}/{}", self.endpoint(ENDPOINT_ALBUMS), album_id);
+        let detail_resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .get(&detail_url)
+                    .header(HEADER_API_KEY, &self.api_key)
+            })
+            .await?;
+
+        if !detail_resp.status().is_success() {
+            let status = detail_resp.status();
+            let text = detail_resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Immich 앨범 상세 조회 실패 ({} / HTTP {}): {}",
+                album_id,
+                status,
+                text
+            ));
+        }
+
+        let detail: ImmichAlbumDetailDto = detail_resp.json().await?;
+        let mut album_assets = detail.assets;
+
+        if album_assets.is_empty() {
+            if let Ok(search_assets) = self.fetch_album_assets_via_search(album_id).await {
+                if !search_assets.is_empty() {
+                    album_assets = search_assets;
+                }
+            }
+        }
+
+        if album_assets.is_empty() {
+            if let Ok(tl_assets) = self.fetch_album_assets_via_timeline(album_id).await {
+                if !tl_assets.is_empty() {
+                    album_assets = tl_assets;
+                }
+            }
+        }
+
+        Ok(album_assets)
     }
 
     async fn fetch_album_assets_via_search(
@@ -1595,6 +1626,46 @@ impl ImmichTarget {
         }
         Ok(())
     }
+
+    async fn inspect_asset_status(&self, asset_id: &str) -> VerifyStatus {
+        let url = format!("{}/{}", self.endpoint(ENDPOINT_ASSETS), asset_id);
+        let resp = match self
+            .limiter
+            .send_with_retry(|| self.client.get(&url).header(HEADER_API_KEY, &self.api_key))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return VerifyStatus::TargetError(e.to_string()),
+        };
+
+        let status = resp.status();
+        if status.is_success() {
+            match resp.json::<ImmichAssetStatusDto>().await {
+                Ok(dto) => {
+                    if dto.is_trashed {
+                        VerifyStatus::TrashedOnTarget
+                    } else {
+                        let resolved_id = is_valid_immich_asset_id_candidate(Some(&dto.id))
+                            .map(str::to_string)
+                            .or_else(|| Some(asset_id.to_string()));
+                        let resolved_sha1 = decode_immich_checksum_to_hex(dto.checksum.as_deref());
+                        VerifyStatus::Present {
+                            healed_target_id: resolved_id,
+                            healed_sha1: resolved_sha1,
+                        }
+                    }
+                }
+                Err(e) => VerifyStatus::TargetError(format!("Immich 자산 응답 파싱 실패: {}", e)),
+            }
+        } else if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::BAD_REQUEST
+        {
+            VerifyStatus::MissingOnTarget
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            VerifyStatus::TargetError(format!("HTTP {}: {}", status, text))
+        }
+    }
 }
 
 fn photo_asset_id_or_default(id: &str) -> String {
@@ -1675,24 +1746,142 @@ impl TargetProvider for ImmichTarget {
         self.verify_hash_exists(&file.resource_id, sha1).await
     }
 
-    async fn verify_exists_batch(&self, files: &[FileRecord]) -> Result<HashMap<String, bool>> {
+    async fn inspect_exists_batch(&self, files: &[FileRecord]) -> HashMap<String, VerifyStatus> {
         let mut out = HashMap::with_capacity(files.len());
-        let mut check_items = Vec::new();
+        if files.is_empty() {
+            return out;
+        }
+        if self.base_url.trim().is_empty() || self.api_key.trim().is_empty() {
+            for f in files {
+                out.insert(
+                    f.resource_id.clone(),
+                    VerifyStatus::TargetError(
+                        "Immich 서버 URL 또는 API Key가 설정되지 않았습니다.".to_string(),
+                    ),
+                );
+            }
+            return out;
+        }
+
+        let mut by_id: HashMap<&str, &FileRecord> = HashMap::with_capacity(files.len());
+        let mut check_items: Vec<(String, String)> = Vec::new();
+        let mut unmatched_candidates: Vec<&FileRecord> = Vec::new();
+
         for f in files {
-            if let Some(ref sha1) = f.sha1_hash {
-                check_items.push((f.resource_id.clone(), sha1.clone()));
+            by_id.insert(f.resource_id.as_str(), f);
+            if let Some(sha1) = f
+                .sha1_hash
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                check_items.push((f.resource_id.clone(), sha1.to_string()));
             } else {
-                out.insert(f.resource_id.clone(), false);
+                unmatched_candidates.push(f);
             }
         }
+
         for chunk in check_items.chunks(500) {
-            let chunk_res = self.check_bulk_hashes(chunk).await?;
-            for (res_id, _) in chunk {
-                let exists = chunk_res.get(res_id).and_then(|opt| opt.as_ref()).is_some();
-                out.insert(res_id.clone(), exists);
+            match self.check_bulk_hashes(chunk).await {
+                Ok(chunk_res) => {
+                    for (res_id, _) in chunk {
+                        if let Some(Some(asset_id)) = chunk_res.get(res_id) {
+                            let existing_rec = by_id.get(res_id.as_str()).copied();
+                            let needs_id_heal = existing_rec
+                                .map(|rec| {
+                                    is_valid_immich_asset_id_candidate(
+                                        rec.remote_target_id.as_deref(),
+                                    )
+                                    .is_none()
+                                })
+                                .unwrap_or(false);
+                            let healed_target_id = if needs_id_heal {
+                                is_valid_immich_asset_id_candidate(Some(asset_id))
+                                    .map(str::to_string)
+                            } else {
+                                None
+                            };
+                            out.insert(
+                                res_id.clone(),
+                                VerifyStatus::Present {
+                                    healed_target_id,
+                                    healed_sha1: None,
+                                },
+                            );
+                        } else if let Some(rec) = by_id.get(res_id.as_str()).copied() {
+                            unmatched_candidates.push(rec);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    for (res_id, _) in chunk {
+                        out.insert(res_id.clone(), VerifyStatus::TargetError(err_msg.clone()));
+                    }
+                }
             }
         }
-        Ok(out)
+
+        let mut unique_asset_ids: Vec<String> = Vec::new();
+        let mut seen_aids: HashSet<String> = HashSet::new();
+        for f in &unmatched_candidates {
+            if let Some(aid) = is_valid_immich_asset_id_candidate(f.remote_target_id.as_deref()) {
+                if seen_aids.insert(aid.to_string()) {
+                    unique_asset_ids.push(aid.to_string());
+                }
+            }
+        }
+
+        let asset_statuses: HashMap<String, VerifyStatus> = stream::iter(unique_asset_ids)
+            .map(|aid| async move {
+                let st = self.inspect_asset_status(&aid).await;
+                (aid, st)
+            })
+            .buffer_unordered(8)
+            .collect()
+            .await;
+
+        for f in unmatched_candidates {
+            if let Some(aid) = is_valid_immich_asset_id_candidate(f.remote_target_id.as_deref()) {
+                let status = match asset_statuses.get(aid) {
+                    Some(VerifyStatus::Present {
+                        healed_target_id,
+                        healed_sha1,
+                    }) => {
+                        let new_tid = healed_target_id
+                            .clone()
+                            .filter(|tid| f.remote_target_id.as_deref() != Some(tid.as_str()));
+                        let new_sha1 = healed_sha1
+                            .clone()
+                            .filter(|sh| f.sha1_hash.as_deref() != Some(sh.as_str()));
+                        VerifyStatus::Present {
+                            healed_target_id: new_tid,
+                            healed_sha1: new_sha1,
+                        }
+                    }
+                    Some(other) => other.clone(),
+                    None => VerifyStatus::TargetError("Immich 자산 상태 조회 누락".to_string()),
+                };
+                out.insert(f.resource_id.clone(), status);
+            } else if f
+                .sha1_hash
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
+                out.insert(f.resource_id.clone(), VerifyStatus::MissingOnTarget);
+            } else {
+                out.insert(
+                    f.resource_id.clone(),
+                    VerifyStatus::TargetError(
+                        "로컬 DB에 검증 가능한 해시 또는 Immich 자산 ID가 없습니다.".to_string(),
+                    ),
+                );
+            }
+        }
+
+        out
     }
 }
 

@@ -4,11 +4,12 @@ use chrono::Utc;
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::{Expr, ExprTrait, Index, OnConflict};
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, QueryOrder, QuerySelect,
-    Schema, Set, SqlxSqliteConnector, Statement, TransactionTrait,
+    Condition, ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, PaginatorTrait,
+    QueryOrder, QuerySelect, Schema, Set, SqlxSqliteConnector, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -197,17 +198,121 @@ impl CheckpointDB {
         );
         self.conn.execute(create_files).await?;
 
-        let create_idx = builder.build(
+        let indexes = [
             Index::create()
                 .if_not_exists()
                 .name("idx_files_source_status")
                 .table(file_entity::Entity)
                 .col(file_entity::Column::SourceType)
-                .col(file_entity::Column::Status),
-        );
-        self.conn.execute(create_idx).await?;
+                .col(file_entity::Column::Status)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_files_source_parent_name")
+                .table(file_entity::Entity)
+                .col(file_entity::Column::SourceType)
+                .col(file_entity::Column::ParentPath)
+                .col(file_entity::Column::Name)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_files_source_status_created")
+                .table(file_entity::Entity)
+                .col(file_entity::Column::SourceType)
+                .col(file_entity::Column::Status)
+                .col(file_entity::Column::CreatedTime)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_files_sha1")
+                .table(file_entity::Entity)
+                .col(file_entity::Column::Sha1Hash)
+                .to_owned(),
+            Index::create()
+                .if_not_exists()
+                .name("idx_files_remote_target")
+                .table(file_entity::Entity)
+                .col(file_entity::Column::RemoteTargetId)
+                .to_owned(),
+        ];
+
+        for idx in indexes {
+            self.conn.execute(builder.build(&idx)).await?;
+        }
+
+        let _ = self.heal_misclassified_nextcloud_targets().await?;
 
         Ok(())
+    }
+
+    /// Repairs records uploaded to Nextcloud (whose `remote_target_id` is a WebDAV path starting with `/`)
+    /// that were overwritten back to `target_type = "immich"` by an earlier re-scan.
+    pub async fn heal_misclassified_nextcloud_targets(&self) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let res = file_entity::Entity::update_many()
+            .col_expr(
+                file_entity::Column::TargetType,
+                Expr::value(TargetType::Nextcloud.as_str()),
+            )
+            .col_expr(file_entity::Column::UpdatedAt, Expr::value(now))
+            .filter(file_entity::Column::TargetType.eq(TargetType::Immich.as_str()))
+            .filter(file_entity::Column::RemoteTargetId.like("/%"))
+            .filter(
+                file_entity::Column::Status
+                    .is_in([FileStatus::Uploaded.as_str(), FileStatus::Deleted.as_str()]),
+            )
+            .exec(&self.conn)
+            .await?;
+        Ok(res.rows_affected)
+    }
+
+    /// Persists resolved Immich `remote_target_id` and/or updated `sha1_hash` values discovered
+    /// during 2nd-stage target verification.
+    pub async fn heal_immich_hashes_and_targets(
+        &self,
+        updates: &[(String, String, Option<String>, Option<String>)],
+    ) -> Result<u64> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let txn = self.conn.begin().await?;
+        let mut updated = 0u64;
+
+        for (source_type, resource_id, new_target_id, new_sha1) in updates {
+            let clean_id = new_target_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let clean_sha1 = new_sha1.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            if clean_id.is_none() && clean_sha1.is_none() {
+                continue;
+            }
+
+            let mut update = file_entity::Entity::update_many()
+                .col_expr(file_entity::Column::UpdatedAt, Expr::value(now.clone()));
+            if let Some(tid) = clean_id {
+                update = update.col_expr(
+                    file_entity::Column::RemoteTargetId,
+                    Expr::value(Some(tid.to_string())),
+                );
+            }
+            if let Some(sha1) = clean_sha1 {
+                update = update.col_expr(
+                    file_entity::Column::Sha1Hash,
+                    Expr::value(Some(sha1.to_string())),
+                );
+            }
+            let res = update
+                .filter(file_entity::Column::SourceType.eq(source_type.as_str()))
+                .filter(file_entity::Column::ResourceId.eq(resource_id.as_str()))
+                .exec(&txn)
+                .await?;
+            updated += res.rows_affected;
+        }
+
+        txn.commit().await?;
+        Ok(updated)
     }
 
     pub async fn get_journal_mode(&self) -> Result<String> {
@@ -330,6 +435,28 @@ impl CheckpointDB {
         let now = Utc::now().to_rfc3339();
         let txn = self.conn.begin().await?;
 
+        let mut by_source: HashMap<&str, Vec<String>> = HashMap::new();
+        for f in files {
+            by_source
+                .entry(f.source_type.as_str())
+                .or_default()
+                .push(f.resource_id.clone());
+        }
+        let mut existing_map: HashMap<(String, String), FileRecord> =
+            HashMap::with_capacity(files.len());
+        for (src_type, res_ids) in by_source {
+            for chunk in res_ids.chunks(500) {
+                let rows = file_entity::Entity::find()
+                    .filter(file_entity::Column::SourceType.eq(src_type))
+                    .filter(file_entity::Column::ResourceId.is_in(chunk.iter().cloned()))
+                    .all(&txn)
+                    .await?;
+                for row in rows {
+                    existing_map.insert((row.source_type.clone(), row.resource_id.clone()), row);
+                }
+            }
+        }
+
         for f in files {
             let colliding = file_entity::Entity::find()
                 .filter(file_entity::Column::SourceType.eq(&f.source_type))
@@ -345,10 +472,7 @@ impl CheckpointDB {
                 f.name.clone()
             };
 
-            let existing =
-                file_entity::Entity::find_by_id((f.source_type.clone(), f.resource_id.clone()))
-                    .one(&txn)
-                    .await?;
+            let existing = existing_map.remove(&(f.source_type.clone(), f.resource_id.clone()));
 
             match existing {
                 None => {
@@ -369,46 +493,94 @@ impl CheckpointDB {
                         error_msg: Set(None),
                         updated_at: Set(now.clone()),
                     };
-                    file_entity::Entity::insert(active).exec(&txn).await?;
+                    let inserted = file_entity::Entity::insert(active)
+                        .exec_with_returning(&txn)
+                        .await?;
+                    existing_map.insert(
+                        (inserted.source_type.clone(), inserted.resource_id.clone()),
+                        inserted,
+                    );
                 }
                 Some(old) => {
+                    let old_is_backed_up = old.status == FileStatus::Uploaded.as_str()
+                        || old.status == FileStatus::Deleted.as_str();
+                    let was_reclassified = old_is_backed_up
+                        && (old.target_type != f.target_type
+                            || old.name != effective_name
+                            || TargetRouter::is_livephoto_archive_name(&f.name));
+
+                    let is_merged_or_reclassified = was_reclassified
+                        || (old_is_backed_up
+                            && old.sync_result.as_deref()
+                                == Some(SyncResultKind::Duplicate.as_str()));
                     let hash_changed = match (&f.sha1_hash, &old.sha1_hash) {
-                        (Some(new_h), Some(old_h)) => new_h != old_h,
+                        (Some(new_h), Some(old_h)) if !is_merged_or_reclassified => new_h != old_h,
                         _ => false,
                     };
-                    let size_changed = f.size > 0 && old.size > 0 && old.size != f.size;
+                    let size_changed = if was_reclassified {
+                        false
+                    } else {
+                        f.size > 0 && old.size > 0 && old.size != f.size
+                    };
                     let content_changed = size_changed
                         || old.created_time != f.created_time
                         || old.modified_time != f.modified_time
                         || hash_changed;
 
-                    let preserved_size = if f.size == 0 && old.size > 0 && !content_changed {
-                        old.size
+                    if !content_changed && old_is_backed_up {
+                        let preserved_size = if old.size == 0 && f.size > 0 && !was_reclassified {
+                            f.size
+                        } else {
+                            old.size
+                        };
+                        let preserved_sha1 = if old.sha1_hash.is_none() && f.sha1_hash.is_some() {
+                            f.sha1_hash.clone()
+                        } else {
+                            old.sha1_hash.clone()
+                        };
+                        let mut active: file_entity::ActiveModel = old.into();
+                        active.parent_path = Set(f.parent_path.clone());
+                        active.size = Set(preserved_size);
+                        active.sha1_hash = Set(preserved_sha1);
+                        active.updated_at = Set(now.clone());
+                        let updated = file_entity::Entity::update(active).exec(&txn).await?;
+                        existing_map.insert(
+                            (updated.source_type.clone(), updated.resource_id.clone()),
+                            updated,
+                        );
                     } else {
-                        f.size
-                    };
+                        let preserved_size = if f.size == 0 && old.size > 0 && !content_changed {
+                            old.size
+                        } else {
+                            f.size
+                        };
 
-                    let mut active: file_entity::ActiveModel = old.into();
-                    active.name = Set(effective_name);
-                    active.parent_path = Set(f.parent_path.clone());
-                    active.size = Set(preserved_size);
-                    active.created_time = Set(f.created_time.clone());
-                    active.modified_time = Set(f.modified_time.clone());
-                    active.target_type = Set(f.target_type.clone());
-                    active.updated_at = Set(now.clone());
+                        let mut active: file_entity::ActiveModel = old.into();
+                        active.name = Set(effective_name);
+                        active.parent_path = Set(f.parent_path.clone());
+                        active.size = Set(preserved_size);
+                        active.created_time = Set(f.created_time.clone());
+                        active.modified_time = Set(f.modified_time.clone());
+                        active.target_type = Set(f.target_type.clone());
+                        active.updated_at = Set(now.clone());
 
-                    if content_changed {
-                        active.sha1_hash = Set(f.sha1_hash.clone());
-                        active.remote_target_id = Set(None);
-                        active.sync_result = Set(None);
-                        active.status = Set(FileStatus::Pending.as_str().to_string());
-                        active.retry_count = Set(0);
-                        active.error_msg = Set(None);
-                    } else if f.sha1_hash.is_some() {
-                        active.sha1_hash = Set(f.sha1_hash.clone());
+                        if content_changed {
+                            active.sha1_hash = Set(f.sha1_hash.clone());
+                            active.remote_target_id = Set(None);
+                            active.sync_result = Set(None);
+                            active.status = Set(FileStatus::Pending.as_str().to_string());
+                            active.retry_count = Set(0);
+                            active.error_msg = Set(None);
+                        } else if f.sha1_hash.is_some() {
+                            active.sha1_hash = Set(f.sha1_hash.clone());
+                        }
+
+                        let updated = file_entity::Entity::update(active).exec(&txn).await?;
+                        existing_map.insert(
+                            (updated.source_type.clone(), updated.resource_id.clone()),
+                            updated,
+                        );
                     }
-
-                    file_entity::Entity::update(active).exec(&txn).await?;
                 }
             }
         }
@@ -817,7 +989,19 @@ impl CheckpointDB {
     }
 
     pub async fn count_nextcloud_repair_candidates(&self) -> Result<u64> {
-        Ok(self.get_nextcloud_repair_candidates().await?.len() as u64)
+        let anomaly_expr = Expr::cust(
+            "((LOWER(TRIM(name)) LIKE '%livephoto%' AND (LOWER(TRIM(name)) LIKE '%.zip' OR LOWER(TRIM(name)) LIKE '%,zip')) OR LOWER(TRIM(name)) LIKE '%(null)' OR LOWER(TRIM(name)) LIKE '%.null')",
+        );
+        let cnt = file_entity::Entity::find()
+            .filter(file_entity::Column::TargetType.eq(TargetType::Nextcloud.as_str()))
+            .filter(
+                file_entity::Column::Status
+                    .is_in([FileStatus::Uploaded.as_str(), FileStatus::Deleted.as_str()]),
+            )
+            .filter(anomaly_expr)
+            .count(&self.conn)
+            .await?;
+        Ok(cnt)
     }
 
     pub fn is_gdrive_origin_pair(source_type: &str, resource_id: &str) -> bool {
@@ -864,6 +1048,13 @@ impl CheckpointDB {
             .filter(
                 file_entity::Column::Status
                     .is_in([FileStatus::Uploaded.as_str(), FileStatus::Deleted.as_str()]),
+            )
+            .filter(
+                Condition::any()
+                    .add(file_entity::Column::SourceType.eq("gdrive"))
+                    .add(Expr::cust(
+                        "(LOWER(resource_id) LIKE '%drive%' OR resource_id LIKE '%드라이브%')",
+                    )),
             )
             .into_tuple()
             .all(&self.conn)
@@ -1083,6 +1274,24 @@ impl CheckpointDB {
         winner_asset_id: &str,
         winner_sha1_hex: Option<&str>,
     ) -> Result<u64> {
+        self.remap_merged_immich_assets_with_hashes(
+            loser_asset_ids,
+            loser_device_asset_ids,
+            &[],
+            winner_asset_id,
+            winner_sha1_hex,
+        )
+        .await
+    }
+
+    pub async fn remap_merged_immich_assets_with_hashes(
+        &self,
+        loser_asset_ids: &[String],
+        loser_device_asset_ids: &[String],
+        loser_sha1_hashes: &[String],
+        winner_asset_id: &str,
+        winner_sha1_hex: Option<&str>,
+    ) -> Result<u64> {
         let clean_loser_ids: Vec<String> = loser_asset_ids
             .iter()
             .map(|s| s.trim().to_string())
@@ -1094,8 +1303,13 @@ impl CheckpointDB {
             .filter(|s| !s.is_empty())
             .map(|s| s.split_once('#').map(|(base, _)| base).unwrap_or(s).to_string())
             .collect();
+        let clean_loser_hashes: Vec<String> = loser_sha1_hashes
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
 
-        if clean_loser_ids.is_empty() && clean_dev_ids.is_empty() {
+        if clean_loser_ids.is_empty() && clean_dev_ids.is_empty() && clean_loser_hashes.is_empty() {
             return Ok(0);
         }
 
@@ -1106,6 +1320,9 @@ impl CheckpointDB {
         }
         if !clean_dev_ids.is_empty() {
             cond = cond.add(file_entity::Column::ResourceId.is_in(clean_dev_ids));
+        }
+        if !clean_loser_hashes.is_empty() {
+            cond = cond.add(file_entity::Column::Sha1Hash.is_in(clean_loser_hashes));
         }
 
         let mut update = file_entity::Entity::update_many()
@@ -1128,6 +1345,11 @@ impl CheckpointDB {
 
         let res = update
             .filter(file_entity::Column::TargetType.eq(TargetType::Immich.as_str()))
+            .filter(
+                Condition::any()
+                    .add(file_entity::Column::RemoteTargetId.is_null())
+                    .add(file_entity::Column::RemoteTargetId.ne(winner_asset_id)),
+            )
             .filter(cond)
             .exec(&self.conn)
             .await?;

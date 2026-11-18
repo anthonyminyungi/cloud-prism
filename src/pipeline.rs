@@ -15,10 +15,10 @@ use crate::targets::immich::{
     decode_immich_checksum_to_hex, evaluate_duplicate_group, DuplicateGroupEvaluation, ImmichTarget,
 };
 use crate::targets::nextcloud::NextcloudTarget;
-use crate::targets::{TargetProvider, UploadContext, UploadOutcome};
+use crate::targets::{TargetProvider, UploadContext, UploadOutcome, VerifyStatus};
 use anyhow::{anyhow, Result};
 use futures::stream::{self, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -275,14 +275,16 @@ impl SyncPipeline {
                     .processed_files
                     .fetch_add(added as u64, Ordering::SeqCst);
                 self.state
-                    .emit_event(
+                    .emit_progress_throttled(
                         src,
                         JobState::Scanning,
                         Some(folder_path.to_string()),
-                        format!(
-                            "폴더 스캔 중: {} (발견된 파일 {}건 체크포인트 등록)",
-                            folder_path, added
-                        ),
+                        || {
+                            format!(
+                                "폴더 스캔 중: {} (발견된 파일 {}건 체크포인트 등록)",
+                                folder_path, added
+                            )
+                        },
                     )
                     .await;
             }
@@ -388,15 +390,25 @@ impl SyncPipeline {
         Ok(stats)
     }
 
-    async fn verify_uploaded_batch(&self, files: &[FileRecord]) -> Result<HashMap<String, bool>> {
+    async fn inspect_uploaded_batch(
+        &self,
+        files: &[FileRecord],
+        phase_state: JobState,
+    ) -> HashMap<String, VerifyStatus> {
+        let src = self.source_key();
         let mut by_target: HashMap<TargetType, Vec<FileRecord>> = HashMap::new();
         let mut results = HashMap::with_capacity(files.len());
+        let mut record_lookup: HashMap<&str, &FileRecord> = HashMap::with_capacity(files.len());
 
         for f in files {
+            record_lookup.insert(f.resource_id.as_str(), f);
             match f.target_type.parse::<TargetType>() {
                 Ok(t) => by_target.entry(t).or_default().push(f.clone()),
                 Err(_) => {
-                    results.insert(f.resource_id.clone(), false);
+                    results.insert(
+                        f.resource_id.clone(),
+                        VerifyStatus::TargetError(format!("알 수 없는 타겟 타입: {}", f.target_type)),
+                    );
                 }
             }
         }
@@ -405,24 +417,63 @@ impl SyncPipeline {
             if self.state.is_stopping() {
                 break;
             }
+            self.state
+                .emit_event(
+                    src,
+                    phase_state,
+                    None,
+                    format!(
+                        "[{}] 타겟 재검증 진행 중 ({}: {}건)...",
+                        src,
+                        target_type,
+                        group.len()
+                    ),
+                )
+                .await;
+
             match self.targets.get(&target_type) {
-                Some(target) => match target.verify_exists_batch(&group).await {
-                    Ok(map) => results.extend(map),
-                    Err(_) => {
-                        for f in group {
-                            results.insert(f.resource_id, false);
-                        }
-                    }
-                },
+                Some(target) => {
+                    let map = target.inspect_exists_batch(&group).await;
+                    results.extend(map);
+                }
                 None => {
                     for f in group {
-                        results.insert(f.resource_id, false);
+                        results.insert(
+                            f.resource_id,
+                            VerifyStatus::TargetError(format!(
+                                "등록되지 않은 타겟 플러그인: {}",
+                                target_type
+                            )),
+                        );
                     }
                 }
             }
         }
 
-        Ok(results)
+        let mut heals: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
+        for (res_id, status) in &results {
+            if let VerifyStatus::Present {
+                healed_target_id,
+                healed_sha1,
+            } = status
+            {
+                if healed_target_id.is_some() || healed_sha1.is_some() {
+                    if let Some(rec) = record_lookup.get(res_id.as_str()) {
+                        heals.push((
+                            rec.source_type.clone(),
+                            rec.resource_id.clone(),
+                            healed_target_id.clone(),
+                            healed_sha1.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        if !heals.is_empty() {
+            let _ = self.state.db.heal_immich_hashes_and_targets(&heals).await;
+        }
+
+        results
     }
 
     async fn cleanup_takeout_archives_after_sync(&self) -> Result<()> {
@@ -519,24 +570,32 @@ impl SyncPipeline {
             )
             .await;
 
-        let verified_map = self.verify_uploaded_batch(&uploaded).await?;
+        let verified_map = self
+            .inspect_uploaded_batch(&uploaded, JobState::Syncing)
+            .await;
         for file in &uploaded {
             if self.state.is_stopping() {
                 return Ok(());
             }
-            let verified = verified_map
-                .get(&file.resource_id)
-                .copied()
-                .unwrap_or(false);
-            if !verified {
+            let st = verified_map.get(&file.resource_id);
+            if !matches!(st, Some(VerifyStatus::Present { .. })) {
+                let reason = match st {
+                    Some(VerifyStatus::TrashedOnTarget) => "타겟 휴지통에 보관 중".to_string(),
+                    Some(VerifyStatus::MissingOnTarget) | None => "타겟 미존재".to_string(),
+                    Some(VerifyStatus::SizeMismatch { expected, actual }) => {
+                        format!("크기 불일치 ({} != {})", expected, actual)
+                    }
+                    Some(VerifyStatus::TargetError(err)) => format!("통신 오류: {}", err),
+                    Some(VerifyStatus::Present { .. }) => unreachable!(),
+                };
                 self.state
                     .emit_event(
                         src,
                         JobState::Syncing,
                         Some(file.name.clone()),
                         format!(
-                            "[{}] 타겟 재검증 실패 항목이 있어 로컬 ZIP 삭제를 중단합니다: {} ({})",
-                            src, file.name, file.target_type
+                            "[{}] 타겟 재검증 실패({}) 항목이 있어 로컬 ZIP 삭제를 중단합니다: {} ({})",
+                            src, reason, file.name, file.target_type
                         ),
                     )
                     .await;
@@ -608,16 +667,13 @@ impl SyncPipeline {
         let max_retries = self.config.max_retries as i64;
 
         self.state
-            .emit_event(
-                src,
-                JobState::Syncing,
-                Some(file.name.clone()),
+            .emit_progress_throttled(src, JobState::Syncing, Some(file.name.clone()), || {
                 format!(
                     "처리 중: {}/{}",
                     file.parent_path.trim_end_matches('/'),
                     file.name
-                ),
-            )
+                )
+            })
             .await;
 
         match self.transfer_file(&file).await {
@@ -657,11 +713,11 @@ impl SyncPipeline {
                     };
                 self.state.processed_files.fetch_add(1, Ordering::SeqCst);
                 self.state
-                    .emit_event(
+                    .emit_progress_throttled(
                         src,
                         JobState::Syncing,
                         Some(final_name.clone()),
-                        format!("이주 완료 [{} / {}]: {}", final_target, result_str, final_name),
+                        || format!("이주 완료 [{} / {}]: {}", final_target, result_str, final_name),
                     )
                     .await;
             }
@@ -767,11 +823,18 @@ impl SyncPipeline {
         };
 
         if is_livephoto_zip || matches!(inspected, Some(DetectedFileKind::ZipArchive)) {
-            if let Ok(Some(extracted)) = try_extract_livephoto_zip(
-                downloaded.temp_guard.path(),
-                &file.name,
-                &chosen_tmp,
-            ) {
+            let zip_path_owned = downloaded.temp_guard.path().to_path_buf();
+            let zip_name_owned = file.name.clone();
+            let extract_tmp = chosen_tmp.clone();
+            let extracted_opt = tokio::task::spawn_blocking(move || {
+                try_extract_livephoto_zip(&zip_path_owned, &zip_name_owned, &extract_tmp)
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten();
+
+            if let Some(extracted) = extracted_opt {
                 let created_with_zip = pick_older_timestamp(
                     &resolved_created,
                     extracted.timestamp_override.as_deref(),
@@ -919,7 +982,16 @@ impl SyncPipeline {
     }
 
     pub async fn run_delete(&self, dry_run: bool) -> Result<SyncStats> {
+        self.run_delete_with_options(dry_run, false).await
+    }
+
+    pub async fn run_delete_with_options(
+        &self,
+        dry_run: bool,
+        include_target_deleted: bool,
+    ) -> Result<SyncStats> {
         let src = self.source_key();
+        let _ = self.state.db.heal_misclassified_nextcloud_targets().await;
         let initial_stats = self.state.db.get_stats(src).await?;
         let fetch_limit = initial_stats.total_files.max(DELETE_BATCH_LIMIT);
         let uploaded = self
@@ -931,6 +1003,11 @@ impl SyncPipeline {
             .begin_phase(src, JobState::Deleting, uploaded.len() as u64)
             .await;
 
+        let mode_suffix = if include_target_deleted {
+            " · 타겟 선삭제 포함"
+        } else {
+            ""
+        };
         self.state
             .emit_event(
                 src,
@@ -938,86 +1015,273 @@ impl SyncPipeline {
                 None,
                 if dry_run {
                     format!(
-                        "[{}] 원격 삭제 시뮬레이션(Dry-Run) 시작 (대상: {}건)",
+                        "[{}] 원격 삭제 시뮬레이션(Dry-Run) 시작 (대상: {}건{})",
                         src,
-                        uploaded.len()
+                        uploaded.len(),
+                        mode_suffix
                     )
                 } else {
                     format!(
-                        "[{}] 재검증 후 원격 휴지통 삭제 시작 (대상: {}건)",
+                        "[{}] 재검증 후 원격 휴지통 삭제 시작 (대상: {}건{})",
                         src,
-                        uploaded.len()
+                        uploaded.len(),
+                        mode_suffix
                     )
                 },
             )
             .await;
 
-        let verified_map = self.verify_uploaded_batch(&uploaded).await?;
+        if uploaded.is_empty() {
+            let stats = self.state.db.get_stats(src).await?;
+            self.state
+                .finish_job(
+                    src,
+                    format!("[{}] 정리 대상(UPLOADED) 파일이 없습니다.", src),
+                )
+                .await;
+            return Ok(stats);
+        }
+
+        let total_checked = uploaded.len();
+        let verified_map = self
+            .inspect_uploaded_batch(&uploaded, JobState::Deleting)
+            .await;
+
+        if self.state.is_stopping() {
+            let stats = self.state.db.get_stats(src).await?;
+            self.state
+                .finish_job(src, format!("[{}] 삭제 작업이 안전 일시정지되었습니다.", src))
+                .await;
+            return Ok(stats);
+        }
+
+        // Per-target safety circuit breaker when `include_target_deleted` is enabled
+        let mut tripped_targets: HashSet<TargetType> = HashSet::new();
+        if include_target_deleted {
+            let mut per_target: HashMap<TargetType, (usize, usize, usize)> = HashMap::new();
+            for file in &uploaded {
+                let Ok(tt) = file.target_type.parse::<TargetType>() else {
+                    continue;
+                };
+                let entry = per_target.entry(tt).or_insert((0, 0, 0));
+                entry.0 += 1;
+                match verified_map.get(&file.resource_id) {
+                    Some(VerifyStatus::Present { .. } | VerifyStatus::TrashedOnTarget) => {
+                        entry.1 += 1;
+                    }
+                    Some(VerifyStatus::MissingOnTarget) => {
+                        entry.2 += 1;
+                    }
+                    _ => {}
+                }
+            }
+            for (tt, (target_total, alive_count, missing_count)) in per_target {
+                if missing_count > 0 && alive_count == 0 && target_total >= 5 {
+                    tripped_targets.insert(tt);
+                    self.state
+                        .emit_event(
+                            src,
+                            JobState::Deleting,
+                            None,
+                            format!(
+                                "[안전 차단] {} 검증 대상 {}건 중 타겟에 존재하는 파일이 0건입니다. 스토리지 마운트 해제 또는 빈 서버 연결 사고 방지를 위해 선삭제 항목 자동 정리를 보류합니다.",
+                                tt, target_total
+                            ),
+                        )
+                        .await;
+                }
+            }
+        }
+
+        let mut eligible: Vec<FileRecord> = Vec::with_capacity(uploaded.len());
+        let mut cnt_present = 0usize;
+        let mut cnt_trashed = 0usize;
+        let mut cnt_included_missing = 0usize;
+        let mut cnt_held_missing = 0usize;
+        let mut cnt_held_mismatch = 0usize;
+        let mut cnt_held_error = 0usize;
+        let mut held_sample_logs = 0u32;
+        const MAX_HELD_SAMPLE_LOGS: u32 = 20;
 
         for file in uploaded {
+            let status = verified_map
+                .get(&file.resource_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    VerifyStatus::TargetError("검증 결과 누락".to_string())
+                });
+
+            match status {
+                VerifyStatus::Present { .. } => {
+                    cnt_present += 1;
+                    eligible.push(file);
+                }
+                VerifyStatus::TrashedOnTarget => {
+                    cnt_trashed += 1;
+                    eligible.push(file);
+                }
+                VerifyStatus::MissingOnTarget => {
+                    let tripped = file
+                        .target_type
+                        .parse::<TargetType>()
+                        .map(|tt| tripped_targets.contains(&tt))
+                        .unwrap_or(false);
+                    if include_target_deleted && !tripped {
+                        cnt_included_missing += 1;
+                        eligible.push(file);
+                    } else {
+                        cnt_held_missing += 1;
+                        if held_sample_logs < MAX_HELD_SAMPLE_LOGS {
+                            held_sample_logs += 1;
+                            self.state
+                                .emit_event(
+                                    src,
+                                    JobState::Deleting,
+                                    Some(file.name.clone()),
+                                    format!(
+                                        "⚠️ 삭제 보류 (타겟 미존재): {} ({})",
+                                        file.name, file.target_type
+                                    ),
+                                )
+                                .await;
+                        }
+                    }
+                }
+                VerifyStatus::SizeMismatch { expected, actual } => {
+                    cnt_held_mismatch += 1;
+                    if held_sample_logs < MAX_HELD_SAMPLE_LOGS {
+                        held_sample_logs += 1;
+                        self.state
+                            .emit_event(
+                                src,
+                                JobState::Deleting,
+                                Some(file.name.clone()),
+                                format!(
+                                    "⚠️ 삭제 보류 (크기 불일치 {} != {}): {} ({})",
+                                    expected, actual, file.name, file.target_type
+                                ),
+                            )
+                            .await;
+                    }
+                }
+                VerifyStatus::TargetError(err) => {
+                    cnt_held_error += 1;
+                    if held_sample_logs < MAX_HELD_SAMPLE_LOGS {
+                        held_sample_logs += 1;
+                        self.state
+                            .emit_event(
+                                src,
+                                JobState::Deleting,
+                                Some(file.name.clone()),
+                                format!(
+                                    "⚠️ 삭제 보류 (타겟 통신 오류: {}): {} ({})",
+                                    err, file.name, file.target_type
+                                ),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
+        let held_total = cnt_held_missing + cnt_held_mismatch + cnt_held_error;
+        let eligible_total = eligible.len();
+
+        if dry_run {
+            self.state
+                .processed_files
+                .store(total_checked as u64, Ordering::SeqCst);
+            let stats = self.state.db.get_stats(src).await?;
+            self.state
+                .finish_job(
+                    src,
+                    format!(
+                        "[{}] 삭제 Dry-Run 완료 — 정리 가능 {}건 (타겟 보관 {}, 타겟 휴지통 {}, 타겟 선삭제 포함 {}) · 보류 {}건 (타겟 미존재 {}, 크기 불일치 {}, 통신 오류 {})",
+                        src,
+                        eligible_total,
+                        cnt_present,
+                        cnt_trashed,
+                        cnt_included_missing,
+                        held_total,
+                        cnt_held_missing,
+                        cnt_held_mismatch,
+                        cnt_held_error
+                    ),
+                )
+                .await;
+            return Ok(stats);
+        }
+
+        if held_total > 0 {
+            self.state
+                .processed_files
+                .fetch_add(held_total as u64, Ordering::SeqCst);
+        }
+
+        let concurrency = self.config.concurrency.max(1);
+        let mut deleted_total = 0u64;
+        let mut delete_failed_total = 0u64;
+        let mut fail_logs = 0u32;
+
+        for chunk in eligible.chunks(100) {
             if self.state.is_stopping() {
                 break;
             }
+            let chunk_vec: Vec<FileRecord> = chunk.to_vec();
+            let outcomes: Vec<Option<(FileRecord, Result<()>)>> = stream::iter(chunk_vec)
+                .map(|file| async move {
+                    if self.state.is_stopping() {
+                        return None;
+                    }
+                    let res = self.source.delete_resource(&file.resource_id).await;
+                    Some((file, res))
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
 
-            let verified = verified_map
-                .get(&file.resource_id)
-                .copied()
-                .unwrap_or(false);
+            let mut deleted_ids: Vec<String> = Vec::new();
+            let mut last_deleted_name: Option<String> = None;
 
-            if !verified {
-                self.state
-                    .emit_event(
-                        src,
-                        JobState::Deleting,
-                        Some(file.name.clone()),
-                        format!(
-                            "⚠️ 삭제 보류 (타겟 서버 재검증 실패): {} ({})",
-                            file.name, file.target_type
-                        ),
-                    )
-                    .await;
-                continue;
-            }
-
-            if dry_run {
+            for item in outcomes.into_iter().flatten() {
+                let (file, res) = item;
                 self.state.processed_files.fetch_add(1, Ordering::SeqCst);
-                self.state
-                    .emit_event(
-                        src,
-                        JobState::Deleting,
-                        Some(file.name.clone()),
-                        format!("[Dry-Run] 타겟 존재 검증 통과 (삭제 가능): {}", file.name),
-                    )
-                    .await;
-                continue;
+                match res {
+                    Ok(()) => {
+                        deleted_total += 1;
+                        last_deleted_name = Some(file.name);
+                        deleted_ids.push(file.resource_id);
+                    }
+                    Err(err) => {
+                        delete_failed_total += 1;
+                        if fail_logs < 30 {
+                            fail_logs += 1;
+                            self.state
+                                .emit_event(
+                                    src,
+                                    JobState::Deleting,
+                                    Some(file.name.clone()),
+                                    format!("원격 삭제 실패 ({}): {}", file.name, err),
+                                )
+                                .await;
+                        }
+                    }
+                }
             }
 
-            match self.source.delete_resource(&file.resource_id).await {
-                Ok(()) => {
-                    self.state
-                        .db
-                        .mark_file_deleted(src, &file.resource_id)
-                        .await?;
-                    self.state.processed_files.fetch_add(1, Ordering::SeqCst);
-                    self.state
-                        .emit_event(
-                            src,
-                            JobState::Deleting,
-                            Some(file.name.clone()),
-                            format!("🗑️ 원격 휴지통 이동 완료: {}", file.name),
+            if !deleted_ids.is_empty() {
+                self.state
+                    .db
+                    .mark_files_deleted_batch(src, &deleted_ids)
+                    .await?;
+                self.state
+                    .emit_progress_throttled(src, JobState::Deleting, last_deleted_name, || {
+                        format!(
+                            "[{}] 원격 휴지통 이동 진행 중... ({}건 완료 / 대상 {}건)",
+                            src, deleted_total, eligible_total
                         )
-                        .await;
-                }
-                Err(err) => {
-                    self.state
-                        .emit_event(
-                            src,
-                            JobState::Deleting,
-                            Some(file.name.clone()),
-                            format!("원격 삭제 실패 ({}): {}", file.name, err),
-                        )
-                        .await;
-                }
+                    })
+                    .await;
             }
         }
 
@@ -1025,14 +1289,10 @@ impl SyncPipeline {
         self.state
             .finish_job(
                 src,
-                if dry_run {
-                    format!("[{}] 원격 삭제 Dry-Run 시뮬레이션 완료", src)
-                } else {
-                    format!(
-                        "[{}] 원격 휴지통 이동 완료 (누적 삭제: {}건)",
-                        src, stats.deleted_files
-                    )
-                },
+                format!(
+                    "[{}] 원격 휴지통 이동 완료 — 이번 실행 {}건 삭제 (실패 {}건, 보류 {}건 / 누적 삭제: {}건)",
+                    src, deleted_total, delete_failed_total, held_total, stats.deleted_files
+                ),
             )
             .await;
         Ok(stats)
@@ -1158,11 +1418,18 @@ pub async fn run_repair_nextcloud_anomalies_with_limit(
         };
 
         if is_livephoto_zip || matches!(inspected, Some(DetectedFileKind::ZipArchive)) {
-            if let Ok(Some(extracted)) = try_extract_livephoto_zip(
-                downloaded.temp_guard.path(),
-                &file.name,
-                &chosen_tmp,
-            ) {
+            let zip_path_owned = downloaded.temp_guard.path().to_path_buf();
+            let zip_name_owned = file.name.clone();
+            let extract_tmp = chosen_tmp.clone();
+            let extracted_opt = tokio::task::spawn_blocking(move || {
+                try_extract_livephoto_zip(&zip_path_owned, &zip_name_owned, &extract_tmp)
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten();
+
+            if let Some(extracted) = extracted_opt {
                 let base_created = pick_older_timestamp(
                     &file.created_time,
                     extracted.timestamp_override.as_deref(),
@@ -1210,19 +1477,21 @@ pub async fn run_repair_nextcloud_anomalies_with_limit(
                             outcome.remote_target_id
                         );
                         state
-                            .emit_event(
+                            .emit_progress_throttled(
                                 "repair",
                                 JobState::Syncing,
                                 Some(extracted.image_filename.clone()),
-                                format!(
-                                    "[사후 보정] 라이브포토 복구 완료 [{} / 촬영일: {} / 확인: {}]: {} → {} + {}",
-                                    outcome.sync_result.as_str(),
-                                    date_label,
-                                    immich_link,
-                                    file.name,
-                                    extracted.image_filename,
-                                    vid_label
-                                ),
+                                || {
+                                    format!(
+                                        "[사후 보정] 라이브포토 복구 완료 [{} / 촬영일: {} / 확인: {}]: {} → {} + {}",
+                                        outcome.sync_result.as_str(),
+                                        date_label,
+                                        immich_link,
+                                        file.name,
+                                        extracted.image_filename,
+                                        vid_label
+                                    )
+                                },
                             )
                             .await;
                         continue;
@@ -1292,18 +1561,20 @@ pub async fn run_repair_nextcloud_anomalies_with_limit(
                                 "CREATED(신규 업로드)"
                             };
                             state
-                                .emit_event(
+                                .emit_progress_throttled(
                                     "repair",
                                     JobState::Syncing,
                                     Some(restored_name.clone()),
-                                    format!(
-                                        "[사후 보정] (null) 미디어 복구 완료 [{} / 촬영일: {} / 확인: {}]: {} → {}",
-                                        status_note,
-                                        date_label,
-                                        immich_link,
-                                        file.name,
-                                        restored_name
-                                    ),
+                                    || {
+                                        format!(
+                                            "[사후 보정] (null) 미디어 복구 완료 [{} / 촬영일: {} / 확인: {}]: {} → {}",
+                                            status_note,
+                                            date_label,
+                                            immich_link,
+                                            file.name,
+                                            restored_name
+                                        )
+                                    },
                                 )
                                 .await;
                         }
@@ -1354,14 +1625,16 @@ pub async fn run_repair_nextcloud_anomalies_with_limit(
                             repaired_count += 1;
                             state.processed_files.fetch_add(1, Ordering::SeqCst);
                             state
-                                .emit_event(
+                                .emit_progress_throttled(
                                     "repair",
                                     JobState::Syncing,
                                     Some(restored_name.clone()),
-                                    format!(
-                                        "[사후 보정] (null) 문서 확장자 복원 완료 (Nextcloud): {} → {}",
-                                        file.name, restored_name
-                                    ),
+                                    || {
+                                        format!(
+                                            "[사후 보정] (null) 문서 확장자 복원 완료 (Nextcloud): {} → {}",
+                                            file.name, restored_name
+                                        )
+                                    },
                                 )
                                 .await;
                         }
@@ -1412,14 +1685,16 @@ pub async fn run_repair_nextcloud_anomalies_with_limit(
                             repaired_count += 1;
                             state.processed_files.fetch_add(1, Ordering::SeqCst);
                             state
-                                .emit_event(
+                                .emit_progress_throttled(
                                     "repair",
                                     JobState::Syncing,
                                     Some(restored_name.clone()),
-                                    format!(
-                                        "[사후 보정] (null) 압축파일 확장자 복원 완료 (Nextcloud): {} → {}",
-                                        file.name, restored_name
-                                    ),
+                                    || {
+                                        format!(
+                                            "[사후 보정] (null) 압축파일 확장자 복원 완료 (Nextcloud): {} → {}",
+                                            file.name, restored_name
+                                        )
+                                    },
                                 )
                                 .await;
                         }
@@ -1527,11 +1802,11 @@ pub async fn run_stage_gdrive_to_immich_album_with_limit(
 
     let target_limiter =
         RateLimiter::new((config.rate_limit_rps * 10.0).max(50.0), config.max_retries);
-    let immich_target = ImmichTarget::new(
+    let immich_target = Arc::new(ImmichTarget::new(
         config.immich_url.clone(),
         config.immich_api_key.clone(),
         target_limiter,
-    );
+    ));
 
     let album_id = immich_target.ensure_album_by_name(album_name).await?;
 
@@ -1909,15 +2184,17 @@ pub async fn run_move_immich_album_to_nextcloud_with_limit(
         moved_count += 1;
         state.processed_files.fetch_add(1, Ordering::SeqCst);
         state
-            .emit_event(
+            .emit_progress_throttled(
                 "repair",
                 JobState::Syncing,
                 Some(filename.clone()),
-                format!(
-                    "[앨범 핀포인트 이동] Immich → Nextcloud 이관 완료: {}/{}",
-                    parent_path.trim_end_matches('/'),
-                    filename
-                ),
+                || {
+                    format!(
+                        "[앨범 핀포인트 이동] Immich → Nextcloud 이관 완료: {}/{}",
+                        parent_path.trim_end_matches('/'),
+                        filename
+                    )
+                },
             )
             .await;
     }
@@ -1956,11 +2233,11 @@ pub async fn run_merge_immich_duplicates_with_limit(
 
     let target_limiter =
         RateLimiter::new((config.rate_limit_rps * 10.0).max(50.0), config.max_retries);
-    let immich_target = ImmichTarget::new(
+    let immich_target = Arc::new(ImmichTarget::new(
         config.immich_url.clone(),
         config.immich_api_key.clone(),
         target_limiter,
-    );
+    ));
 
     let groups = immich_target.get_duplicates().await?;
     let mut plans: Vec<Box<crate::targets::immich::DuplicateMergePlan>> = groups
@@ -2009,6 +2286,48 @@ pub async fn run_merge_immich_duplicates_with_limit(
 
     let all_albums = immich_target.list_all_albums().await?;
     let has_non_empty_albums = !all_albums.is_empty();
+    let mut album_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut albums_preloaded = !has_non_empty_albums;
+
+    if has_non_empty_albums {
+        let populated: Vec<(String, String)> = all_albums
+            .iter()
+            .filter(|a| a.asset_count > 0 && !a.id.trim().is_empty())
+            .map(|a| (a.id.clone(), a.album_name.clone()))
+            .collect();
+        let fetched: Vec<Result<(String, String, Vec<_>)>> = stream::iter(populated)
+            .map(|(aid, aname)| {
+                let target = Arc::clone(&immich_target);
+                async move {
+                    let assets = target.get_album_assets(&aid).await?;
+                    Ok((aid, aname, assets))
+                }
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
+
+        let mut all_ok = true;
+        for item in fetched {
+            match item {
+                Ok((aid, aname, assets)) => {
+                    for asset in assets {
+                        if !asset.id.is_empty() {
+                            album_map
+                                .entry(asset.id)
+                                .or_default()
+                                .push((aid.clone(), aname.clone()));
+                        }
+                    }
+                }
+                Err(_) => {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
+        albums_preloaded = all_ok;
+    }
 
     let mut merged_groups = 0u64;
     let mut trashed_assets = 0u64;
@@ -2019,7 +2338,23 @@ pub async fn run_merge_immich_duplicates_with_limit(
         }
 
         let mut albums_to_join: Vec<(String, String)> = Vec::new();
-        if has_non_empty_albums {
+        if has_non_empty_albums && albums_preloaded {
+            let mut seen_album_ids: HashSet<String> = album_map
+                .get(&plan.winner.id)
+                .into_iter()
+                .flatten()
+                .map(|(aid, _)| aid.clone())
+                .collect();
+            for loser in &plan.losers {
+                if let Some(list) = album_map.get(&loser.id) {
+                    for (aid, aname) in list {
+                        if seen_album_ids.insert(aid.clone()) {
+                            albums_to_join.push((aid.clone(), aname.clone()));
+                        }
+                    }
+                }
+            }
+        } else if has_non_empty_albums {
             let winner_albums = match immich_target.get_albums_for_asset(&plan.winner.id).await {
                 Ok(list) => list,
                 Err(err) => {
@@ -2136,19 +2471,21 @@ pub async fn run_merge_immich_duplicates_with_limit(
             trashed_assets += plan.loser_ids.len() as u64;
             state.processed_files.fetch_add(1, Ordering::SeqCst);
             state
-                .emit_event(
+                .emit_progress_throttled(
                     "repair",
                     JobState::Syncing,
                     Some(plan.winner.original_file_name.clone()),
-                    format!(
-                        "[{}] 유지: {} ({:.2} MB) | {} | 휴지통 이동 예정: {}건 ({})",
-                        mode_tag,
-                        plan.winner.original_file_name,
-                        winner_mb,
-                        absorbed_summary,
-                        plan.loser_ids.len(),
-                        loser_names.join(", ")
-                    ),
+                    || {
+                        format!(
+                            "[{}] 유지: {} ({:.2} MB) | {} | 휴지통 이동 예정: {}건 ({})",
+                            mode_tag,
+                            plan.winner.original_file_name,
+                            winner_mb,
+                            absorbed_summary,
+                            plan.loser_ids.len(),
+                            loser_names.join(", ")
+                        )
+                    },
                 )
                 .await;
             continue;
@@ -2292,12 +2629,18 @@ pub async fn run_merge_immich_duplicates_with_limit(
             .iter()
             .filter_map(|l| l.device_asset_id.clone())
             .collect();
+        let loser_sha1_hashes: Vec<String> = plan
+            .losers
+            .iter()
+            .filter_map(|l| decode_immich_checksum_to_hex(l.checksum.as_deref()))
+            .collect();
         let winner_sha1_hex = decode_immich_checksum_to_hex(plan.winner.checksum.as_deref());
         if let Err(err) = state
             .db
-            .remap_merged_immich_assets(
+            .remap_merged_immich_assets_with_hashes(
                 &plan.loser_ids,
                 &loser_device_ids,
+                &loser_sha1_hashes,
                 &plan.winner.id,
                 winner_sha1_hex.as_deref(),
             )
@@ -2320,18 +2663,20 @@ pub async fn run_merge_immich_duplicates_with_limit(
         trashed_assets += plan.loser_ids.len() as u64;
         state.processed_files.fetch_add(1, Ordering::SeqCst);
         state
-            .emit_event(
+            .emit_progress_throttled(
                 "repair",
                 JobState::Syncing,
                 Some(plan.winner.original_file_name.clone()),
-                format!(
-                    "[{}] 병합 완료: {} ({:.2} MB) 유지 | {} | 중복 {}건 휴지통 이동",
-                    mode_tag,
-                    plan.winner.original_file_name,
-                    winner_mb,
-                    absorbed_summary,
-                    plan.loser_ids.len()
-                ),
+                || {
+                    format!(
+                        "[{}] 병합 완료: {} ({:.2} MB) 유지 | {} | 중복 {}건 휴지통 이동",
+                        mode_tag,
+                        plan.winner.original_file_name,
+                        winner_mb,
+                        absorbed_summary,
+                        plan.loser_ids.len()
+                    )
+                },
             )
             .await;
     }

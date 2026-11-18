@@ -1554,3 +1554,339 @@ async fn test_stage_gdrive_origin_immich_assets_to_album_auto_creates_and_filter
         Some("asset-dup-resolved")
     );
 }
+
+#[tokio::test]
+async fn test_delete_verification_propfind_trashed_healed_and_include_target_deleted_circuit_breaker()
+{
+    use mybox_immich_sync::db::FileUpsert;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_delete_verify.db");
+    let tmp_download_dir = temp_dir.path().join("tmp_delete_verify");
+
+    let propfind_xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/Docs/</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/Docs/ok.pdf</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype/><d:getcontentlength>100</d:getcontentlength></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/Docs/mismatch.pdf</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype/><d:getcontentlength>999</d:getcontentlength></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+
+    // 1 PROPFIND per run covers both Nextcloud files in `/Docs` with 0 HEAD calls!
+    Mock::given(method("PROPFIND"))
+        .and(path(
+            "/remote.php/dav/files/ncuser/Cloud-Backup/MyBox/Docs/",
+        ))
+        .respond_with(ResponseTemplate::new(207).set_body_string(propfind_xml))
+        .expect(3)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "imm_trashed", "action": "accept" },
+                { "id": "imm_healed", "action": "accept" },
+                { "id": "imm_missing", "action": "accept" }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/uuid-trashed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "uuid-trashed",
+            "isTrashed": true
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // 20 zero-bytes base64 = 40 zero hex characters
+    Mock::given(method("GET"))
+        .and(path("/api/assets/uuid-healed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "uuid-healed",
+            "isTrashed": false,
+            "checksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/uuid-missing"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+
+    for id in ["nc_ok", "imm_trashed", "imm_healed", "imm_missing"] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/drive/resources/{}", id)))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+    }
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: tmp_download_dir.to_str().unwrap().to_string(),
+        mybox_pat: "test_pat".to_string(),
+        mybox_api_base: mock_server.uri(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_immich_key".to_string(),
+        enable_nextcloud: true,
+        nextcloud_url: mock_server.uri(),
+        nextcloud_user: "ncuser".to_string(),
+        nextcloud_app_password: "ncpassword".to_string(),
+        nextcloud_base_dir: "/Cloud-Backup".to_string(),
+        rate_limit_rps: 200.0,
+        concurrency: 2,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    db.upsert_files(&[
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "nc_ok".to_string(),
+            name: "ok.pdf".to_string(),
+            parent_path: "/Docs".to_string(),
+            size: 100,
+            created_time: "2026-01-01T00:00:00Z".to_string(),
+            modified_time: "2026-01-01T00:00:00Z".to_string(),
+            target_type: "nextcloud".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "nc_mismatch".to_string(),
+            name: "mismatch.pdf".to_string(),
+            parent_path: "/Docs".to_string(),
+            size: 200,
+            created_time: "2026-01-02T00:00:00Z".to_string(),
+            modified_time: "2026-01-02T00:00:00Z".to_string(),
+            target_type: "nextcloud".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "imm_trashed".to_string(),
+            name: "trashed.jpg".to_string(),
+            parent_path: "/Photos".to_string(),
+            size: 300,
+            created_time: "2026-01-03T00:00:00Z".to_string(),
+            modified_time: "2026-01-03T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "imm_healed".to_string(),
+            name: "healed.jpg".to_string(),
+            parent_path: "/Photos".to_string(),
+            size: 400,
+            created_time: "2026-01-04T00:00:00Z".to_string(),
+            modified_time: "2026-01-04T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "imm_missing".to_string(),
+            name: "missing.jpg".to_string(),
+            parent_path: "/Photos".to_string(),
+            size: 500,
+            created_time: "2026-01-05T00:00:00Z".to_string(),
+            modified_time: "2026-01-05T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+    ])
+    .await
+    .unwrap();
+
+    db.mark_file_uploaded(
+        "mybox",
+        "nc_ok",
+        "h_nc_ok",
+        "/Cloud-Backup/MyBox/Docs/ok.pdf",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "nc_mismatch",
+        "h_nc_mm",
+        "/Cloud-Backup/MyBox/Docs/mismatch.pdf",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "imm_trashed",
+        "1111111111111111111111111111111111111111",
+        "uuid-trashed",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "imm_healed",
+        "2222222222222222222222222222222222222222",
+        "uuid-healed",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "imm_missing",
+        "3333333333333333333333333333333333333333",
+        "uuid-missing",
+        "created",
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::new(db, cfg.clone());
+    let pipeline = SyncPipeline::from_config(state.clone(), cfg, "mybox").unwrap();
+
+    // 1. Dry-run heals `imm_healed` SHA-1 in SQLite without deleting anything
+    let dry_stats = pipeline.run_delete_with_options(true, false).await.unwrap();
+    assert_eq!(dry_stats.deleted_files, 0);
+    let after_dry = state
+        .db
+        .get_uploaded_files_for_delete("mybox", 10)
+        .await
+        .unwrap();
+    let healed_rec = after_dry
+        .iter()
+        .find(|r| r.resource_id == "imm_healed")
+        .unwrap();
+    assert_eq!(
+        healed_rec.sha1_hash.as_deref(),
+        Some("0000000000000000000000000000000000000000")
+    );
+
+    // 2. Actual delete with `include_target_deleted = false`:
+    // Deletes `nc_ok`, `imm_trashed`, `imm_healed`; holds back `nc_mismatch` and `imm_missing`.
+    let stats_strict = pipeline.run_delete_with_options(false, false).await.unwrap();
+    assert_eq!(stats_strict.deleted_files, 3);
+
+    // 3. Actual delete with `include_target_deleted = true`:
+    // `imm_missing` gets deleted while `nc_mismatch` (SizeMismatch) stays held back!
+    let stats_inc = pipeline.run_delete_with_options(false, true).await.unwrap();
+    assert_eq!(stats_inc.deleted_files, 4);
+
+    let remaining = state
+        .db
+        .get_uploaded_files_for_delete("mybox", 10)
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].resource_id, "nc_mismatch");
+
+    // 4. Circuit Breaker test: 5 Immich items where ALL 5 return 404 (0 alive, >= 5 total) -> blocked!
+    let cb_mock = MockServer::start().await;
+    let cb_dir = TempDir::new().unwrap();
+    let cb_db_path = cb_dir.path().join("cb.db");
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                { "id": "cb_0", "action": "accept" },
+                { "id": "cb_1", "action": "accept" },
+                { "id": "cb_2", "action": "accept" },
+                { "id": "cb_3", "action": "accept" },
+                { "id": "cb_4", "action": "accept" }
+            ]
+        })))
+        .mount(&cb_mock)
+        .await;
+
+    for i in 0..5 {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/assets/cb-uuid-{}", i)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&cb_mock)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/drive/resources/cb_{}", i)))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&cb_mock)
+            .await;
+    }
+
+    let cb_cfg = AppConfig {
+        db_path: cb_db_path.to_str().unwrap().to_string(),
+        tmp_dir: cb_dir.path().join("tmp").to_str().unwrap().to_string(),
+        mybox_pat: "test_pat".to_string(),
+        mybox_api_base: cb_mock.uri(),
+        immich_url: cb_mock.uri(),
+        immich_api_key: "test_key".to_string(),
+        enable_nextcloud: false,
+        rate_limit_rps: 200.0,
+        concurrency: 2,
+        ..AppConfig::default()
+    };
+    let cb_db = CheckpointDB::connect(&cb_cfg.db_path).await.unwrap();
+    let cb_upserts: Vec<FileUpsert> = (0..5)
+        .map(|i| FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: format!("cb_{}", i),
+            name: format!("img_{}.jpg", i),
+            parent_path: "/Photos".to_string(),
+            size: 1000,
+            created_time: "2026-01-01T00:00:00Z".to_string(),
+            modified_time: "2026-01-01T00:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        })
+        .collect();
+    cb_db.upsert_files(&cb_upserts).await.unwrap();
+    for i in 0..5 {
+        cb_db
+            .mark_file_uploaded(
+                "mybox",
+                &format!("cb_{}", i),
+                &format!("{:040x}", i + 1),
+                &format!("cb-uuid-{}", i),
+                "created",
+            )
+            .await
+            .unwrap();
+    }
+
+    let cb_state = AppState::new(cb_db, cb_cfg.clone());
+    let cb_pipeline = SyncPipeline::from_config(cb_state, cb_cfg, "mybox").unwrap();
+    let cb_stats = cb_pipeline
+        .run_delete_with_options(false, true)
+        .await
+        .unwrap();
+    assert_eq!(cb_stats.deleted_files, 0);
+}

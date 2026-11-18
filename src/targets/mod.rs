@@ -25,6 +25,21 @@ pub struct UploadOutcome {
     pub sync_result: SyncResultKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyStatus {
+    Present {
+        healed_target_id: Option<String>,
+        healed_sha1: Option<String>,
+    },
+    TrashedOnTarget,
+    MissingOnTarget,
+    SizeMismatch {
+        expected: i64,
+        actual: i64,
+    },
+    TargetError(String),
+}
+
 #[async_trait]
 pub trait TargetProvider: Send + Sync {
     fn target_type(&self) -> TargetType;
@@ -42,12 +57,27 @@ pub trait TargetProvider: Send + Sync {
     async fn upload(&self, ctx: UploadContext<'_>) -> Result<UploadOutcome>;
     async fn verify_exists(&self, file: &FileRecord) -> Result<bool>;
 
-    async fn verify_exists_batch(&self, files: &[FileRecord]) -> Result<HashMap<String, bool>> {
+    async fn inspect_exists_batch(&self, files: &[FileRecord]) -> HashMap<String, VerifyStatus> {
         let mut out = HashMap::with_capacity(files.len());
         for f in files {
-            let ok = self.verify_exists(f).await.unwrap_or(false);
-            out.insert(f.resource_id.clone(), ok);
+            let st = match self.verify_exists(f).await {
+                Ok(true) => VerifyStatus::Present {
+                    healed_target_id: None,
+                    healed_sha1: None,
+                },
+                Ok(false) => VerifyStatus::MissingOnTarget,
+                Err(e) => VerifyStatus::TargetError(e.to_string()),
+            };
+            out.insert(f.resource_id.clone(), st);
         }
-        Ok(out)
+        out
+    }
+
+    async fn verify_exists_batch(&self, files: &[FileRecord]) -> Result<HashMap<String, bool>> {
+        let inspected = self.inspect_exists_batch(files).await;
+        Ok(inspected
+            .into_iter()
+            .map(|(k, v)| (k, matches!(v, VerifyStatus::Present { .. })))
+            .collect())
     }
 }

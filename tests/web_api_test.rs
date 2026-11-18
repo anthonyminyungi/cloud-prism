@@ -111,6 +111,7 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     assert!(html.contains("id=\"navTabSettings\""));
     assert!(html.contains("id=\"syncView\""));
     assert!(html.contains("id=\"cleanupView\""));
+    assert!(html.contains("id=\"chkIncludeTargetDeleted\""));
     assert!(html.contains("id=\"settingsView\""));
     assert!(html.contains("id=\"zipDropzone\""));
     assert!(html.contains("id=\"cfgTakeoutDir\""));
@@ -426,4 +427,41 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
         json!(["mybox", "takeout"])
     );
     assert!(temp_dir.path().join("settings.json").exists());
+
+    // 9. Verify POST /api/jobs/start accepts include_target_deleted flag for delete dry-run
+    let del_start_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/jobs/start")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "source": "mybox",
+                        "mode": "delete",
+                        "dry_run": true,
+                        "include_target_deleted": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del_start_resp.status(), StatusCode::ACCEPTED);
+    let del_start_json: Value = serde_json::from_slice(
+        &to_bytes(del_start_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(del_start_json["include_target_deleted"], true);
+
+    for _ in 0..50 {
+        if *state.job_state.read().await == JobState::Idle {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
 }

@@ -55,6 +55,8 @@ enum Commands {
         source: String,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        include_target_deleted: bool,
     },
     /// Print checkpoint status table
     Status {
@@ -109,10 +111,19 @@ async fn main() -> Result<()> {
             let stats = pipeline.run_sync().await?;
             println!("Sync completed: {:?}", stats);
         }
-        Commands::Delete { source, dry_run } => {
+        Commands::Delete {
+            source,
+            dry_run,
+            include_target_deleted,
+        } => {
             let pipeline = SyncPipeline::from_config(state, cfg, &source)?;
-            let stats = pipeline.run_delete(dry_run).await?;
-            println!("Delete (dry_run={}) completed: {:?}", dry_run, stats);
+            let stats = pipeline
+                .run_delete_with_options(dry_run, include_target_deleted)
+                .await?;
+            println!(
+                "Delete (dry_run={}, include_target_deleted={}) completed: {:?}",
+                dry_run, include_target_deleted, stats
+            );
         }
         Commands::Status { source } => {
             let stats = state.db.get_stats(&source).await?;

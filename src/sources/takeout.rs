@@ -184,7 +184,111 @@ struct TakeoutArchiveIndex {
 
 pub struct GoogleTakeoutProvider {
     takeout_dir: PathBuf,
-    index_cache: Arc<Mutex<Option<TakeoutArchiveIndex>>>,
+    index_cache: Arc<Mutex<Option<Arc<TakeoutArchiveIndex>>>>,
+}
+
+fn list_zip_paths_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("zip"))
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+fn compute_zip_signatures_in_dir(dir: &Path) -> Result<Vec<(PathBuf, u64, Option<SystemTime>)>> {
+    let paths = list_zip_paths_in_dir(dir)?;
+    let mut sigs = Vec::with_capacity(paths.len());
+    for p in paths {
+        if let Ok(meta) = std::fs::metadata(&p) {
+            sigs.push((p, meta.len(), meta.modified().ok()));
+        }
+    }
+    Ok(sigs)
+}
+
+fn get_or_build_index_in_dir(
+    takeout_dir: &Path,
+    index_cache: &Mutex<Option<Arc<TakeoutArchiveIndex>>>,
+) -> Result<Arc<TakeoutArchiveIndex>> {
+    let sigs = compute_zip_signatures_in_dir(takeout_dir)?;
+    if let Ok(guard) = index_cache.lock() {
+        if let Some(ref cached) = *guard {
+            if cached.zip_signatures == sigs {
+                return Ok(Arc::clone(cached));
+            }
+        }
+    }
+
+    let mut entry_to_zip = HashMap::new();
+    let mut sidecar_to_zip = HashMap::new();
+    let mut non_media_count = 0usize;
+
+    for (zip_path, _, _) in &sigs {
+        let Ok(file) = File::open(zip_path) else {
+            continue;
+        };
+        let Ok(mut archive) = ZipArchive::new(file) else {
+            continue;
+        };
+
+        for i in 0..archive.len() {
+            let Ok(zf) = archive.by_index_raw(i) else {
+                continue;
+            };
+            if zf.is_dir() {
+                continue;
+            }
+            let entry_name = zf.name().to_string();
+            if entry_name.to_ascii_lowercase().ends_with(".json") {
+                sidecar_to_zip
+                    .entry(entry_name)
+                    .or_insert_with(|| zip_path.clone());
+                continue;
+            }
+
+            let filename = Path::new(&entry_name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&entry_name)
+                .to_string();
+            if is_takeout_system_entry(&entry_name, &filename) {
+                continue;
+            }
+
+            if let std::collections::hash_map::Entry::Vacant(vacant) =
+                entry_to_zip.entry(entry_name)
+            {
+                vacant.insert(zip_path.clone());
+                if TargetRouter::classify(&filename, false).is_none() {
+                    non_media_count += 1;
+                }
+            }
+        }
+    }
+
+    let built = Arc::new(TakeoutArchiveIndex {
+        zip_signatures: sigs,
+        entry_to_zip,
+        sidecar_to_zip,
+        non_media_count,
+    });
+
+    if let Ok(mut guard) = index_cache.lock() {
+        *guard = Some(Arc::clone(&built));
+    }
+
+    Ok(built)
 }
 
 impl GoogleTakeoutProvider {
@@ -196,104 +300,11 @@ impl GoogleTakeoutProvider {
     }
 
     fn list_zip_paths(&self) -> Result<Vec<PathBuf>> {
-        if !self.takeout_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.takeout_dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| ext.eq_ignore_ascii_case("zip"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        paths.sort();
-        Ok(paths)
+        list_zip_paths_in_dir(&self.takeout_dir)
     }
 
-    fn compute_zip_signatures(&self) -> Result<Vec<(PathBuf, u64, Option<SystemTime>)>> {
-        let paths = self.list_zip_paths()?;
-        let mut sigs = Vec::with_capacity(paths.len());
-        for p in paths {
-            if let Ok(meta) = std::fs::metadata(&p) {
-                sigs.push((p, meta.len(), meta.modified().ok()));
-            }
-        }
-        Ok(sigs)
-    }
-
-    fn get_or_build_index(&self) -> Result<TakeoutArchiveIndex> {
-        let sigs = self.compute_zip_signatures()?;
-        if let Ok(guard) = self.index_cache.lock() {
-            if let Some(ref cached) = *guard {
-                if cached.zip_signatures == sigs {
-                    return Ok(cached.clone());
-                }
-            }
-        }
-
-        let mut entry_to_zip = HashMap::new();
-        let mut sidecar_to_zip = HashMap::new();
-        let mut non_media_count = 0usize;
-
-        for (zip_path, _, _) in &sigs {
-            let Ok(file) = File::open(zip_path) else {
-                continue;
-            };
-            let Ok(mut archive) = ZipArchive::new(file) else {
-                continue;
-            };
-
-            for i in 0..archive.len() {
-                let Ok(zf) = archive.by_index_raw(i) else {
-                    continue;
-                };
-                if zf.is_dir() {
-                    continue;
-                }
-                let entry_name = zf.name().to_string();
-                if entry_name.to_ascii_lowercase().ends_with(".json") {
-                    sidecar_to_zip
-                        .entry(entry_name)
-                        .or_insert_with(|| zip_path.clone());
-                    continue;
-                }
-
-                let filename = Path::new(&entry_name)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&entry_name)
-                    .to_string();
-                if is_takeout_system_entry(&entry_name, &filename) {
-                    continue;
-                }
-
-                if let std::collections::hash_map::Entry::Vacant(vacant) =
-                    entry_to_zip.entry(entry_name)
-                {
-                    vacant.insert(zip_path.clone());
-                    if TargetRouter::classify(&filename, false).is_none() {
-                        non_media_count += 1;
-                    }
-                }
-            }
-        }
-
-        let built = TakeoutArchiveIndex {
-            zip_signatures: sigs,
-            entry_to_zip,
-            sidecar_to_zip,
-            non_media_count,
-        };
-
-        if let Ok(mut guard) = self.index_cache.lock() {
-            *guard = Some(built.clone());
-        }
-
-        Ok(built)
+    fn get_or_build_index(&self) -> Result<Arc<TakeoutArchiveIndex>> {
+        get_or_build_index_in_dir(&self.takeout_dir, &self.index_cache)
     }
 
     /// Returns the number of non-media user files inside the Takeout ZIP archives
@@ -379,13 +390,13 @@ impl GoogleTakeoutProvider {
         None
     }
 
-    fn resolve_entry_zip_path(
-        &self,
+    fn resolve_entry_zip_path_in_dir(
+        takeout_dir: &Path,
         resource_id: &str,
         index: &TakeoutArchiveIndex,
     ) -> Result<(PathBuf, String)> {
         if let Some((zip_name, entry_name)) = resource_id.split_once("::") {
-            let candidate_path = self.takeout_dir.join(zip_name);
+            let candidate_path = takeout_dir.join(zip_name);
             if candidate_path.exists() {
                 return Ok((candidate_path, entry_name.to_string()));
             }
@@ -400,7 +411,7 @@ impl GoogleTakeoutProvider {
             return Ok((zip_path.clone(), entry_name.to_string()));
         }
 
-        for zip_path in self.list_zip_paths()? {
+        for zip_path in list_zip_paths_in_dir(takeout_dir)? {
             let Ok(file) = File::open(&zip_path) else {
                 continue;
             };
@@ -447,63 +458,71 @@ impl SourceProvider for GoogleTakeoutProvider {
         _folder_path: &str,
         _cursor: Option<&str>,
     ) -> Result<ListPage> {
-        let mut page = ListPage::default();
-        if folder_id != "root" || !self.takeout_dir.exists() {
-            return Ok(page);
+        if folder_id != "root" {
+            return Ok(ListPage::default());
         }
-
-        let mut seen_entries = HashSet::new();
-
-        for zip_path in self.list_zip_paths()? {
-            let file = File::open(&zip_path)?;
-            let mut archive = ZipArchive::new(file)?;
-
-            for i in 0..archive.len() {
-                let zf = archive.by_index_raw(i)?;
-                if zf.is_dir() {
-                    continue;
-                }
-                let entry_name = zf.name().to_string();
-                let path_obj = Path::new(&entry_name);
-                let filename = path_obj
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&entry_name)
-                    .to_string();
-
-                if is_takeout_system_entry(&entry_name, &filename) {
-                    continue;
-                }
-                if !seen_entries.insert(entry_name.clone()) {
-                    continue;
-                }
-
-                let parent = path_obj
-                    .parent()
-                    .and_then(|p| p.to_str())
-                    .map(normalize_takeout_parent_path)
-                    .unwrap_or_else(|| "/".to_string());
-                let entry_timestamp = zip_datetime_to_rfc3339(zf.last_modified());
-
-                page.files.push(RemoteFile {
-                    resource_id: entry_name,
-                    name: filename,
-                    parent_path: parent,
-                    size: zf.size() as i64,
-                    created_time: entry_timestamp.clone(),
-                    modified_time: entry_timestamp,
-                    sha1_hash: None,
-                });
+        let takeout_dir = self.takeout_dir.clone();
+        tokio::task::spawn_blocking(move || -> Result<ListPage> {
+            let mut page = ListPage::default();
+            if !takeout_dir.exists() {
+                return Ok(page);
             }
-        }
 
-        page.files.sort_by(|a, b| {
-            a.created_time
-                .cmp(&b.created_time)
-                .then_with(|| a.modified_time.cmp(&b.modified_time))
-        });
+            let mut seen_entries = HashSet::new();
 
-        Ok(page)
+            for zip_path in list_zip_paths_in_dir(&takeout_dir)? {
+                let file = File::open(&zip_path)?;
+                let mut archive = ZipArchive::new(file)?;
+
+                for i in 0..archive.len() {
+                    let zf = archive.by_index_raw(i)?;
+                    if zf.is_dir() {
+                        continue;
+                    }
+                    let entry_name = zf.name().to_string();
+                    let path_obj = Path::new(&entry_name);
+                    let filename = path_obj
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&entry_name)
+                        .to_string();
+
+                    if is_takeout_system_entry(&entry_name, &filename) {
+                        continue;
+                    }
+                    if !seen_entries.insert(entry_name.clone()) {
+                        continue;
+                    }
+
+                    let parent = path_obj
+                        .parent()
+                        .and_then(|p| p.to_str())
+                        .map(normalize_takeout_parent_path)
+                        .unwrap_or_else(|| "/".to_string());
+                    let entry_timestamp = zip_datetime_to_rfc3339(zf.last_modified());
+
+                    page.files.push(RemoteFile {
+                        resource_id: entry_name,
+                        name: filename,
+                        parent_path: parent,
+                        size: zf.size() as i64,
+                        created_time: entry_timestamp.clone(),
+                        modified_time: entry_timestamp,
+                        sha1_hash: None,
+                    });
+                }
+            }
+
+            page.files.sort_by(|a, b| {
+                a.created_time
+                    .cmp(&b.created_time)
+                    .then_with(|| a.modified_time.cmp(&b.modified_time))
+            });
+
+            Ok(page)
+        })
+        .await
+        .map_err(|e| anyhow!("Takeout 목록 스캔 스레드 오류: {}", e))?
     }
 
     async fn download_to_temp(
@@ -512,9 +531,6 @@ impl SourceProvider for GoogleTakeoutProvider {
         filename: &str,
         tmp_dir: &Path,
     ) -> Result<DownloadedSourceFile> {
-        let index = self.get_or_build_index()?;
-        let (zip_path, entry_name) = self.resolve_entry_zip_path(resource_id, &index)?;
-
         tokio::fs::create_dir_all(tmp_dir).await?;
         let id_hash = hex::encode(Sha1::digest(resource_id.as_bytes()));
         let id_hash12 = &id_hash[..12];
@@ -525,10 +541,16 @@ impl SourceProvider for GoogleTakeoutProvider {
         ));
         let temp_guard = TempFileGuard::new(temp_path.clone());
         let is_media = TargetRouter::classify(filename, false).is_some();
-        let sidecar_to_zip = index.sidecar_to_zip;
+
+        let takeout_dir = self.takeout_dir.clone();
+        let index_cache = Arc::clone(&self.index_cache);
+        let resource_id = resource_id.to_string();
 
         let (sha1_hash, total_bytes, created_override) =
             tokio::task::spawn_blocking(move || -> Result<(String, u64, Option<String>)> {
+                let index = get_or_build_index_in_dir(&takeout_dir, &index_cache)?;
+                let (zip_path, entry_name) =
+                    Self::resolve_entry_zip_path_in_dir(&takeout_dir, &resource_id, &index)?;
                 let file = File::open(&zip_path)?;
                 let mut archive = ZipArchive::new(file)?;
                 let mut hasher = Sha1::new();
@@ -554,7 +576,7 @@ impl SourceProvider for GoogleTakeoutProvider {
                         &zip_path,
                         &mut archive,
                         &entry_name,
-                        &sidecar_to_zip,
+                        &index.sidecar_to_zip,
                     )
                 } else {
                     None

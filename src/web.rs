@@ -934,6 +934,8 @@ struct StartJobRequest {
     #[serde(default)]
     dry_run: bool,
     #[serde(default)]
+    include_target_deleted: bool,
+    #[serde(default)]
     limit: Option<u64>,
 }
 
@@ -997,6 +999,7 @@ async fn start_job(
     let state_clone = state.clone();
     let mode = req.mode;
     let dry_run = req.dry_run;
+    let include_target_deleted = req.include_target_deleted;
     let total_sources = pipelines.len();
 
     let handle = tokio::spawn(async move {
@@ -1033,7 +1036,11 @@ async fn start_job(
                 JobMode::Auto => pipeline.run_auto().await,
                 JobMode::Scan => pipeline.run_scan().await,
                 JobMode::Sync => pipeline.run_sync().await,
-                JobMode::Delete => pipeline.run_delete(dry_run).await,
+                JobMode::Delete => {
+                    pipeline
+                        .run_delete_with_options(dry_run, include_target_deleted)
+                        .await
+                }
             };
 
             if let Err(err) = res {
@@ -1068,6 +1075,7 @@ async fn start_job(
             "sources": target_sources,
             "mode": req.mode,
             "dry_run": req.dry_run,
+            "include_target_deleted": req.include_target_deleted,
             "limit": req.limit
         })),
     )

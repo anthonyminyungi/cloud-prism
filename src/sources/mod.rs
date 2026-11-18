@@ -20,6 +20,7 @@ use zip::ZipArchive;
 
 pub const DEFAULT_FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 pub const LARGE_FILE_DISK_FALLBACK_THRESHOLD: u64 = 256 * 1024 * 1024; // 256 MB
+pub const IO_STREAM_BUFFER_SIZE: usize = 256 * 1024;
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 15;
 const HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 const HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
@@ -360,7 +361,8 @@ pub async fn stream_response_to_temp(
     let temp_path = tmp_dir.join(format!("{}_{}_{}", source_prefix, safe_id, safe_name));
     let temp_guard = TempFileGuard::new(temp_path);
 
-    let mut file = tokio::fs::File::create(temp_guard.path()).await?;
+    let file = tokio::fs::File::create(temp_guard.path()).await?;
+    let mut writer = tokio::io::BufWriter::with_capacity(IO_STREAM_BUFFER_SIZE, file);
     let mut hasher = Sha1::new();
     let mut total_bytes: u64 = 0;
     let mut stream = resp.bytes_stream();
@@ -380,11 +382,11 @@ pub async fn stream_response_to_temp(
         };
         let chunk = chunk_res?;
         hasher.update(&chunk);
-        file.write_all(&chunk).await?;
+        writer.write_all(&chunk).await?;
         total_bytes += chunk.len() as u64;
     }
-    file.flush().await?;
-    drop(file);
+    writer.flush().await?;
+    drop(writer);
 
     Ok(DownloadedSourceFile {
         temp_guard,

@@ -920,6 +920,10 @@
             <div id="cleanupProgressMeta" class="progress-meta num">안전 2단계 절차: 1) Dry-run 시뮬레이션 → 2) 재검증 후 휴지통 이동</div>
           </div>
           <div class="action-toolbar">
+            <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;">
+              <input id="chkIncludeTargetDeleted" type="checkbox" onchange="toggleIncludeTargetDeleted(this.checked)" />
+              <span>타겟(Immich·Nextcloud)에서 이미 직접 삭제한 항목도 함께 정리</span>
+            </label>
             <button id="cleanupStopBtn" class="btn" style="display:none;" onclick="stopJob()">일시정지</button>
           </div>
         </div>
@@ -1166,7 +1170,7 @@
   <div class="modal-backdrop" id="deleteModal">
     <div class="modal">
       <h3 id="deleteModalTitle">완료 항목 원격 삭제 (휴지통 이동)</h3>
-      <p>Immich 또는 Nextcloud로 백업이 완료(UPLOADED)된 파일만 대상이 되며, 삭제 직전 타겟 서버에 파일 해시/크기가 존재하는지 100% 재검증한 뒤 원격 클라우드 휴지통으로
+      <p id="deleteModalDesc">Immich 또는 Nextcloud로 백업이 완료(UPLOADED)된 파일만 대상이 되며, 삭제 직전 타겟 서버에 파일 해시/크기가 존재하는지 100% 재검증한 뒤 원격 클라우드 휴지통으로
         이동합니다. 계속하시겠습니까?</p>
       <div class="modal-actions">
         <button class="btn" onclick="closeDeleteModal()">취소</button>
@@ -1182,6 +1186,10 @@
     let currentJobState = 'idle';
     let initialLogsLoaded = false;
     let pendingDeleteSource = null;
+    let cleanupIncludeTargetDeleted = localStorage.getItem('cp_include_target_deleted') === 'true';
+    let statusFetchInFlight = false;
+    let statusRefreshTimer = null;
+    let logScrollPending = false;
     let latestReadiness = {
       targets_ready: false,
       sync_tab_enabled: false,
@@ -1275,8 +1283,16 @@
       return ` · 남은 시간 ${mins}분 ${remSecs}초`;
     }
 
+    function toggleIncludeTargetDeleted(checked) {
+      cleanupIncludeTargetDeleted = Boolean(checked);
+      localStorage.setItem('cp_include_target_deleted', cleanupIncludeTargetDeleted ? 'true' : 'false');
+    }
+
     function appendLog(time, msg) {
       const box = document.getElementById('logConsole');
+      while (box.childElementCount >= 200) {
+        box.removeChild(box.firstElementChild);
+      }
       const div = document.createElement('div');
       div.className = 'log-line';
       const timeSpan = document.createElement('span');
@@ -1285,7 +1301,13 @@
       div.appendChild(timeSpan);
       div.appendChild(document.createTextNode(msg));
       box.appendChild(div);
-      box.scrollTop = box.scrollHeight;
+      if (!logScrollPending) {
+        logScrollPending = true;
+        requestAnimationFrame(() => {
+          logScrollPending = false;
+          box.scrollTop = box.scrollHeight;
+        });
+      }
     }
 
     async function verifyAllConnections() {
@@ -1436,13 +1458,28 @@
       });
     }
 
+    function scheduleStatusRefresh(delayMs = 1200) {
+      if (statusRefreshTimer) {
+        clearTimeout(statusRefreshTimer);
+      }
+      statusRefreshTimer = setTimeout(() => {
+        statusRefreshTimer = null;
+        fetchStatus();
+      }, delayMs);
+    }
+
     async function fetchStatus() {
+      if (statusFetchInFlight) return;
+      statusFetchInFlight = true;
       try {
         const res = await fetch('/api/status');
         if (!res.ok) return;
         const d = await res.json();
         renderStatus(d);
-      } catch (_) { }
+      } catch (_) {
+      } finally {
+        statusFetchInFlight = false;
+      }
     }
 
     function setInputIfUntouched(id, val) {
@@ -1839,10 +1876,11 @@
 
     async function startBatchJob(sources, mode, dryRun) {
       const limit = mode === 'delete' ? null : getSelectedSampleLimit();
+      const include_target_deleted = mode === 'delete' ? cleanupIncludeTargetDeleted : false;
       const res = await fetch('/api/jobs/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sources, mode, dry_run: dryRun, limit })
+        body: JSON.stringify({ sources, mode, dry_run: dryRun, include_target_deleted, limit })
       });
       if (res.status === 409) {
         appendLog(new Date().toLocaleTimeString(), '이미 실행 중인 작업이 있습니다.');
@@ -1886,6 +1924,12 @@
       pendingDeleteSource = source;
       const name = SOURCE_NAMES[source] || source;
       document.getElementById('deleteModalTitle').textContent = `${name} 완료 항목 휴지통 이동`;
+      const descEl = document.getElementById('deleteModalDesc');
+      if (descEl) {
+        descEl.textContent = cleanupIncludeTargetDeleted
+          ? 'Immich 또는 Nextcloud로 백업이 완료(UPLOADED)된 파일 중 타겟에 보관 중이거나 사용자가 타겟에서 이미 직접 삭제한 항목을 원격 클라우드 휴지통으로 이동합니다. (통신 오류·크기 불일치·타겟 전량 유실 의심 시에는 자동 차단됩니다.) 계속하시겠습니까?'
+          : 'Immich 또는 Nextcloud로 백업이 완료(UPLOADED)된 파일만 대상이 되며, 삭제 직전 타겟 서버에 파일 해시/크기가 존재하는지 100% 재검증한 뒤 원격 클라우드 휴지통으로 이동합니다. 계속하시겠습니까?';
+      }
       document.getElementById('deleteModal').style.display = 'flex';
     }
 
@@ -1908,8 +1952,8 @@
           appendLog((ev.timestamp || '').slice(11, 19), ev.message || '');
           const labelText = ev.current_file ? `${ev.current_file}` : (ev.message || '대기 중');
           document.getElementById('currentFileLabel').textContent = labelText;
-          if (ev.state === 'deleting') {
-            document.getElementById('cleanupTaskLabel').textContent = labelText;
+          if (ev.state === 'deleting' || (ev.state === 'idle' && ev.source === 'mybox')) {
+            document.getElementById('cleanupTaskLabel').textContent = ev.message || labelText;
           }
           const pct = ev.total_files > 0
             ? Math.min(100, Math.round((ev.processed_files / ev.total_files) * 100))
@@ -1918,11 +1962,32 @@
           document.getElementById('progressBar').style.width = `${pct}%`;
           document.getElementById('cleanupProgressBar').style.width = `${pct}%`;
           document.getElementById('progressMeta').textContent = `${pct}% · ${(ev.speed_fps || 0).toFixed(1)} 파일/초${eta}`;
-          fetchStatus();
+          if (ev.state === 'deleting') {
+            document.getElementById('cleanupProgressMeta').textContent = `${pct}% (${ev.processed_files || 0}/${ev.total_files || 0}) · ${(ev.speed_fps || 0).toFixed(1)} 파일/초${eta}`;
+          }
+
+          const dot = document.getElementById('jobStatusDot');
+          const text = document.getElementById('jobStatusText');
+          if (dot && text && ev.state) {
+            dot.className = 'dot';
+            const activeSrc = SOURCE_NAMES[ev.source] || ev.source || '';
+            if (ev.state === 'idle') text.textContent = '대기 중';
+            else if (ev.state === 'scanning') { dot.classList.add('ok'); text.textContent = `${activeSrc} · 스캔 중`; }
+            else if (ev.state === 'syncing') { dot.classList.add('ok'); text.textContent = `${activeSrc} · 동기화 중`; }
+            else if (ev.state === 'deleting') { dot.classList.add('warn'); text.textContent = `${activeSrc} · 정리 중`; }
+            else if (ev.state === 'stopping') { dot.classList.add('warn'); text.textContent = '안전 정지 중'; }
+          }
+
+          if (ev.state === 'idle' || ev.state !== currentJobState) {
+            currentJobState = ev.state || currentJobState;
+            scheduleStatusRefresh(150);
+          }
         } catch (_) { }
       };
     }
 
+    const chkInclude = document.getElementById('chkIncludeTargetDeleted');
+    if (chkInclude) chkInclude.checked = cleanupIncludeTargetDeleted;
     updateThemeButtonLabel();
     fetchStatus();
     connectSSE();

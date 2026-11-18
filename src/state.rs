@@ -83,6 +83,8 @@ pub struct AppState {
     pub event_tx: broadcast::Sender<ProgressEvent>,
     pub job_handle: Mutex<Option<JoinHandle<()>>>,
     pub scheduler_notify: Arc<Notify>,
+    pub boot_instant: Instant,
+    pub last_progress_emit_ms: AtomicU64,
 }
 
 impl AppState {
@@ -109,6 +111,8 @@ impl AppState {
             event_tx,
             job_handle: Mutex::new(None),
             scheduler_notify: Arc::new(Notify::new()),
+            boot_instant: Instant::now(),
+            last_progress_emit_ms: AtomicU64::new(0),
         })
     }
 
@@ -239,6 +243,7 @@ impl AppState {
         *self.current_file.write().await = None;
         self.processed_files.store(0, Ordering::SeqCst);
         self.total_files.store(total, Ordering::SeqCst);
+        self.last_progress_emit_ms.store(0, Ordering::Relaxed);
         *self.job_started_at.write().await = Some(Instant::now());
     }
 
@@ -318,5 +323,31 @@ impl AppState {
         }
 
         let _ = self.event_tx.send(ev);
+    }
+
+    pub async fn emit_progress_throttled<F>(
+        &self,
+        source: &str,
+        state: JobState,
+        current_file: Option<String>,
+        build_msg: F,
+    ) where
+        F: FnOnce() -> String,
+    {
+        const PROGRESS_EMIT_INTERVAL_MS: u64 = 250;
+        let now_ms = self.boot_instant.elapsed().as_millis() as u64;
+        let prev = self.last_progress_emit_ms.load(Ordering::Relaxed);
+        if prev > 0 && now_ms.saturating_sub(prev) < PROGRESS_EMIT_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_progress_emit_ms
+            .compare_exchange(prev, now_ms.max(1), Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let msg = build_msg();
+        self.emit_event(source, state, current_file, msg).await;
     }
 }

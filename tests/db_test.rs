@@ -567,3 +567,202 @@ async fn test_repair_candidates_immich_asset_lookup_and_reclassification() {
     assert_eq!(stats.uploaded_immich_created, 1);
     assert_eq!(stats.uploaded_nextcloud, 3);
 }
+
+#[tokio::test]
+async fn test_rescan_preserves_reclassified_uploaded_records_and_heals_targets_and_sibling_hashes() {
+    use mybox_immich_sync::router::TargetType;
+
+    let db = CheckpointDB::connect(":memory:").await.unwrap();
+
+    let scan_payload = vec![
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_lp_zip".to_string(),
+            name: "IMG_1000.livephoto.zip".to_string(),
+            parent_path: "/2023".to_string(),
+            size: 5000,
+            created_time: "2023-05-01T10:00:00Z".to_string(),
+            modified_time: "2023-05-01T10:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_null_doc".to_string(),
+            name: "report.(null)".to_string(),
+            parent_path: "/Docs".to_string(),
+            size: 1200,
+            created_time: "2023-05-02T10:00:00Z".to_string(),
+            modified_time: "2023-05-02T10:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_moved_nc".to_string(),
+            name: "icon.png".to_string(),
+            parent_path: "/Icons".to_string(),
+            size: 400,
+            created_time: "2023-05-03T10:00:00Z".to_string(),
+            modified_time: "2023-05-03T10:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_corrupted_nc".to_string(),
+            name: "legacy.pdf".to_string(),
+            parent_path: "/Docs".to_string(),
+            size: 900,
+            created_time: "2023-05-04T10:00:00Z".to_string(),
+            modified_time: "2023-05-04T10:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: None,
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "res_dup_sibling".to_string(),
+            name: "dup_copy.jpg".to_string(),
+            parent_path: "/2023".to_string(),
+            size: 1500,
+            created_time: "2023-05-05T10:00:00Z".to_string(),
+            modified_time: "2023-05-05T10:00:00Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: Some("loser_sha1_hex".to_string()),
+        },
+    ];
+    db.upsert_files(&scan_payload).await.unwrap();
+
+    db.update_file_reclassified(
+        "mybox",
+        "res_lp_zip",
+        "IMG_1000.JPG",
+        TargetType::Immich,
+        "asset_lp_1",
+        "sha_lp_img",
+        3200,
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "res_lp_zip",
+        "sha_lp_img",
+        "asset_lp_1",
+        "created",
+    )
+    .await
+    .unwrap();
+
+    db.mark_file_uploaded(
+        "mybox",
+        "res_null_doc",
+        "sha_pdf",
+        "/MyBox/Docs/report.pdf",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.update_file_reclassified(
+        "mybox",
+        "res_null_doc",
+        "report.pdf",
+        TargetType::Nextcloud,
+        "/MyBox/Docs/report.pdf",
+        "sha_pdf",
+        1200,
+        "created",
+    )
+    .await
+    .unwrap();
+
+    db.mark_file_uploaded(
+        "mybox",
+        "res_moved_nc",
+        "sha_icon",
+        "/MyBox/Icons/icon.png",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.update_file_reclassified(
+        "mybox",
+        "res_moved_nc",
+        "icon.png",
+        TargetType::Nextcloud,
+        "/MyBox/Icons/icon.png",
+        "sha_icon",
+        400,
+        "created",
+    )
+    .await
+    .unwrap();
+
+    // Simulate legacy record whose target_type was overwritten to "immich" despite `/...` Nextcloud path
+    db.mark_file_uploaded(
+        "mybox",
+        "res_corrupted_nc",
+        "sha_leg",
+        "/MyBox/Docs/legacy.pdf",
+        "created",
+    )
+    .await
+    .unwrap();
+    let healed_nc = db.heal_misclassified_nextcloud_targets().await.unwrap();
+    assert_eq!(healed_nc, 1);
+
+    // Sibling duplicate uploaded with placeholder ID sharing loser SHA-1
+    db.mark_file_uploaded(
+        "mybox",
+        "res_dup_sibling",
+        "loser_sha1_hex",
+        "existing_immich_asset",
+        "duplicate",
+    )
+    .await
+    .unwrap();
+    let remapped = db
+        .remap_merged_immich_assets_with_hashes(
+            &["other_asset_id".to_string()],
+            &[],
+            &["loser_sha1_hex".to_string()],
+            "winner_asset_99",
+            Some("winner_sha1_hex"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(remapped, 1);
+
+    // Re-scan with original source filenames & sizes: MUST NOT revert target_type, name, or size!
+    db.upsert_files(&scan_payload).await.unwrap();
+    assert!(db.get_pending_files("mybox", 3, 100).await.unwrap().is_empty());
+
+    let uploaded = db.get_uploaded_files_for_delete("mybox", 100).await.unwrap();
+    let by_id: std::collections::HashMap<_, _> = uploaded
+        .into_iter()
+        .map(|r| (r.resource_id.clone(), r))
+        .collect();
+
+    let lp = by_id.get("res_lp_zip").unwrap();
+    assert_eq!(lp.name, "IMG_1000.JPG");
+    assert_eq!(lp.target_type, "immich");
+    assert_eq!(lp.size, 3200);
+
+    let ndoc = by_id.get("res_null_doc").unwrap();
+    assert_eq!(ndoc.name, "report.pdf");
+    assert_eq!(ndoc.target_type, "nextcloud");
+
+    let moved = by_id.get("res_moved_nc").unwrap();
+    assert_eq!(moved.target_type, "nextcloud");
+
+    let legacy = by_id.get("res_corrupted_nc").unwrap();
+    assert_eq!(legacy.target_type, "nextcloud");
+
+    let dup_sib = by_id.get("res_dup_sibling").unwrap();
+    assert_eq!(
+        dup_sib.remote_target_id.as_deref(),
+        Some("winner_asset_99")
+    );
+    assert_eq!(dup_sib.sha1_hash.as_deref(), Some("winner_sha1_hex"));
+}
