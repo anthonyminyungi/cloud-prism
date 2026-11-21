@@ -125,6 +125,11 @@ pub fn try_extract_livephoto_zip(
     };
 
     let is_named_livephoto = TargetRouter::is_livephoto_archive_name(original_zip_name);
+    let outer_ext = Path::new(original_zip_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let is_disguised_media = TargetRouter::is_media_extension(outer_ext);
     let mut image_entry: Option<(usize, String, Option<String>)> = None;
     let mut video_entry: Option<(usize, String, Option<String>)> = None;
     let mut has_other_files = false;
@@ -150,7 +155,13 @@ pub fn try_extract_livephoto_zip(
         }
 
         let mut header = [0u8; 64];
-        let n = zf.read(&mut header).unwrap_or(0);
+        let mut n = 0usize;
+        while n < header.len() {
+            match zf.read(&mut header[n..]) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => n += k,
+            }
+        }
         let detected = inspect_magic_bytes(&header[..n]);
         let entry_ts = zip_datetime_to_rfc3339_opt(zf.last_modified())
             .or_else(|| extract_timestamp_from_filename(&fname));
@@ -210,7 +221,7 @@ pub fn try_extract_livephoto_zip(
         }
     }
 
-    let qualifies = if is_named_livephoto {
+    let qualifies = if is_named_livephoto || is_disguised_media {
         image_entry.is_some()
     } else {
         image_entry.is_some() && video_entry.is_some() && !has_other_files
@@ -227,7 +238,11 @@ pub fn try_extract_livephoto_zip(
     ));
     let prefix10 = &prefix_hash[..10];
 
-    let img_temp_path = tmp_dir.join(format!("lp_img_{}_{}", prefix10, sanitize_filename(&img_name)));
+    let img_temp_path = tmp_dir.join(format!(
+        "lp_img_{}_{}",
+        prefix10,
+        sanitize_filename(&img_name)
+    ));
     let img_guard = TempFileGuard::new(img_temp_path.clone());
     let mut img_hasher = Sha1::new();
     let mut img_size: u64 = 0;
@@ -247,16 +262,27 @@ pub fn try_extract_livephoto_zip(
         out.flush()?;
     }
 
+    if img_size == 0 {
+        return Ok(None);
+    }
+
     let (video_guard, video_filename, vid_ts) = if let Some((vid_idx, vid_name, v_ts)) = video_entry
     {
-        let vid_temp_path =
-            tmp_dir.join(format!("lp_vid_{}_{}", prefix10, sanitize_filename(&vid_name)));
+        let vid_temp_path = tmp_dir.join(format!(
+            "lp_vid_{}_{}",
+            prefix10,
+            sanitize_filename(&vid_name)
+        ));
         let v_guard = TempFileGuard::new(vid_temp_path.clone());
         let mut zf = archive.by_index(vid_idx)?;
         let mut out = std::fs::File::create(&vid_temp_path)?;
-        std::io::copy(&mut zf, &mut out)?;
+        let vid_size = std::io::copy(&mut zf, &mut out)?;
         out.flush()?;
-        (Some(v_guard), Some(vid_name), v_ts)
+        if vid_size == 0 {
+            (None, None, None)
+        } else {
+            (Some(v_guard), Some(vid_name), v_ts)
+        }
     } else {
         (None, None, None)
     };
@@ -497,6 +523,96 @@ mod tests {
         }
         assert!(
             try_extract_livephoto_zip(&doc_zip_path, "project_docs.zip", tmp_dir.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_disguised_media_zip_extraction_edge_cases() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let dir = TempDir::new().unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+
+        // 1. .heic-named ZIP with .mov first and .heic second (ftypqt  and ftypheic)
+        let disguised_name = "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.heic";
+        let disguised_path = dir.path().join(disguised_name);
+        {
+            let f = std::fs::File::create(&disguised_path).unwrap();
+            let mut zw = ZipWriter::new(f);
+            let opts = SimpleFileOptions::default();
+
+            zw.start_file(
+                "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.mov",
+                opts,
+            )
+            .unwrap();
+            zw.write_all(b"\x00\x00\x00\x14ftypqt  \x20\x05\x03\x00fake_mov")
+                .unwrap();
+
+            zw.start_file(disguised_name, opts).unwrap();
+            zw.write_all(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00fake_heic")
+                .unwrap();
+
+            zw.finish().unwrap();
+        }
+        let extracted = try_extract_livephoto_zip(&disguised_path, disguised_name, tmp_dir.path())
+            .unwrap()
+            .expect("disguised .heic ZIP must extract both photo and video");
+        assert_eq!(extracted.image_filename, disguised_name);
+        assert_eq!(
+            extracted.video_filename.as_deref(),
+            Some("P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.mov")
+        );
+        assert!(extracted.image_guard.path().exists());
+        assert!(extracted.video_guard.as_ref().unwrap().path().exists());
+
+        // 2. .heic-named ZIP with image + small .json sidecar extracts image
+        let image_only_name = "IMG_2222.heic";
+        let image_only_path = dir.path().join(image_only_name);
+        {
+            let f = std::fs::File::create(&image_only_path).unwrap();
+            let mut zw = ZipWriter::new(f);
+            let opts = SimpleFileOptions::default();
+
+            zw.start_file("IMG_2222.heic", opts).unwrap();
+            zw.write_all(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00fake_heic")
+                .unwrap();
+
+            zw.start_file("metadata.json", opts).unwrap();
+            zw.write_all(br#"{"title":"IMG_2222.heic"}"#).unwrap();
+
+            zw.finish().unwrap();
+        }
+        let extracted_img_only =
+            try_extract_livephoto_zip(&image_only_path, image_only_name, tmp_dir.path())
+                .unwrap()
+                .expect("disguised .heic ZIP with image + sidecar must extract image");
+        assert_eq!(extracted_img_only.image_filename, "IMG_2222.heic");
+        assert!(extracted_img_only.video_guard.is_none());
+
+        // 3. .heic-named ZIP with 0-byte image must return Ok(None)
+        let zero_img_name = "EMPTY_0001.heic";
+        let zero_img_path = dir.path().join(zero_img_name);
+        {
+            let f = std::fs::File::create(&zero_img_path).unwrap();
+            let mut zw = ZipWriter::new(f);
+            let opts = SimpleFileOptions::default();
+
+            zw.start_file("EMPTY_0001.heic", opts).unwrap();
+            // write 0 bytes
+
+            zw.start_file("EMPTY_0001.mov", opts).unwrap();
+            zw.write_all(b"\x00\x00\x00\x14ftypqt  \x20\x05\x03\x00fake_mov")
+                .unwrap();
+
+            zw.finish().unwrap();
+        }
+        assert!(
+            try_extract_livephoto_zip(&zero_img_path, zero_img_name, tmp_dir.path())
                 .unwrap()
                 .is_none()
         );

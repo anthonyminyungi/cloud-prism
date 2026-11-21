@@ -1890,3 +1890,646 @@ async fn test_delete_verification_propfind_trashed_healed_and_include_target_del
         .unwrap();
     assert_eq!(cb_stats.deleted_files, 0);
 }
+
+#[tokio::test]
+async fn test_sync_extracts_zip_disguised_heic_livephoto_from_mybox() {
+    use sha1::{Digest, Sha1};
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_disguised_zip_sync.db");
+    let tmp_download_dir = temp_dir.path().join("tmp_disguised_sync");
+
+    let heic_bytes = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00fake_heic_payload";
+    let mov_bytes = b"\x00\x00\x00\x14ftypqt  \x20\x05\x03\x00fake_mov_payload";
+    let expected_image_sha1 = hex::encode(Sha1::digest(heic_bytes));
+
+    let mut zip_buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut zip_buf);
+        let opts = SimpleFileOptions::default();
+        zip.start_file(
+            "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.mov",
+            opts,
+        )
+        .unwrap();
+        zip.write_all(mov_bytes).unwrap();
+        zip.start_file(
+            "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.heic",
+            opts,
+        )
+        .unwrap();
+        zip.write_all(heic_bytes).unwrap();
+        zip.finish().unwrap();
+    }
+    let zip_bytes = zip_buf.into_inner();
+    let zip_len = zip_bytes.len() as i64;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/drive/resources"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "fileCount": 1,
+            "subFolderCount": 0,
+            "resources": [
+                {
+                    "resourceId": "mybox_disguised_1",
+                    "name": "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.heic",
+                    "type": "file",
+                    "size": zip_len,
+                    "createdAt": "2020-06-18T14:59:25Z",
+                    "modifiedAt": "2020-06-18T14:59:25Z"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/drive/files/mybox_disguised_1/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "downloadUrl": format!("{}/v1/storage/download/mybox_disguised_1", mock_server.uri()),
+            "expiresIn": 600
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/storage/download/mybox_disguised_1"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 1 upload for .mov + 1 upload for .heic = 2 POST /api/assets
+    Mock::given(method("POST"))
+        .and(path("/api/assets"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "immich_lp_asset",
+            "status": "created"
+        })))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: tmp_download_dir.to_str().unwrap().to_string(),
+        mybox_pat: "test_pat".to_string(),
+        mybox_api_base: mock_server.uri(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_immich_key".to_string(),
+        enable_nextcloud: false,
+        rate_limit_rps: 200.0,
+        concurrency: 1,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    let state = AppState::new(db, cfg.clone());
+    let pipeline = SyncPipeline::from_config(state.clone(), cfg, "mybox").unwrap();
+
+    let scan1 = pipeline.run_scan().await.unwrap();
+    assert_eq!(scan1.pending_files, 1);
+
+    let sync_stats = pipeline.run_sync().await.unwrap();
+    assert_eq!(sync_stats.uploaded_immich_created, 1);
+    assert_eq!(sync_stats.failed_files, 0);
+
+    let uploaded = state
+        .db
+        .get_uploaded_files_for_delete("mybox", 10)
+        .await
+        .unwrap();
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(
+        uploaded[0].sha1_hash.as_deref(),
+        Some(expected_image_sha1.as_str())
+    );
+    assert_eq!(uploaded[0].size, zip_len);
+    assert_eq!(
+        uploaded[0].remote_target_id.as_deref(),
+        Some("immich_lp_asset")
+    );
+
+    // Incremental MYBOX rescan must keep pending_files == 0 (preserving original MYBOX ZIP size)
+    let scan2 = pipeline.run_scan().await.unwrap();
+    assert_eq!(scan2.pending_files, 0);
+}
+
+#[tokio::test]
+async fn test_repair_immich_broken_assets_recovers_zip_livephoto_dedups_and_stages_standalone() {
+    use mybox_immich_sync::db::FileUpsert;
+    use mybox_immich_sync::pipeline::run_repair_immich_broken_assets;
+    use serde_json::Value;
+    use sha1::{Digest, Sha1};
+    use std::io::Write;
+    use wiremock::matchers::body_json;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_broken_assets.db");
+    let tmp_download_dir = temp_dir.path().join("tmp_broken_assets");
+
+    let heic_new = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00new_heic_bytes";
+    let mov_new = b"\x00\x00\x00\x14ftypqt  \x20\x05\x03\x00new_mov_bytes";
+    let mut zip_new_buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut zip_new_buf);
+        let opts = SimpleFileOptions::default();
+        zip.start_file(
+            "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.mov",
+            opts,
+        )
+        .unwrap();
+        zip.write_all(mov_new).unwrap();
+        zip.start_file(
+            "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.heic",
+            opts,
+        )
+        .unwrap();
+        zip.write_all(heic_new).unwrap();
+        zip.finish().unwrap();
+    }
+    let zip_new_bytes = zip_new_buf.into_inner();
+    let new_image_sha1 = hex::encode(Sha1::digest(heic_new));
+
+    let heic_dup = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00existing_dup_heic";
+    let mov_dup = b"\x00\x00\x00\x14ftypqt  \x20\x05\x03\x00existing_dup_mov";
+    let mut zip_dup_buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut zip_dup_buf);
+        let opts = SimpleFileOptions::default();
+        zip.start_file("IMG_8888.heic", opts).unwrap();
+        zip.write_all(heic_dup).unwrap();
+        zip.start_file("IMG_8888.mov", opts).unwrap();
+        zip.write_all(mov_dup).unwrap();
+        zip.finish().unwrap();
+    }
+    let zip_dup_bytes = zip_dup_buf.into_inner();
+    let dup_image_sha1 = hex::encode(Sha1::digest(heic_dup));
+
+    // 1. Metadata search endpoint returning 1 healthy + 4 broken assets
+    let search_items = json!({
+        "assets": {
+            "items": [
+                {
+                    "id": "healthy-existing",
+                    "originalFileName": "IMG_8888.heic",
+                    "fileCreatedAt": "2020-06-18T10:00:00.000Z",
+                    "isTrashed": false,
+                    "isOffline": false,
+                    "type": "IMAGE",
+                    "thumbhash": "IQgK0000",
+                    "livePhotoVideoId": null,
+                    "exifInfo": {
+                        "fileSizeInByte": heic_dup.len(),
+                        "exifImageWidth": 4032,
+                        "exifImageHeight": 3024,
+                        "dateTimeOriginal": "2020-06-18T10:00:00.000Z"
+                    }
+                },
+                {
+                    "id": "broken-zip-new",
+                    "deviceAssetId": "mybox_zip_new_1",
+                    "originalFileName": "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.heic",
+                    "fileCreatedAt": "2020-06-18T14:59:25.000Z",
+                    "isFavorite": true,
+                    "isTrashed": false,
+                    "isOffline": false,
+                    "type": "IMAGE",
+                    "thumbhash": null,
+                    "tags": [{ "id": "tag-trip", "name": "여행" }],
+                    "exifInfo": {
+                        "fileSizeInByte": zip_new_bytes.len(),
+                        "rating": 5
+                    }
+                },
+                {
+                    "id": "broken-zip-dup",
+                    "deviceAssetId": "mybox_zip_dup_1",
+                    "originalFileName": "IMG_8888+1.heic",
+                    "fileCreatedAt": "2020-06-18T10:00:05.000Z",
+                    "isTrashed": false,
+                    "isOffline": false,
+                    "type": "IMAGE",
+                    "thumbhash": null,
+                    "exifInfo": {
+                        "fileSizeInByte": zip_dup_bytes.len()
+                    }
+                },
+                {
+                    "id": "broken-nonzip-dup",
+                    "deviceAssetId": "mybox_corrupt_dup_1",
+                    "originalFileName": "IMG_8888 (1).jpg",
+                    "fileCreatedAt": "2020-06-18T10:05:00.000Z",
+                    "isTrashed": false,
+                    "isOffline": false,
+                    "type": "IMAGE",
+                    "thumbhash": null,
+                    "exifInfo": {
+                        "fileSizeInByte": 12
+                    }
+                },
+                {
+                    "id": "broken-standalone",
+                    "deviceAssetId": "mybox_corrupt_solo_1",
+                    "originalFileName": "SOLO_BROKEN.jpg",
+                    "fileCreatedAt": "2021-01-01T00:00:00.000Z",
+                    "isTrashed": false,
+                    "isOffline": false,
+                    "type": "IMAGE",
+                    "thumbhash": null,
+                    "exifInfo": {
+                        "fileSizeInByte": 0
+                    }
+                }
+            ],
+            "nextPage": null
+        }
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(search_items))
+        .mount(&mock_server)
+        .await;
+
+    // 2. Thumbnail health probes
+    for (id, status_code) in [
+        ("broken-zip-new", 500u16),
+        ("broken-zip-dup", 500u16),
+        ("broken-nonzip-dup", 404u16),
+        ("broken-standalone", 404u16),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/assets/{}/thumbnail", id)))
+            .respond_with(ResponseTemplate::new(status_code))
+            .mount(&mock_server)
+            .await;
+    }
+
+    // 3. Original file downloads
+    Mock::given(method("GET"))
+        .and(path("/api/assets/broken-zip-new/original"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_new_bytes))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/broken-zip-dup/original"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_dup_bytes))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/broken-nonzip-dup/original"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"corrupt_data".as_slice()))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/broken-standalone/original"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+
+    // 4. Bulk upload check: only dup_image_sha1 rejects as `healthy-existing`
+    let dup_sha1_clone = dup_image_sha1.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/assets/bulk-upload-check"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let mut results = Vec::new();
+            if let Some(assets) = body.get("assets").and_then(|v| v.as_array()) {
+                for item in assets {
+                    let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let checksum = item.get("checksum").and_then(|v| v.as_str()).unwrap_or("");
+                    if checksum == dup_sha1_clone {
+                        results.push(json!({
+                            "id": id,
+                            "action": "reject",
+                            "assetId": "healthy-existing"
+                        }));
+                    } else {
+                        results.push(json!({
+                            "id": id,
+                            "action": "accept"
+                        }));
+                    }
+                }
+            }
+            ResponseTemplate::new(200).set_body_json(json!({ "results": results }))
+        })
+        .mount(&mock_server)
+        .await;
+
+    // 5. Asset detail lookups
+    Mock::given(method("GET"))
+        .and(path("/api/assets/healthy-existing"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "healthy-existing",
+            "originalFileName": "IMG_8888.heic",
+            "isTrashed": false,
+            "livePhotoVideoId": null
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/broken-zip-new"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "broken-zip-new",
+            "deviceAssetId": "mybox_zip_new_1",
+            "originalFileName": "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.heic",
+            "isFavorite": true,
+            "isTrashed": false,
+            "tags": [{ "id": "tag-trip", "name": "여행" }],
+            "exifInfo": { "rating": 5 }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/broken-zip-dup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "broken-zip-dup",
+            "deviceAssetId": "mybox_zip_dup_1",
+            "originalFileName": "IMG_8888+1.heic",
+            "isTrashed": false
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/broken-nonzip-dup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "broken-nonzip-dup",
+            "deviceAssetId": "mybox_corrupt_dup_1",
+            "originalFileName": "IMG_8888 (1).jpg",
+            "isTrashed": false
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // 6. Mutation mocks (must NOT be hit during Dry-Run, MUST be hit during Execute)
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .and(query_param("assetId", "broken-zip-new"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": "album-fam", "albumName": "가족", "assetCount": 1 }
+        ])))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .and(query_param("assetId", "broken-zip-dup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .and(query_param("assetId", "broken-nonzip-dup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/assets"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body_text = String::from_utf8_lossy(&req.body);
+            let id = if body_text.contains("mybox_zip_new_1#extracted#livevideo") {
+                "recovered-mov-1"
+            } else if body_text.contains("mybox_zip_new_1#extracted") {
+                "recovered-new-photo"
+            } else if body_text.contains("mybox_zip_dup_1#extracted-livevideo") {
+                "recovered-dup-mov"
+            } else {
+                panic!(
+                    "Unexpected deviceAssetId in POST /api/assets: {}",
+                    body_text
+                );
+            };
+            ResponseTemplate::new(201).set_body_json(json!({
+                "id": id,
+                "status": "created"
+            }))
+        })
+        .expect(3)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/api/assets/healthy-existing"))
+        .and(body_json(
+            json!({ "livePhotoVideoId": "recovered-dup-mov" }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/api/assets"))
+        .and(body_json(json!({
+            "ids": ["recovered-new-photo"],
+            "isFavorite": true,
+            "rating": 5
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/album-fam/assets"))
+        .and(body_json(json!({ "ids": ["recovered-new-photo"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/api/tags/tag-trip/assets"))
+        .and(body_json(json!({ "ids": ["recovered-new-photo"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Trash calls: only the 3 recoverable/duplicate broken assets, NEVER broken-standalone!
+    Mock::given(method("DELETE"))
+        .and(path("/api/assets"))
+        .and(body_json(
+            json!({ "ids": ["broken-zip-new"], "force": false }),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/assets"))
+        .and(body_json(
+            json!({ "ids": ["broken-zip-dup"], "force": false }),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/assets"))
+        .and(body_json(
+            json!({ "ids": ["broken-nonzip-dup"], "force": false }),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Album staging for standalone broken asset
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .and(body_json(json!({ "albumName": "broken-assets" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "album-broken-1",
+            "albumName": "broken-assets",
+            "assetCount": 0
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/album-broken-1/assets"))
+        .and(body_json(json!({ "ids": ["broken-standalone"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: tmp_download_dir.to_str().unwrap().to_string(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_key".to_string(),
+        rate_limit_rps: 200.0,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    db.upsert_files(&[
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "mybox_zip_new_1".to_string(),
+            name: "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.heic".to_string(),
+            parent_path: "/2020".to_string(),
+            size: 1000,
+            created_time: "2020-06-18T14:59:25Z".to_string(),
+            modified_time: "2020-06-18T14:59:25Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: Some("old_zip_sha1_new".to_string()),
+        },
+        FileUpsert {
+            source_type: "mybox".to_string(),
+            resource_id: "mybox_zip_dup_1".to_string(),
+            name: "IMG_8888+1.heic".to_string(),
+            parent_path: "/2020".to_string(),
+            size: 1000,
+            created_time: "2020-06-18T10:00:05Z".to_string(),
+            modified_time: "2020-06-18T10:00:05Z".to_string(),
+            target_type: "immich".to_string(),
+            sha1_hash: Some("old_zip_sha1_dup".to_string()),
+        },
+    ])
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "mybox_zip_new_1",
+        "old_zip_sha1_new",
+        "broken-zip-new",
+        "created",
+    )
+    .await
+    .unwrap();
+    db.mark_file_uploaded(
+        "mybox",
+        "mybox_zip_dup_1",
+        "old_zip_sha1_dup",
+        "broken-zip-dup",
+        "created",
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::new(db, cfg.clone());
+
+    // Step 1: Dry-Run classifies all 4 broken assets with ZERO mutations
+    let dry_count = run_repair_immich_broken_assets(state.clone(), cfg.clone(), true)
+        .await
+        .unwrap();
+    assert_eq!(dry_count, 4);
+
+    let reqs_after_dry = mock_server.received_requests().await.unwrap();
+    for req in &reqs_after_dry {
+        let p = req.url.path();
+        let m = req.method.as_str();
+        assert!(
+            !(m == "POST" && (p == "/api/assets" || p == "/api/albums"))
+                && m != "PUT"
+                && m != "DELETE",
+            "Dry-Run must not perform mutation request: {} {}",
+            m,
+            p
+        );
+    }
+
+    // Step 2: Execute fixes all 4 broken assets and remaps SQLite DB
+    let exec_count = run_repair_immich_broken_assets(state.clone(), cfg, false)
+        .await
+        .unwrap();
+    assert_eq!(exec_count, 4);
+
+    let db_rows = state
+        .db
+        .get_uploaded_files_for_delete("mybox", 10)
+        .await
+        .unwrap();
+    let rec_new = db_rows
+        .iter()
+        .find(|r| r.resource_id == "mybox_zip_new_1")
+        .unwrap();
+    assert_eq!(
+        rec_new.remote_target_id.as_deref(),
+        Some("recovered-new-photo")
+    );
+    assert_eq!(rec_new.sha1_hash.as_deref(), Some(new_image_sha1.as_str()));
+
+    let rec_dup = db_rows
+        .iter()
+        .find(|r| r.resource_id == "mybox_zip_dup_1")
+        .unwrap();
+    assert_eq!(
+        rec_dup.remote_target_id.as_deref(),
+        Some("healthy-existing")
+    );
+    assert_eq!(rec_dup.sha1_hash.as_deref(), Some(dup_image_sha1.as_str()));
+}

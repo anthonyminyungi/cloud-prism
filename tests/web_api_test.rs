@@ -118,6 +118,8 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     assert!(html.contains("Google 포토 · 드라이브 (Google Takeout)"));
     assert!(!html.contains("id=\"cfgGdriveToken\""));
     assert!(html.contains("id=\"sampleLimitSelect\""));
+    assert!(html.contains("id=\"btnRepairBrokenDryRun\""));
+    assert!(html.contains("id=\"btnRepairBrokenExecute\""));
     assert!(html.contains("toggleTheme"));
     assert!(html.contains("escapeHtml"));
     assert!(!html.contains("linear-gradient("));

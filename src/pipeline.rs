@@ -12,7 +12,10 @@ use crate::sources::takeout::{list_takeout_archives, GoogleTakeoutProvider};
 use crate::sources::{try_extract_livephoto_zip, SourceProvider};
 use crate::state::{AppState, JobState};
 use crate::targets::immich::{
-    decode_immich_checksum_to_hex, evaluate_duplicate_group, DuplicateGroupEvaluation, ImmichTarget,
+    asset_capture_epoch_secs, decode_immich_checksum_to_hex, evaluate_duplicate_group,
+    find_healthy_duplicate, is_broken_asset_candidate, is_valid_immich_asset_id_candidate,
+    normalize_filename_stem, AssetMetadataUpdateRequest, DuplicateGroupEvaluation, HealthyAssetRef,
+    ImmichDuplicateAssetDto, ImmichTarget, ThumbnailHealth,
 };
 use crate::targets::nextcloud::NextcloudTarget;
 use crate::targets::{TargetProvider, UploadContext, UploadOutcome, VerifyStatus};
@@ -814,7 +817,7 @@ impl SyncPipeline {
             .as_deref()
             .unwrap_or(&file.modified_time);
 
-        let inspected = if is_null_ext {
+        let inspected = if is_null_ext || target_type == TargetType::Immich {
             inspect_file_path(downloaded.temp_guard.path())
                 .ok()
                 .flatten()
@@ -844,17 +847,22 @@ impl SyncPipeline {
 
                 let outcome = self
                     .immich_target
-                    .upload_live_photo(
-                        &extracted,
-                        &file.resource_id,
-                        &final_created,
-                        modified_at,
-                    )
+                    .upload_live_photo(&extracted, &file.resource_id, &final_created, modified_at)
                     .await?;
+
+                let db_size = if !is_livephoto_zip
+                    && !is_null_ext
+                    && file.size > 0
+                    && extracted.image_filename == file.name
+                {
+                    file.size
+                } else {
+                    extracted.image_size as i64
+                };
 
                 return Ok((
                     extracted.image_sha1,
-                    Some(extracted.image_size as i64),
+                    Some(db_size),
                     outcome,
                     Some((extracted.image_filename, TargetType::Immich)),
                 ));
@@ -884,6 +892,11 @@ impl SyncPipeline {
                     Some(downloaded.size as i64),
                     outcome,
                     Some((file.name.clone(), TargetType::Nextcloud)),
+                ));
+            } else if !is_null_ext && target_type == TargetType::Immich {
+                return Err(anyhow!(
+                    "미디어 확장자({}) 파일이 ZIP 아카이브(PK)로 위장되어 있으나 유효한 사진이 없어 Immich 업로드를 중단합니다.",
+                    file.name
                 ));
             }
         }
@@ -2701,6 +2714,1187 @@ pub async fn run_merge_immich_duplicates_with_limit(
     Ok(merged_groups)
 }
 
+async fn transfer_broken_asset_metadata_and_albums(
+    immich_target: &ImmichTarget,
+    broken_detail: &ImmichDuplicateAssetDto,
+    target_asset_id: &str,
+    target_detail_opt: Option<&ImmichDuplicateAssetDto>,
+) -> Result<()> {
+    let broken_albums = immich_target
+        .get_albums_for_asset(&broken_detail.id)
+        .await?;
+
+    let merged_is_favorite = if broken_detail.is_favorite
+        && !target_detail_opt.map(|t| t.is_favorite).unwrap_or(false)
+    {
+        Some(true)
+    } else {
+        None
+    };
+
+    let is_archived = |a: &ImmichDuplicateAssetDto| {
+        a.is_archived
+            || a.visibility
+                .as_deref()
+                .map(|v| v.eq_ignore_ascii_case("archive"))
+                .unwrap_or(false)
+    };
+    let merged_visibility =
+        if is_archived(broken_detail) && !target_detail_opt.map(is_archived).unwrap_or(false) {
+            Some("archive".to_string())
+        } else {
+            None
+        };
+
+    let broken_desc = broken_detail
+        .exif_info
+        .as_ref()
+        .and_then(|e| e.description.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let target_has_desc = target_detail_opt
+        .and_then(|t| t.exif_info.as_ref())
+        .and_then(|e| e.description.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let merged_description = if !target_has_desc {
+        broken_desc.map(str::to_string)
+    } else {
+        None
+    };
+
+    let broken_rating = broken_detail
+        .exif_info
+        .as_ref()
+        .and_then(|e| e.rating)
+        .unwrap_or(0);
+    let target_rating = target_detail_opt
+        .and_then(|t| t.exif_info.as_ref())
+        .and_then(|e| e.rating)
+        .unwrap_or(0);
+    let merged_rating = if broken_rating > target_rating && broken_rating > 0 {
+        Some(broken_rating)
+    } else {
+        None
+    };
+
+    let update_req = AssetMetadataUpdateRequest {
+        ids: vec![target_asset_id.to_string()],
+        is_favorite: merged_is_favorite,
+        visibility: merged_visibility,
+        description: merged_description,
+        rating: merged_rating,
+        ..Default::default()
+    };
+    if update_req.has_updates() {
+        immich_target.update_asset_metadata(&update_req).await?;
+    }
+
+    let target_id_owned = target_asset_id.to_string();
+    for album in broken_albums {
+        let aid = album.id.trim();
+        if !aid.is_empty() {
+            immich_target
+                .add_assets_to_album(aid, std::slice::from_ref(&target_id_owned))
+                .await?;
+        }
+    }
+
+    let existing_target_tags: HashSet<&str> = target_detail_opt
+        .map(|t| t.tags.iter().map(|tag| tag.id.trim()).collect())
+        .unwrap_or_default();
+    for tag in &broken_detail.tags {
+        let tid = tag.id.trim();
+        if !tid.is_empty() && !existing_target_tags.contains(tid) {
+            immich_target
+                .add_assets_to_tag(tid, std::slice::from_ref(&target_id_owned))
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_broken_zip_timestamps(
+    asset: &ImmichDuplicateAssetDto,
+    orig_filename: &str,
+    extracted_image_filename: &str,
+    extracted_ts_override: Option<&str>,
+) -> (String, String) {
+    let fallback_now = chrono::Utc::now().to_rfc3339();
+    let base_created = asset
+        .exif_info
+        .as_ref()
+        .and_then(|e| e.date_time_original.as_deref())
+        .or(asset.file_created_at.as_deref())
+        .unwrap_or(&fallback_now);
+    let mut created_at = pick_older_timestamp(base_created, asset.file_created_at.as_deref());
+    created_at = pick_older_timestamp(&created_at, extracted_ts_override);
+    let ext_img_ts = extract_timestamp_from_filename(extracted_image_filename);
+    created_at = pick_older_timestamp(&created_at, ext_img_ts.as_deref());
+    let orig_fn_ts = extract_timestamp_from_filename(orig_filename);
+    created_at = pick_older_timestamp(&created_at, orig_fn_ts.as_deref());
+    let modified_at = asset
+        .file_modified_at
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&created_at)
+        .to_string();
+    (created_at, modified_at)
+}
+
+pub async fn run_repair_immich_broken_assets(
+    state: Arc<AppState>,
+    config: AppConfig,
+    dry_run: bool,
+) -> Result<u64> {
+    run_repair_immich_broken_assets_with_limit(state, config, dry_run, None).await
+}
+
+pub async fn run_repair_immich_broken_assets_with_limit(
+    state: Arc<AppState>,
+    config: AppConfig,
+    dry_run: bool,
+    limit: Option<u64>,
+) -> Result<u64> {
+    if config.immich_url.trim().is_empty() || config.immich_api_key.trim().is_empty() {
+        return Err(anyhow!(
+            "Immich 서버 URL 또는 API Key가 설정되지 않았습니다."
+        ));
+    }
+
+    let mode_tag = if dry_run {
+        "오류 자산 진단 Dry-Run"
+    } else {
+        "오류 자산 복구·정리"
+    };
+
+    state.begin_phase("repair", JobState::Syncing, 0).await;
+    state
+        .emit_event(
+            "repair",
+            JobState::Syncing,
+            None,
+            format!(
+                "[{}] Immich 전체 라이브러리 메타데이터 스캔을 시작합니다...",
+                mode_tag
+            ),
+        )
+        .await;
+
+    let target_limiter =
+        RateLimiter::new((config.rate_limit_rps * 10.0).max(50.0), config.max_retries);
+    let immich_target = Arc::new(ImmichTarget::new(
+        config.immich_url.clone(),
+        config.immich_api_key.clone(),
+        target_limiter,
+    ));
+
+    let mut page: u32 = 1;
+    let mut scanned_total: u64 = 0;
+    let mut suspects: Vec<ImmichDuplicateAssetDto> = Vec::new();
+    let mut healthy_by_stem: HashMap<String, Vec<HealthyAssetRef>> = HashMap::new();
+
+    loop {
+        if state.is_stopping() {
+            state
+                .finish_job(
+                    "repair",
+                    format!(
+                        "[{}] 메타데이터 스캔 중 안전 일시정지되었습니다 ({}건 스캔).",
+                        mode_tag, scanned_total
+                    ),
+                )
+                .await;
+            return Ok(0);
+        }
+
+        let (items, next_page) = immich_target.search_metadata_page(page, 500).await?;
+        for asset in items {
+            scanned_total += 1;
+            if asset.is_trashed || asset.id.trim().is_empty() {
+                continue;
+            }
+            if !asset.is_offline
+                && !asset
+                    .thumbhash
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+            {
+                let stem = normalize_filename_stem(&asset.original_file_name);
+                if stem.len() >= 4 {
+                    healthy_by_stem
+                        .entry(stem)
+                        .or_default()
+                        .push(HealthyAssetRef {
+                            id: asset.id.clone(),
+                            original_file_name: asset.original_file_name.clone(),
+                            capture_ts: asset_capture_epoch_secs(&asset),
+                        });
+                }
+            }
+            if is_broken_asset_candidate(&asset) {
+                suspects.push(asset);
+            }
+        }
+
+        state
+            .emit_progress_throttled("repair", JobState::Syncing, None, || {
+                format!(
+                    "[{}] Immich 스캔 중... ({}건 조회, 오류 후보 {}건)",
+                    mode_tag,
+                    scanned_total,
+                    suspects.len()
+                )
+            })
+            .await;
+
+        match next_page {
+            Some(np) => page = np,
+            None => break,
+        }
+    }
+
+    if suspects.is_empty() {
+        state
+            .finish_job(
+                "repair",
+                format!(
+                    "[{}] Immich 전체 {}건 스캔 완료 — 로딩 오류 후보 자산이 없습니다.",
+                    mode_tag, scanned_total
+                ),
+            )
+            .await;
+        return Ok(0);
+    }
+
+    state
+        .emit_event(
+            "repair",
+            JobState::Syncing,
+            None,
+            format!(
+                "[{}] 전체 {}건 중 오류 후보 {}건의 실제 썸네일 응답을 검증합니다...",
+                mode_tag,
+                scanned_total,
+                suspects.len()
+            ),
+        )
+        .await;
+
+    let mut confirmed_broken: Vec<(ImmichDuplicateAssetDto, String)> = Vec::new();
+    let mut transient_errors = 0u64;
+
+    for chunk in suspects.chunks(32) {
+        if state.is_stopping() {
+            state
+                .finish_job(
+                    "repair",
+                    format!("[{}] 썸네일 검증 중 안전 일시정지되었습니다.", mode_tag),
+                )
+                .await;
+            return Ok(0);
+        }
+
+        let checks: Vec<(ImmichDuplicateAssetDto, ThumbnailHealth)> =
+            stream::iter(chunk.iter().cloned())
+                .map(|asset| {
+                    let target = Arc::clone(&immich_target);
+                    async move {
+                        let health = target.check_thumbnail_health(&asset.id).await;
+                        (asset, health)
+                    }
+                })
+                .buffered(4)
+                .collect()
+                .await;
+
+        for (asset, health) in checks {
+            match health {
+                ThumbnailHealth::Healthy => {
+                    let stem = normalize_filename_stem(&asset.original_file_name);
+                    if stem.len() >= 4 {
+                        let capture_ts = asset_capture_epoch_secs(&asset);
+                        let list = healthy_by_stem.entry(stem).or_default();
+                        if !list.iter().any(|h| h.id == asset.id) {
+                            list.push(HealthyAssetRef {
+                                id: asset.id,
+                                original_file_name: asset.original_file_name,
+                                capture_ts,
+                            });
+                        }
+                    }
+                }
+                ThumbnailHealth::Broken { status: _, reason } => {
+                    confirmed_broken.push((asset, reason));
+                }
+                ThumbnailHealth::TransientError(_) => {
+                    transient_errors += 1;
+                }
+            }
+        }
+    }
+
+    if transient_errors > 0 {
+        state
+            .emit_event(
+                "repair",
+                JobState::Syncing,
+                None,
+                format!(
+                    "[{}] 일시적 통신 오류로 썸네일 판정을 건너뛴 항목 {}건 (안전상 유지)",
+                    mode_tag, transient_errors
+                ),
+            )
+            .await;
+    }
+
+    if confirmed_broken.is_empty() {
+        state
+            .finish_job(
+                "repair",
+                format!(
+                    "[{}] Immich 전체 {}건 중 후보 {}건 확인 완료 — 실제 썸네일 로딩 오류 자산이 없습니다.",
+                    mode_tag,
+                    scanned_total,
+                    suspects.len()
+                ),
+            )
+            .await;
+        return Ok(0);
+    }
+
+    if let Some(n) = limit.filter(|&n| n > 0) {
+        confirmed_broken.truncate(n as usize);
+    }
+
+    let total_broken = confirmed_broken.len() as u64;
+    state.processed_files.store(0, Ordering::SeqCst);
+    state.total_files.store(total_broken, Ordering::SeqCst);
+    *state.job_started_at.write().await = Some(tokio::time::Instant::now());
+
+    state
+        .emit_event(
+            "repair",
+            JobState::Syncing,
+            None,
+            format!(
+                "[{}] 썸네일 로딩 오류 확정 {}건에 대해 원본 검사를 시작합니다.",
+                mode_tag, total_broken
+            ),
+        )
+        .await;
+
+    let fallback_dir = config.disk_fallback_tmp_dir();
+    let immich_web_base = config.immich_url.trim_end_matches('/');
+
+    let mut recovered_zip_created = 0u64;
+    let mut recovered_zip_duplicate = 0u64;
+    let mut trashed_non_zip_dup = 0u64;
+    let mut staged_standalone_broken = 0u64;
+    let mut failed_count = 0u64;
+    let mut broken_album_id: Option<String> = None;
+
+    for (asset, thumb_reason) in confirmed_broken {
+        if state.is_stopping() {
+            break;
+        }
+
+        let filename = if asset.original_file_name.trim().is_empty() {
+            format!("{}.bin", asset.id)
+        } else {
+            asset.original_file_name.clone()
+        };
+        let size_hint = asset
+            .exif_info
+            .as_ref()
+            .and_then(|e| e.file_size_in_byte)
+            .filter(|&s| s > 0)
+            .map(|s| s as u64);
+        let chosen_tmp = crate::sources::resolve_temp_dir(
+            Path::new(&config.tmp_dir),
+            Some(&fallback_dir),
+            size_hint,
+        );
+        let broken_url = format!("{}/photos/{}", immich_web_base, asset.id);
+
+        let downloaded_opt = match immich_target
+            .download_asset_optional_to_temp(&asset.id, &filename, &chosen_tmp)
+            .await
+        {
+            Ok(opt) => opt,
+            Err(err) => {
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(filename.clone()),
+                        format!(
+                            "[{}] 원본 다운로드 실패로 보류 ({}): {}",
+                            mode_tag, filename, err
+                        ),
+                    )
+                    .await;
+                failed_count += 1;
+                state.processed_files.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+        };
+
+        let mut extracted_zip = None;
+        let mut non_zip_reason: Option<String> = None;
+
+        match downloaded_opt {
+            None => {
+                non_zip_reason = Some("원본 파일 미존재(HTTP 404)".to_string());
+            }
+            Some(downloaded) => {
+                if downloaded.size == 0 {
+                    non_zip_reason = Some("0바이트 빈 파일".to_string());
+                } else {
+                    let inspected = inspect_file_path(downloaded.temp_guard.path())
+                        .ok()
+                        .flatten();
+                    match inspected {
+                        Some(DetectedFileKind::ZipArchive) => {
+                            let zip_path_owned = downloaded.temp_guard.path().to_path_buf();
+                            let zip_name_owned = filename.clone();
+                            let extract_tmp = chosen_tmp.clone();
+                            let extracted_opt = tokio::task::spawn_blocking(move || {
+                                try_extract_livephoto_zip(
+                                    &zip_path_owned,
+                                    &zip_name_owned,
+                                    &extract_tmp,
+                                )
+                            })
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .flatten();
+
+                            if let Some(extracted) = extracted_opt {
+                                extracted_zip = Some(extracted);
+                            } else {
+                                non_zip_reason =
+                                    Some("ZIP 아카이브 내부에 추출 가능한 미디어 없음".to_string());
+                            }
+                        }
+                        Some(DetectedFileKind::Media { ext, .. }) => {
+                            non_zip_reason = Some(format!(
+                                "원본 헤더({}) 확인되나 Immich 썸네일 디코딩 실패 ({})",
+                                ext, thumb_reason
+                            ));
+                        }
+                        Some(DetectedFileKind::Document { ext }) => {
+                            non_zip_reason =
+                                Some(format!("문서 헤더({}) 파일 ({})", ext, thumb_reason));
+                        }
+                        None => {
+                            non_zip_reason =
+                                Some(format!("비이미지/손상 데이터 ({})", thumb_reason));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(extracted) = extracted_zip {
+            let (created_at, modified_at) = resolve_broken_zip_timestamps(
+                &asset,
+                &filename,
+                &extracted.image_filename,
+                extracted.timestamp_override.as_deref(),
+            );
+            let base_dev = asset
+                .device_asset_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&asset.id);
+            let extracted_dev_id = format!("{}#extracted", base_dev);
+
+            let dup_id_opt = match immich_target
+                .precheck_duplicate(&extracted_dev_id, &extracted.image_sha1)
+                .await
+            {
+                Ok(res) => res,
+                Err(err) => {
+                    state
+                        .emit_event(
+                            "repair",
+                            JobState::Syncing,
+                            Some(filename.clone()),
+                            format!(
+                                "[{}] 추출 사진 중복 확인 실패로 보류 ({}): {}",
+                                mode_tag, filename, err
+                            ),
+                        )
+                        .await;
+                    failed_count += 1;
+                    state.processed_files.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+            };
+
+            let mut existing_dup: Option<ImmichDuplicateAssetDto> = None;
+            if let Some(valid_dup_id) = is_valid_immich_asset_id_candidate(dup_id_opt.as_deref()) {
+                if valid_dup_id != asset.id {
+                    match immich_target.get_asset_detail(valid_dup_id).await {
+                        Ok(Some(detail)) if !detail.is_trashed => {
+                            existing_dup = Some(detail);
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            state
+                                .emit_event(
+                                    "repair",
+                                    JobState::Syncing,
+                                    Some(filename.clone()),
+                                    format!(
+                                        "[{}] 중복 정상본 상세 조회 실패로 보류 ({}): {}",
+                                        mode_tag, filename, err
+                                    ),
+                                )
+                                .await;
+                            failed_count += 1;
+                            state.processed_files.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if let Some(existing) = existing_dup {
+                let needs_live_link = existing
+                    .live_photo_video_id
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                    && extracted.video_guard.is_some();
+                let existing_url = format!("{}/photos/{}", immich_web_base, existing.id);
+
+                if dry_run {
+                    recovered_zip_duplicate += 1;
+                    state
+                        .emit_event(
+                            "repair",
+                            JobState::Syncing,
+                            Some(filename.clone()),
+                            format!(
+                                "[{}] ZIP 위장 라이브포토(동일 정상본 존재): {} | 정상본: {} ({}) | {} | 깨진 ZIP 자산({}) 휴지통 이동 예정",
+                                mode_tag,
+                                filename,
+                                existing.original_file_name,
+                                existing_url,
+                                if needs_live_link {
+                                    "라이브포토 영상 연결 예정"
+                                } else {
+                                    "라이브포토 영상 이미 보유"
+                                },
+                                broken_url
+                            ),
+                        )
+                        .await;
+                } else {
+                    let broken_detail = immich_target
+                        .get_asset_detail(&asset.id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| asset.clone());
+
+                    if needs_live_link {
+                        if let Some(ref v_guard) = extracted.video_guard {
+                            let vid_name = extracted
+                                .video_filename
+                                .as_deref()
+                                .unwrap_or("livephoto.mov");
+                            let vid_dev_id = format!("{}#extracted-livevideo", base_dev);
+                            let vid_id = match immich_target
+                                .upload_asset_with_options(
+                                    v_guard.path(),
+                                    vid_name,
+                                    &vid_dev_id,
+                                    &created_at,
+                                    &modified_at,
+                                    None,
+                                )
+                                .await
+                            {
+                                Ok((vid_id, _)) => vid_id,
+                                Err(err) => {
+                                    state
+                                        .emit_event(
+                                            "repair",
+                                            JobState::Syncing,
+                                            Some(filename.clone()),
+                                            format!(
+                                                "[{}] 라이브포토 영상 업로드 실패로 휴지통 이동 보류 ({}): {}",
+                                                mode_tag, filename, err
+                                            ),
+                                        )
+                                        .await;
+                                    failed_count += 1;
+                                    state.processed_files.fetch_add(1, Ordering::SeqCst);
+                                    continue;
+                                }
+                            };
+                            if is_valid_immich_asset_id_candidate(Some(&vid_id)).is_none() {
+                                state
+                                    .emit_event(
+                                        "repair",
+                                        JobState::Syncing,
+                                        Some(filename.clone()),
+                                        format!(
+                                            "[{}] 유효한 라이브포토 영상 ID를 받지 못해 휴지통 이동 보류 ({})",
+                                            mode_tag, filename
+                                        ),
+                                    )
+                                    .await;
+                                failed_count += 1;
+                                state.processed_files.fetch_add(1, Ordering::SeqCst);
+                                continue;
+                            }
+                            if let Err(err) = immich_target
+                                .link_live_photo_video(&existing.id, &vid_id)
+                                .await
+                            {
+                                state
+                                    .emit_event(
+                                        "repair",
+                                        JobState::Syncing,
+                                        Some(filename.clone()),
+                                        format!(
+                                            "[{}] 라이브포토 영상 연결 실패로 휴지통 이동 보류 ({}): {}",
+                                            mode_tag, filename, err
+                                        ),
+                                    )
+                                    .await;
+                                failed_count += 1;
+                                state.processed_files.fetch_add(1, Ordering::SeqCst);
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Err(err) = transfer_broken_asset_metadata_and_albums(
+                        &immich_target,
+                        &broken_detail,
+                        &existing.id,
+                        Some(&existing),
+                    )
+                    .await
+                    {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(filename.clone()),
+                                format!(
+                                    "[{}] 메타데이터/앨범 승계 실패로 휴지통 이동 보류 ({}): {}",
+                                    mode_tag, filename, err
+                                ),
+                            )
+                            .await;
+                        failed_count += 1;
+                        state.processed_files.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+
+                    if let Err(err) = immich_target
+                        .trash_assets(std::slice::from_ref(&asset.id))
+                        .await
+                    {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(filename.clone()),
+                                format!(
+                                    "[{}] 깨진 ZIP 자산 휴지통 이동 실패 ({}): {}",
+                                    mode_tag, filename, err
+                                ),
+                            )
+                            .await;
+                        failed_count += 1;
+                        state.processed_files.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+
+                    let broken_dev_ids: Vec<String> =
+                        broken_detail.device_asset_id.clone().into_iter().collect();
+                    let broken_hashes: Vec<String> =
+                        decode_immich_checksum_to_hex(broken_detail.checksum.as_deref())
+                            .into_iter()
+                            .collect();
+                    if let Err(err) = state
+                        .db
+                        .remap_merged_immich_assets_with_hashes(
+                            std::slice::from_ref(&asset.id),
+                            &broken_dev_ids,
+                            &broken_hashes,
+                            &existing.id,
+                            Some(&extracted.image_sha1),
+                        )
+                        .await
+                    {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(filename.clone()),
+                                format!(
+                                    "[{}] 로컬 DB 매핑 갱신 경고 ({}): {}",
+                                    mode_tag, filename, err
+                                ),
+                            )
+                            .await;
+                    }
+
+                    recovered_zip_duplicate += 1;
+                    state
+                        .emit_event(
+                            "repair",
+                            JobState::Syncing,
+                            Some(filename.clone()),
+                            format!(
+                                "[{}] ZIP 위장 라이브포토 정리 완료: {} → 기존 정상본({}) 연결 후 깨진 자산 휴지통 이동",
+                                mode_tag, filename, existing_url
+                            ),
+                        )
+                        .await;
+                }
+            } else {
+                let img_mb = extracted.image_size as f64 / (1024.0 * 1024.0);
+                let vid_note = extracted
+                    .video_filename
+                    .as_deref()
+                    .map(|v| format!(" + {}", v))
+                    .unwrap_or_default();
+
+                if dry_run {
+                    recovered_zip_created += 1;
+                    state
+                        .emit_event(
+                            "repair",
+                            JobState::Syncing,
+                            Some(filename.clone()),
+                            format!(
+                                "[{}] ZIP 위장 라이브포토(신규 복구): {} → {}{} ({:.2} MB) 재업로드 후 깨진 자산({}) 휴지통 이동 예정",
+                                mode_tag,
+                                filename,
+                                extracted.image_filename,
+                                vid_note,
+                                img_mb,
+                                broken_url
+                            ),
+                        )
+                        .await;
+                } else {
+                    let broken_detail = immich_target
+                        .get_asset_detail(&asset.id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| asset.clone());
+
+                    let outcome = match immich_target
+                        .upload_live_photo(&extracted, &extracted_dev_id, &created_at, &modified_at)
+                        .await
+                    {
+                        Ok(o) => o,
+                        Err(err) => {
+                            state
+                                .emit_event(
+                                    "repair",
+                                    JobState::Syncing,
+                                    Some(filename.clone()),
+                                    format!(
+                                        "[{}] ZIP 추출 자산 업로드 실패로 기존 자산 유지 ({}): {}",
+                                        mode_tag, filename, err
+                                    ),
+                                )
+                                .await;
+                            failed_count += 1;
+                            state.processed_files.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
+                    };
+
+                    let new_id = outcome.remote_target_id;
+                    if is_valid_immich_asset_id_candidate(Some(&new_id)).is_none()
+                        || new_id == asset.id
+                    {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(filename.clone()),
+                                format!(
+                                    "[{}] 유효한 신규 Immich 자산 ID를 받지 못해 기존 자산 삭제 보류 ({}): {}",
+                                    mode_tag, filename, new_id
+                                ),
+                            )
+                            .await;
+                        failed_count += 1;
+                        state.processed_files.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+
+                    if let Err(err) = transfer_broken_asset_metadata_and_albums(
+                        &immich_target,
+                        &broken_detail,
+                        &new_id,
+                        None,
+                    )
+                    .await
+                    {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(filename.clone()),
+                                format!(
+                                    "[{}] 메타데이터/앨범 승계 실패로 기존 자산 휴지통 이동 보류 ({}): {}",
+                                    mode_tag, filename, err
+                                ),
+                            )
+                            .await;
+                        failed_count += 1;
+                        state.processed_files.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+
+                    if let Err(err) = immich_target
+                        .trash_assets(std::slice::from_ref(&asset.id))
+                        .await
+                    {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(filename.clone()),
+                                format!(
+                                    "[{}] 신규 복구 완료했으나 깨진 자산 휴지통 이동 실패 ({}): {}",
+                                    mode_tag, filename, err
+                                ),
+                            )
+                            .await;
+                        failed_count += 1;
+                        state.processed_files.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+
+                    let broken_dev_ids: Vec<String> =
+                        broken_detail.device_asset_id.clone().into_iter().collect();
+                    let broken_hashes: Vec<String> =
+                        decode_immich_checksum_to_hex(broken_detail.checksum.as_deref())
+                            .into_iter()
+                            .collect();
+                    if let Err(err) = state
+                        .db
+                        .remap_merged_immich_assets_with_hashes(
+                            std::slice::from_ref(&asset.id),
+                            &broken_dev_ids,
+                            &broken_hashes,
+                            &new_id,
+                            Some(&extracted.image_sha1),
+                        )
+                        .await
+                    {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(filename.clone()),
+                                format!(
+                                    "[{}] 로컬 DB 매핑 갱신 경고 ({}): {}",
+                                    mode_tag, filename, err
+                                ),
+                            )
+                            .await;
+                    }
+
+                    recovered_zip_created += 1;
+                    let new_url = format!("{}/photos/{}", immich_web_base, new_id);
+                    state
+                        .emit_event(
+                            "repair",
+                            JobState::Syncing,
+                            Some(extracted.image_filename.clone()),
+                            format!(
+                                "[{}] ZIP 위장 라이브포토 복구 완료: {} → {}{} (확인: {})",
+                                mode_tag, filename, extracted.image_filename, vid_note, new_url
+                            ),
+                        )
+                        .await;
+                }
+            }
+
+            state.processed_files.fetch_add(1, Ordering::SeqCst);
+            continue;
+        }
+
+        let reason = non_zip_reason.unwrap_or_else(|| thumb_reason.clone());
+        if let Some(healthy) = find_healthy_duplicate(&asset, &healthy_by_stem) {
+            let healthy_url = format!("{}/photos/{}", immich_web_base, healthy.id);
+            if dry_run {
+                trashed_non_zip_dup += 1;
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(filename.clone()),
+                        format!(
+                            "[{}] 로딩 오류 중복본: {} ({}) | 정상본: {} ({}) | 깨진 자산({}) 휴지통 이동 예정",
+                            mode_tag,
+                            filename,
+                            reason,
+                            healthy.original_file_name,
+                            healthy_url,
+                            broken_url
+                        ),
+                    )
+                    .await;
+            } else {
+                let broken_detail = immich_target
+                    .get_asset_detail(&asset.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| asset.clone());
+                let healthy_detail = match immich_target.get_asset_detail(&healthy.id).await {
+                    Ok(Some(d)) if !d.is_trashed => d,
+                    Ok(_) => {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(filename.clone()),
+                                format!(
+                                    "[{}] 정상 중복본이 휴지통/미존재 상태여서 삭제 보류 ({})",
+                                    mode_tag, filename
+                                ),
+                            )
+                            .await;
+                        failed_count += 1;
+                        state.processed_files.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    Err(err) => {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(filename.clone()),
+                                format!(
+                                    "[{}] 정상 중복본 상세 조회 실패로 삭제 보류 ({}): {}",
+                                    mode_tag, filename, err
+                                ),
+                            )
+                            .await;
+                        failed_count += 1;
+                        state.processed_files.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+                };
+
+                if let Err(err) = transfer_broken_asset_metadata_and_albums(
+                    &immich_target,
+                    &broken_detail,
+                    &healthy_detail.id,
+                    Some(&healthy_detail),
+                )
+                .await
+                {
+                    state
+                        .emit_event(
+                            "repair",
+                            JobState::Syncing,
+                            Some(filename.clone()),
+                            format!(
+                                "[{}] 메타데이터/앨범 승계 실패로 휴지통 이동 보류 ({}): {}",
+                                mode_tag, filename, err
+                            ),
+                        )
+                        .await;
+                    failed_count += 1;
+                    state.processed_files.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+
+                if let Err(err) = immich_target
+                    .trash_assets(std::slice::from_ref(&asset.id))
+                    .await
+                {
+                    state
+                        .emit_event(
+                            "repair",
+                            JobState::Syncing,
+                            Some(filename.clone()),
+                            format!(
+                                "[{}] 오류 중복본 휴지통 이동 실패 ({}): {}",
+                                mode_tag, filename, err
+                            ),
+                        )
+                        .await;
+                    failed_count += 1;
+                    state.processed_files.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+
+                let broken_dev_ids: Vec<String> =
+                    broken_detail.device_asset_id.clone().into_iter().collect();
+                let broken_hashes: Vec<String> =
+                    decode_immich_checksum_to_hex(broken_detail.checksum.as_deref())
+                        .into_iter()
+                        .collect();
+                let healthy_sha1 =
+                    decode_immich_checksum_to_hex(healthy_detail.checksum.as_deref());
+                if let Err(err) = state
+                    .db
+                    .remap_merged_immich_assets_with_hashes(
+                        std::slice::from_ref(&asset.id),
+                        &broken_dev_ids,
+                        &broken_hashes,
+                        &healthy_detail.id,
+                        healthy_sha1.as_deref(),
+                    )
+                    .await
+                {
+                    state
+                        .emit_event(
+                            "repair",
+                            JobState::Syncing,
+                            Some(filename.clone()),
+                            format!(
+                                "[{}] 로컬 DB 매핑 갱신 경고 ({}): {}",
+                                mode_tag, filename, err
+                            ),
+                        )
+                        .await;
+                }
+
+                trashed_non_zip_dup += 1;
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(filename.clone()),
+                        format!(
+                            "[{}] 로딩 오류 중복본 휴지통 이동 완료: {} → 정상본({}) 유지",
+                            mode_tag, filename, healthy_url
+                        ),
+                    )
+                    .await;
+            }
+        } else if dry_run {
+            staged_standalone_broken += 1;
+            state
+                .emit_event(
+                    "repair",
+                    JobState::Syncing,
+                    Some(filename.clone()),
+                    format!(
+                        "[{}] 단독 로딩 오류(삭제 안 함): {} ({}) | {} → 'broken-assets' 앨범 수집 예정",
+                        mode_tag, filename, reason, broken_url
+                    ),
+                )
+                .await;
+        } else {
+            let album_id = match broken_album_id {
+                Some(ref aid) => aid.clone(),
+                None => match immich_target.ensure_album_by_name("broken-assets").await {
+                    Ok(aid) => {
+                        broken_album_id = Some(aid.clone());
+                        aid
+                    }
+                    Err(err) => {
+                        state
+                            .emit_event(
+                                "repair",
+                                JobState::Syncing,
+                                Some(filename.clone()),
+                                format!(
+                                    "[{}] 'broken-assets' 앨범 생성/조회 실패 ({}): {}",
+                                    mode_tag, filename, err
+                                ),
+                            )
+                            .await;
+                        failed_count += 1;
+                        state.processed_files.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+                },
+            };
+
+            if let Err(err) = immich_target
+                .add_assets_to_album(&album_id, std::slice::from_ref(&asset.id))
+                .await
+            {
+                state
+                    .emit_event(
+                        "repair",
+                        JobState::Syncing,
+                        Some(filename.clone()),
+                        format!(
+                            "[{}] 'broken-assets' 앨범 추가 실패 ({}): {}",
+                            mode_tag, filename, err
+                        ),
+                    )
+                    .await;
+                failed_count += 1;
+                state.processed_files.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+
+            staged_standalone_broken += 1;
+            state
+                .emit_event(
+                    "repair",
+                    JobState::Syncing,
+                    Some(filename.clone()),
+                    format!(
+                        "[{}] 단독 로딩 오류 격리 완료('broken-assets' 앨범): {} ({}) | 확인: {}",
+                        mode_tag, filename, reason, broken_url
+                    ),
+                )
+                .await;
+        }
+
+        state.processed_files.fetch_add(1, Ordering::SeqCst);
+    }
+
+    let handled_total = recovered_zip_created
+        + recovered_zip_duplicate
+        + trashed_non_zip_dup
+        + staged_standalone_broken;
+    let action_label = if dry_run { "예정" } else { "완료" };
+    state
+        .finish_job(
+            "repair",
+            format!(
+                "[{}] {} — 전체 {}건 스캔, 오류 확정 {}건 | ZIP 신규복구 {}건 · ZIP 기존연결 {}건 · 오류중복 휴지통 {}건 · 단독격리(broken-assets) {}건 · 실패/보류 {}건",
+                mode_tag,
+                action_label,
+                scanned_total,
+                total_broken,
+                recovered_zip_created,
+                recovered_zip_duplicate,
+                trashed_non_zip_dup,
+                staged_standalone_broken,
+                failed_count
+            ),
+        )
+        .await;
+
+    Ok(handled_total)
+}
+
 pub fn spawn_auto_sync_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
@@ -2822,6 +4016,24 @@ mod tests {
         let state = AppState::new(db, cfg.clone());
 
         let res = run_merge_immich_duplicates(state, cfg, true).await;
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Immich 서버 URL 또는 API Key가 설정되지 않았습니다"));
+    }
+
+    #[tokio::test]
+    async fn test_repair_immich_broken_assets_requires_configured_immich() {
+        let db = CheckpointDB::connect(":memory:").await.unwrap();
+        let cfg = AppConfig {
+            immich_url: String::new(),
+            immich_api_key: String::new(),
+            ..Default::default()
+        };
+        let state = AppState::new(db, cfg.clone());
+
+        let res = run_repair_immich_broken_assets(state, cfg, true).await;
         assert!(res.is_err());
         assert!(res
             .unwrap_err()

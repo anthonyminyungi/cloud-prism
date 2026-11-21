@@ -2,8 +2,9 @@ use crate::config::SettingsUpdateRequest;
 use crate::limiter::{format_error_chain, RateLimiter};
 use crate::pipeline::{
     build_source_provider, build_target_providers, run_merge_immich_duplicates_with_limit,
-    run_move_immich_album_to_nextcloud_with_limit, run_repair_nextcloud_anomalies_with_limit,
-    run_stage_gdrive_to_immich_album_with_limit, SyncPipeline,
+    run_move_immich_album_to_nextcloud_with_limit, run_repair_immich_broken_assets_with_limit,
+    run_repair_nextcloud_anomalies_with_limit, run_stage_gdrive_to_immich_album_with_limit,
+    SyncPipeline,
 };
 use crate::router::{SourceType, TargetType};
 use crate::sources::sanitize_filename;
@@ -1109,6 +1110,7 @@ pub enum RepairMode {
     StageGdriveToAlbum,
     AlbumToNextcloud,
     ImmichDuplicates,
+    ImmichBrokenAssets,
     All,
 }
 
@@ -1147,7 +1149,9 @@ async fn start_repair_job(
 
     if matches!(
         req.mode,
-        RepairMode::StageGdriveToAlbum | RepairMode::ImmichDuplicates
+        RepairMode::StageGdriveToAlbum
+            | RepairMode::ImmichDuplicates
+            | RepairMode::ImmichBrokenAssets
     ) && (cfg.immich_url.trim().is_empty() || cfg.immich_api_key.trim().is_empty())
     {
         return error_response(
@@ -1201,6 +1205,10 @@ async fn start_repair_job(
             }
             RepairMode::ImmichDuplicates => {
                 run_merge_immich_duplicates_with_limit(state_clone.clone(), cfg, dry_run, limit)
+                    .await
+            }
+            RepairMode::ImmichBrokenAssets => {
+                run_repair_immich_broken_assets_with_limit(state_clone.clone(), cfg, dry_run, limit)
                     .await
             }
             RepairMode::All => {
@@ -1385,6 +1393,7 @@ mod tests {
 
         // 3. Check POST /api/jobs/repair rejects immich_duplicates when Immich is unconfigured
         let resp3 = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1402,5 +1411,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp3.status(), StatusCode::BAD_REQUEST);
+
+        // 4. Check POST /api/jobs/repair rejects immich_broken_assets when Immich is unconfigured
+        let resp4 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs/repair")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "mode": "immich_broken_assets",
+                            "dry_run": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp4.status(), StatusCode::BAD_REQUEST);
     }
 }

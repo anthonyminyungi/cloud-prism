@@ -103,6 +103,22 @@ struct ImmichSearchAssetPage {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ImmichFullSearchMetadataResponse {
+    #[serde(default)]
+    assets: ImmichFullSearchAssetPage,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImmichFullSearchAssetPage {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    items: Vec<ImmichDuplicateAssetDto>,
+    #[serde(default)]
+    next_page: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ImmichTimeBucketSummary {
     #[serde(default, deserialize_with = "deserialize_null_default")]
     time_bucket: String,
@@ -175,6 +191,14 @@ pub struct ImmichDuplicateAssetDto {
     pub checksum: Option<String>,
     #[serde(default)]
     pub live_photo_video_id: Option<String>,
+    #[serde(default)]
+    pub thumbhash: Option<String>,
+    #[serde(default)]
+    pub is_offline: bool,
+    #[serde(default, rename = "type")]
+    pub asset_type: Option<String>,
+    #[serde(default)]
+    pub original_mime_type: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub tags: Vec<ImmichTagDto>,
     #[serde(default)]
@@ -778,7 +802,7 @@ struct ImmichAssetStatusDto {
     checksum: Option<String>,
 }
 
-fn is_valid_immich_asset_id_candidate(raw: Option<&str>) -> Option<&str> {
+pub fn is_valid_immich_asset_id_candidate(raw: Option<&str>) -> Option<&str> {
     let trimmed = raw?.trim();
     if trimmed.is_empty()
         || trimmed == "existing_immich_asset"
@@ -788,6 +812,115 @@ fn is_valid_immich_asset_id_candidate(raw: Option<&str>) -> Option<&str> {
         return None;
     }
     Some(trimmed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThumbnailHealth {
+    Healthy,
+    Broken { status: u16, reason: String },
+    TransientError(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthyAssetRef {
+    pub id: String,
+    pub original_file_name: String,
+    pub capture_ts: Option<i64>,
+}
+
+pub fn is_broken_asset_candidate(asset: &ImmichDuplicateAssetDto) -> bool {
+    if asset.is_trashed || asset.id.trim().is_empty() {
+        return false;
+    }
+    if asset.is_offline {
+        return true;
+    }
+    if asset
+        .thumbhash
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        return true;
+    }
+    let is_image = asset
+        .asset_type
+        .as_deref()
+        .map(|t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("IMAGE"))
+        .unwrap_or(true);
+    if is_image {
+        let missing_dims = asset
+            .exif_info
+            .as_ref()
+            .map(|e| e.exif_image_width.unwrap_or(0) <= 0 || e.exif_image_height.unwrap_or(0) <= 0)
+            .unwrap_or(true);
+        if missing_dims {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn normalize_filename_stem(filename: &str) -> String {
+    let trimmed = filename.trim();
+    let raw_stem = Path::new(trimmed)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(trimmed);
+    let mut stem = raw_stem.trim().to_ascii_lowercase();
+    loop {
+        if let Some(pos) = stem.rfind('+') {
+            let digits = &stem[pos + 1..];
+            if pos > 0 && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                stem.truncate(pos);
+                continue;
+            }
+        }
+        if stem.ends_with(')') {
+            if let Some(pos) = stem.rfind(" (") {
+                let digits = &stem[pos + 2..stem.len() - 1];
+                if pos > 0 && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                    stem.truncate(pos);
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    stem.trim().to_string()
+}
+
+pub fn asset_capture_epoch_secs(asset: &ImmichDuplicateAssetDto) -> Option<i64> {
+    asset_primary_capture_dt(asset).map(|(_, dt)| dt.timestamp())
+}
+
+pub fn find_healthy_duplicate<'a>(
+    broken: &ImmichDuplicateAssetDto,
+    healthy_by_stem: &'a HashMap<String, Vec<HealthyAssetRef>>,
+) -> Option<&'a HealthyAssetRef> {
+    let stem = normalize_filename_stem(&broken.original_file_name);
+    if stem.len() < 4 {
+        return None;
+    }
+    let candidates = healthy_by_stem.get(&stem)?;
+    let broken_ts = asset_capture_epoch_secs(broken);
+
+    if let Some(ts_hit) = candidates.iter().find(|h| {
+        h.id != broken.id
+            && matches!(
+                (broken_ts, h.capture_ts),
+                (Some(b), Some(ht)) if (b - ht).abs() <= 86_400
+            )
+    }) {
+        return Some(ts_hit);
+    }
+
+    if stem.len() >= 16 {
+        return candidates.iter().find(|h| h.id != broken.id);
+    }
+
+    None
 }
 
 pub struct ImmichTarget {
@@ -1305,6 +1438,167 @@ impl ImmichTarget {
         }
 
         stream_response_to_temp(resp, "immich", asset_id, filename, tmp_dir).await
+    }
+
+    pub async fn download_asset_optional_to_temp(
+        &self,
+        asset_id: &str,
+        filename: &str,
+        tmp_dir: &Path,
+    ) -> Result<Option<DownloadedSourceFile>> {
+        let url = format!("{}/{}/original", self.endpoint(ENDPOINT_ASSETS), asset_id);
+        let resp = self
+            .limiter
+            .send_with_retry(|| self.client.get(&url).header(HEADER_API_KEY, &self.api_key))
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "Immich 원본 자산 다운로드 실패 ({}): HTTP {}",
+                asset_id,
+                resp.status()
+            ));
+        }
+
+        stream_response_to_temp(resp, "immich", asset_id, filename, tmp_dir)
+            .await
+            .map(Some)
+    }
+
+    pub async fn search_metadata_page(
+        &self,
+        page: u32,
+        size: u32,
+    ) -> Result<(Vec<ImmichDuplicateAssetDto>, Option<u32>)> {
+        let url = self.endpoint(ENDPOINT_SEARCH_METADATA);
+        let payload = json!({
+            "isTrashed": false,
+            "withExif": true,
+            "size": size,
+            "page": page
+        });
+        let resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .header(HEADER_API_KEY, &self.api_key)
+                    .json(&payload)
+            })
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Immich 메타데이터 검색 실패 (HTTP {}): {}",
+                status,
+                text
+            ));
+        }
+
+        let dto: ImmichFullSearchMetadataResponse = resp.json().await?;
+        let items = dto.assets.items;
+        let next_page = dto
+            .assets
+            .next_page
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => s.parse::<u32>().ok(),
+                serde_json::Value::Number(n) => n.as_u64().map(|x| x as u32),
+                _ => None,
+            })
+            .filter(|&np| np > page && !items.is_empty());
+
+        Ok((items, next_page))
+    }
+
+    pub async fn get_asset_detail(
+        &self,
+        asset_id: &str,
+    ) -> Result<Option<ImmichDuplicateAssetDto>> {
+        let url = format!("{}/{}", self.endpoint(ENDPOINT_ASSETS), asset_id);
+        let resp = self
+            .limiter
+            .send_with_retry(|| self.client.get(&url).header(HEADER_API_KEY, &self.api_key))
+            .await?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::BAD_REQUEST {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Immich 자산 상세 조회 실패 ({} / HTTP {}): {}",
+                asset_id,
+                status,
+                text
+            ));
+        }
+
+        let dto: ImmichDuplicateAssetDto = resp.json().await?;
+        Ok(Some(dto))
+    }
+
+    pub async fn check_thumbnail_health(&self, asset_id: &str) -> ThumbnailHealth {
+        let url = format!(
+            "{}/{}/thumbnail?size=thumbnail",
+            self.endpoint(ENDPOINT_ASSETS),
+            asset_id
+        );
+        self.limiter.acquire().await;
+        let resp = match self
+            .client
+            .get(&url)
+            .header(HEADER_API_KEY, &self.api_key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return ThumbnailHealth::TransientError(crate::limiter::format_error_chain(&e))
+            }
+        };
+
+        let status = resp.status();
+        let code = status.as_u16();
+        if matches!(code, 429 | 502 | 503 | 504) {
+            return ThumbnailHealth::TransientError(format!("HTTP {}", status));
+        }
+        if matches!(code, 404 | 400 | 422 | 500) {
+            return ThumbnailHealth::Broken {
+                status: code,
+                reason: format!("HTTP {}", status),
+            };
+        }
+        if !status.is_success() {
+            return ThumbnailHealth::TransientError(format!("HTTP {}", status));
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if content_type.starts_with("text/html") || content_type.starts_with("application/json") {
+            return ThumbnailHealth::Broken {
+                status: code,
+                reason: format!("비정상 썸네일 Content-Type ({})", content_type),
+            };
+        }
+
+        match resp.bytes().await {
+            Ok(bytes) if bytes.is_empty() => ThumbnailHealth::Broken {
+                status: code,
+                reason: "빈 썸네일 응답(0 bytes)".to_string(),
+            },
+            Ok(_) => ThumbnailHealth::Healthy,
+            Err(e) => ThumbnailHealth::TransientError(crate::limiter::format_error_chain(&e)),
+        }
     }
 
     pub async fn delete_assets(&self, asset_ids: &[String]) -> Result<()> {
@@ -2097,5 +2391,129 @@ mod tests {
         };
         assert_eq!(plan.winner.id, "asset-with-tz");
         assert_eq!(plan.metadata_update.date_time_original, None);
+    }
+
+    #[test]
+    fn test_is_broken_asset_candidate_and_stem_duplicate_matching() {
+        let healthy = ImmichDuplicateAssetDto {
+            id: "healthy-1".to_string(),
+            original_file_name: "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6.heic"
+                .to_string(),
+            file_created_at: Some("2020-06-18T14:59:25.000Z".to_string()),
+            thumbhash: Some("IQgK...".to_string()),
+            is_offline: false,
+            asset_type: Some("IMAGE".to_string()),
+            exif_info: Some(ImmichExifInfoDto {
+                exif_image_width: Some(4032),
+                exif_image_height: Some(3024),
+                date_time_original: Some("2020-06-18T14:59:25.000Z".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!is_broken_asset_candidate(&healthy));
+
+        let missing_thumbhash = ImmichDuplicateAssetDto {
+            id: "broken-1".to_string(),
+            thumbhash: None,
+            ..healthy.clone()
+        };
+        assert!(is_broken_asset_candidate(&missing_thumbhash));
+
+        let offline = ImmichDuplicateAssetDto {
+            id: "broken-2".to_string(),
+            is_offline: true,
+            ..healthy.clone()
+        };
+        assert!(is_broken_asset_candidate(&offline));
+
+        let trashed = ImmichDuplicateAssetDto {
+            id: "trashed-1".to_string(),
+            is_trashed: true,
+            thumbhash: None,
+            ..healthy.clone()
+        };
+        assert!(!is_broken_asset_candidate(&trashed));
+
+        let healthy_video = ImmichDuplicateAssetDto {
+            id: "video-1".to_string(),
+            asset_type: Some("VIDEO".to_string()),
+            thumbhash: Some("VQ...".to_string()),
+            exif_info: Some(ImmichExifInfoDto {
+                exif_image_width: None,
+                exif_image_height: None,
+                ..Default::default()
+            }),
+            ..healthy.clone()
+        };
+        assert!(!is_broken_asset_candidate(&healthy_video));
+
+        assert_eq!(
+            normalize_filename_stem("IMG_9112+1.jpg"),
+            "img_9112".to_string()
+        );
+        assert_eq!(
+            normalize_filename_stem("IMG_9112 (2).HEIC"),
+            "img_9112".to_string()
+        );
+        assert_eq!(
+            normalize_filename_stem("20200618_235925.heic"),
+            "20200618_235925".to_string()
+        );
+
+        let mut healthy_map: HashMap<String, Vec<HealthyAssetRef>> = HashMap::new();
+        healthy_map.insert(
+            normalize_filename_stem("IMG_9112.heic"),
+            vec![HealthyAssetRef {
+                id: "healthy-short".to_string(),
+                original_file_name: "IMG_9112.heic".to_string(),
+                capture_ts: Some(1_700_000_000),
+            }],
+        );
+        healthy_map.insert(
+            normalize_filename_stem(&healthy.original_file_name),
+            vec![HealthyAssetRef {
+                id: healthy.id.clone(),
+                original_file_name: healthy.original_file_name.clone(),
+                capture_ts: asset_capture_epoch_secs(&healthy),
+            }],
+        );
+
+        let short_broken_same_day = ImmichDuplicateAssetDto {
+            id: "broken-short-1".to_string(),
+            original_file_name: "IMG_9112+1.jpg".to_string(),
+            file_created_at: Some("2023-11-14T22:20:00Z".to_string()),
+            thumbhash: None,
+            exif_info: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            find_healthy_duplicate(&short_broken_same_day, &healthy_map).map(|h| h.id.as_str()),
+            Some("healthy-short")
+        );
+
+        let short_broken_different_year = ImmichDuplicateAssetDto {
+            id: "broken-short-2".to_string(),
+            original_file_name: "IMG_9112.jpg".to_string(),
+            file_created_at: Some("2021-01-01T00:00:00Z".to_string()),
+            thumbhash: None,
+            exif_info: None,
+            ..Default::default()
+        };
+        assert!(find_healthy_duplicate(&short_broken_different_year, &healthy_map).is_none());
+
+        let long_broken_no_ts = ImmichDuplicateAssetDto {
+            id: "broken-long-1".to_string(),
+            original_file_name: "P20200618_235925010_B78EA2DB-0155-4834-B7D3-90045E20A6C6+1.heic"
+                .to_string(),
+            file_created_at: None,
+            thumbhash: None,
+            exif_info: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            find_healthy_duplicate(&long_broken_no_ts, &healthy_map).map(|h| h.id.as_str()),
+            Some("healthy-1")
+        );
     }
 }
