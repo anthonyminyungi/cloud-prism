@@ -2533,3 +2533,281 @@ async fn test_repair_immich_broken_assets_recovers_zip_livephoto_dedups_and_stag
     );
     assert_eq!(rec_dup.sha1_hash.as_deref(), Some(dup_image_sha1.as_str()));
 }
+
+#[tokio::test]
+async fn test_repair_immich_broken_assets_skips_live_photo_mov_and_prevents_cross_type_dedup() {
+    use mybox_immich_sync::pipeline::run_repair_immich_broken_assets;
+    use wiremock::matchers::body_json;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_lp_mov_skip.db");
+    let tmp_download_dir = temp_dir.path().join("tmp_lp_mov_skip");
+
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "assets": {
+                "items": [
+                    {
+                        "id": "heic-live-1",
+                        "originalFileName": "IMG_0480.HEIC",
+                        "fileCreatedAt": "2023-05-01T10:00:00.000Z",
+                        "isTrashed": false,
+                        "isOffline": false,
+                        "type": "IMAGE",
+                        "thumbhash": "ok_thumbhash",
+                        "livePhotoVideoId": "lp-mov-1",
+                        "exifInfo": {
+                            "exifImageWidth": 4032,
+                            "exifImageHeight": 3024,
+                            "dateTimeOriginal": "2023-05-01T10:00:00.000Z"
+                        }
+                    },
+                    {
+                        "id": "lp-mov-1",
+                        "originalFileName": "IMG_0480.MOV",
+                        "fileCreatedAt": "2023-05-01T10:00:00.000Z",
+                        "isTrashed": false,
+                        "isOffline": false,
+                        "type": "VIDEO",
+                        "visibility": null,
+                        "thumbhash": null
+                    },
+                    {
+                        "id": "hidden-mov-2",
+                        "originalFileName": "IMG_0481.MOV",
+                        "fileCreatedAt": "2023-05-01T10:05:00.000Z",
+                        "isTrashed": false,
+                        "isOffline": false,
+                        "type": "VIDEO",
+                        "visibility": "hidden",
+                        "thumbhash": null
+                    },
+                    {
+                        "id": "broken-mov-3",
+                        "originalFileName": "IMG_0480.MOV",
+                        "fileCreatedAt": "2023-05-01T10:00:00.000Z",
+                        "isTrashed": false,
+                        "isOffline": false,
+                        "type": "VIDEO",
+                        "visibility": "timeline",
+                        "thumbhash": null
+                    }
+                ],
+                "nextPage": null
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // Live photo companion & hidden videos must NEVER even be thumbnail-probed
+    Mock::given(method("GET"))
+        .and(path("/api/assets/lp-mov-1/thumbnail"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/hidden-mov-2/thumbnail"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/broken-mov-3/thumbnail"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/assets/broken-mov-3/original"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // NONE of the .MOVs may be trashed (broken-mov-3 must NOT match heic-live-1)
+    Mock::given(method("DELETE"))
+        .and(path("/api/assets"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/albums"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/albums"))
+        .and(body_json(json!({ "albumName": "broken-assets" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "album-broken-only",
+            "albumName": "broken-assets",
+            "assetCount": 0
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/api/albums/album-broken-only/assets"))
+        .and(body_json(json!({ "ids": ["broken-mov-3"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: tmp_download_dir.to_str().unwrap().to_string(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_key".to_string(),
+        rate_limit_rps: 200.0,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    let state = AppState::new(db, cfg.clone());
+
+    let handled = run_repair_immich_broken_assets(state, cfg, false)
+        .await
+        .unwrap();
+    assert_eq!(handled, 1);
+}
+
+#[tokio::test]
+async fn test_restore_immich_trashed_movs_restores_only_trashed_mov_videos() {
+    use mybox_immich_sync::pipeline::run_restore_immich_trashed_movs;
+    use wiremock::matchers::body_json;
+
+    let mock_server = MockServer::start().await;
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_movs.db");
+    let tmp_download_dir = temp_dir.path().join("tmp_restore_movs");
+
+    // Pass 1: default search with withDeleted=true & type=VIDEO
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .and(body_json(json!({
+            "withDeleted": true,
+            "trashedAfter": "1970-01-01T00:00:00.000Z",
+            "type": "VIDEO",
+            "size": 500,
+            "page": 1
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "assets": {
+                "items": [
+                    {
+                        "id": "active-mov-1",
+                        "originalFileName": "IMG_0001.MOV",
+                        "isTrashed": false,
+                        "type": "VIDEO"
+                    },
+                    {
+                        "id": "trashed-mov-1",
+                        "originalFileName": "IMG_0480.MOV",
+                        "isTrashed": true,
+                        "type": "VIDEO"
+                    },
+                    {
+                        "id": "trashed-mp4-1",
+                        "originalFileName": "CLIP_0001.mp4",
+                        "isTrashed": true,
+                        "type": "VIDEO"
+                    },
+                    {
+                        "id": "trashed-heic-1",
+                        "originalFileName": "BROKEN.heic",
+                        "isTrashed": true,
+                        "type": "IMAGE"
+                    }
+                ],
+                "nextPage": null
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // Pass 2: visibility="hidden" search returns duplicate trashed-mov-1 + hidden trashed-mov-2
+    Mock::given(method("POST"))
+        .and(path("/api/search/metadata"))
+        .and(body_json(json!({
+            "withDeleted": true,
+            "trashedAfter": "1970-01-01T00:00:00.000Z",
+            "type": "VIDEO",
+            "visibility": "hidden",
+            "size": 500,
+            "page": 1
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "assets": {
+                "items": [
+                    {
+                        "id": "trashed-mov-1",
+                        "originalFileName": "IMG_0480.MOV",
+                        "isTrashed": true,
+                        "type": "VIDEO"
+                    },
+                    {
+                        "id": "trashed-mov-2",
+                        "originalFileName": "IMG_0477.mov",
+                        "isTrashed": true,
+                        "type": "VIDEO",
+                        "visibility": "hidden"
+                    }
+                ],
+                "nextPage": null
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let cfg = AppConfig {
+        db_path: db_path.to_str().unwrap().to_string(),
+        tmp_dir: tmp_download_dir.to_str().unwrap().to_string(),
+        immich_url: mock_server.uri(),
+        immich_api_key: "test_key".to_string(),
+        rate_limit_rps: 200.0,
+        ..AppConfig::default()
+    };
+
+    let db = CheckpointDB::connect(&cfg.db_path).await.unwrap();
+    let state = AppState::new(db, cfg.clone());
+
+    // Step 1: Dry-run must find 2 targets and send ZERO restore requests
+    let dry_count = run_restore_immich_trashed_movs(state.clone(), cfg.clone(), true)
+        .await
+        .unwrap();
+    assert_eq!(dry_count, 2);
+    let recorded = mock_server.received_requests().await.unwrap();
+    assert!(
+        recorded
+            .iter()
+            .all(|r| r.url.path() != "/api/trash/restore/assets"),
+        "Dry-run must not call /api/trash/restore/assets"
+    );
+
+    // Step 2: Execute must restore exact deduplicated .MOV IDs
+    Mock::given(method("POST"))
+        .and(path("/api/trash/restore/assets"))
+        .and(body_json(
+            json!({ "ids": ["trashed-mov-1", "trashed-mov-2"] }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 2 })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let exec_count = run_restore_immich_trashed_movs(state, cfg, false)
+        .await
+        .unwrap();
+    assert_eq!(exec_count, 2);
+}

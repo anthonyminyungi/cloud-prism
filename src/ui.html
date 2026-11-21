@@ -909,6 +909,11 @@
               <div class="s-metric-sub" style="margin-top: 6px;">
                 <span>썸네일 로딩에 실패한 자산 중 <span class="mono">.heic/.jpg</span> 확장자로 위장된 MYBOX 라이브포토 ZIP을 자동 추출·재업로드(또는 기존 정상본에 라이브포토 영상 연결)하고, 일반 깨진 파일 중 정상 중복본이 있는 경우만 휴지통으로 이동합니다. 단독 오류 파일은 삭제하지 않고 <span class="mono">broken-assets</span> 앨범에 격리합니다.</span>
               </div>
+              <div style="display:flex; gap:8px; align-items:center; margin-top:10px; padding-top:10px; border-top: 1px dashed var(--border); flex-wrap: wrap;">
+                <button id="btnRestoreTrashedMovDryRun" class="btn" onclick="startRepairJob('restore_trashed_movs', true)">휴지통 .MOV 복원 Dry-run</button>
+                <button id="btnRestoreTrashedMovExecute" class="btn" onclick="startRepairJob('restore_trashed_movs', false)">휴지통 .MOV 일괄 복원</button>
+                <span style="font-size:12px; color:var(--muted);">Immich 휴지통의 라이브포토 동반 <span class="mono">.MOV</span> 영상만 선별 복원합니다 (<span class="mono">.heic/.jpg</span> 오류본은 휴지통 유지).</span>
+              </div>
             </div>
           </div>
         </div>
@@ -1619,6 +1624,8 @@
       const btnMergeDupExecute = document.getElementById('btnMergeDupExecute');
       const btnRepairBrokenDryRun = document.getElementById('btnRepairBrokenDryRun');
       const btnRepairBrokenExecute = document.getElementById('btnRepairBrokenExecute');
+      const btnRestoreTrashedMovDryRun = document.getElementById('btnRestoreTrashedMovDryRun');
+      const btnRestoreTrashedMovExecute = document.getElementById('btnRestoreTrashedMovExecute');
       if (btnStageGdrive) {
         btnStageGdrive.textContent = `1단계: Google Drive 이미지 앨범에 담기 (${gdriveImmichCount.toLocaleString()}건)`;
         btnStageGdrive.disabled = !isIdle;
@@ -1630,6 +1637,8 @@
       if (btnMergeDupExecute) btnMergeDupExecute.disabled = !isIdle;
       if (btnRepairBrokenDryRun) btnRepairBrokenDryRun.disabled = !isIdle;
       if (btnRepairBrokenExecute) btnRepairBrokenExecute.disabled = !isIdle;
+      if (btnRestoreTrashedMovDryRun) btnRestoreTrashedMovDryRun.disabled = !isIdle;
+      if (btnRestoreTrashedMovExecute) btnRestoreTrashedMovExecute.disabled = !isIdle;
 
       const globalBtn = document.getElementById('globalSyncBtn');
       if (!isIdle) {

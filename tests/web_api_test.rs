@@ -120,6 +120,8 @@ async fn test_web_dashboard_connection_and_job_lifecycle() {
     assert!(html.contains("id=\"sampleLimitSelect\""));
     assert!(html.contains("id=\"btnRepairBrokenDryRun\""));
     assert!(html.contains("id=\"btnRepairBrokenExecute\""));
+    assert!(html.contains("id=\"btnRestoreTrashedMovDryRun\""));
+    assert!(html.contains("id=\"btnRestoreTrashedMovExecute\""));
     assert!(html.contains("toggleTheme"));
     assert!(html.contains("escapeHtml"));
     assert!(!html.contains("linear-gradient("));

@@ -3,8 +3,8 @@ use crate::limiter::{format_error_chain, RateLimiter};
 use crate::pipeline::{
     build_source_provider, build_target_providers, run_merge_immich_duplicates_with_limit,
     run_move_immich_album_to_nextcloud_with_limit, run_repair_immich_broken_assets_with_limit,
-    run_repair_nextcloud_anomalies_with_limit, run_stage_gdrive_to_immich_album_with_limit,
-    SyncPipeline,
+    run_repair_nextcloud_anomalies_with_limit, run_restore_immich_trashed_movs_with_limit,
+    run_stage_gdrive_to_immich_album_with_limit, SyncPipeline,
 };
 use crate::router::{SourceType, TargetType};
 use crate::sources::sanitize_filename;
@@ -1111,6 +1111,7 @@ pub enum RepairMode {
     AlbumToNextcloud,
     ImmichDuplicates,
     ImmichBrokenAssets,
+    RestoreTrashedMovs,
     All,
 }
 
@@ -1152,6 +1153,7 @@ async fn start_repair_job(
         RepairMode::StageGdriveToAlbum
             | RepairMode::ImmichDuplicates
             | RepairMode::ImmichBrokenAssets
+            | RepairMode::RestoreTrashedMovs
     ) && (cfg.immich_url.trim().is_empty() || cfg.immich_api_key.trim().is_empty())
     {
         return error_response(
@@ -1209,6 +1211,10 @@ async fn start_repair_job(
             }
             RepairMode::ImmichBrokenAssets => {
                 run_repair_immich_broken_assets_with_limit(state_clone.clone(), cfg, dry_run, limit)
+                    .await
+            }
+            RepairMode::RestoreTrashedMovs => {
+                run_restore_immich_trashed_movs_with_limit(state_clone.clone(), cfg, dry_run, limit)
                     .await
             }
             RepairMode::All => {
@@ -1414,6 +1420,7 @@ mod tests {
 
         // 4. Check POST /api/jobs/repair rejects immich_broken_assets when Immich is unconfigured
         let resp4 = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1431,5 +1438,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp4.status(), StatusCode::BAD_REQUEST);
+
+        // 5. Check POST /api/jobs/repair rejects restore_trashed_movs when Immich is unconfigured
+        let resp5 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs/repair")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "mode": "restore_trashed_movs",
+                            "dry_run": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp5.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -28,6 +28,7 @@ const ENDPOINT_ALBUMS: &str = "/api/albums";
 const ENDPOINT_DUPLICATES: &str = "/api/duplicates";
 const ENDPOINT_TAGS: &str = "/api/tags";
 const ENDPOINT_SEARCH_METADATA: &str = "/api/search/metadata";
+const ENDPOINT_TRASH_RESTORE_ASSETS: &str = "/api/trash/restore/assets";
 const ENDPOINT_TIMELINE_BUCKETS: &str = "/api/timeline/buckets";
 const ENDPOINT_TIMELINE_BUCKET: &str = "/api/timeline/bucket";
 const HEADER_API_KEY: &str = "x-api-key";
@@ -187,6 +188,8 @@ pub struct ImmichDuplicateAssetDto {
     pub is_trashed: bool,
     #[serde(default)]
     pub visibility: Option<String>,
+    #[serde(default)]
+    pub is_visible: Option<bool>,
     #[serde(default)]
     pub checksum: Option<String>,
     #[serde(default)]
@@ -826,10 +829,44 @@ pub struct HealthyAssetRef {
     pub id: String,
     pub original_file_name: String,
     pub capture_ts: Option<i64>,
+    pub media_kind: &'static str,
+}
+
+pub fn normalized_asset_media_kind(asset: &ImmichDuplicateAssetDto) -> &'static str {
+    if let Some(ref t) = asset.asset_type {
+        let upper = t.trim().to_ascii_uppercase();
+        if upper == "VIDEO" {
+            return "VIDEO";
+        }
+        if upper == "IMAGE" {
+            return "IMAGE";
+        }
+        if upper == "AUDIO" {
+            return "AUDIO";
+        }
+    }
+    let ext = Path::new(asset.original_file_name.trim())
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    if TargetRouter::is_video_extension(ext) {
+        "VIDEO"
+    } else {
+        "IMAGE"
+    }
+}
+
+pub fn is_hidden_asset(asset: &ImmichDuplicateAssetDto) -> bool {
+    asset
+        .visibility
+        .as_deref()
+        .map(|v| v.trim().eq_ignore_ascii_case("hidden"))
+        .unwrap_or(false)
+        || asset.is_visible == Some(false)
 }
 
 pub fn is_broken_asset_candidate(asset: &ImmichDuplicateAssetDto) -> bool {
-    if asset.is_trashed || asset.id.trim().is_empty() {
+    if asset.is_trashed || asset.id.trim().is_empty() || is_hidden_asset(asset) {
         return false;
     }
     if asset.is_offline {
@@ -844,12 +881,7 @@ pub fn is_broken_asset_candidate(asset: &ImmichDuplicateAssetDto) -> bool {
     {
         return true;
     }
-    let is_image = asset
-        .asset_type
-        .as_deref()
-        .map(|t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("IMAGE"))
-        .unwrap_or(true);
-    if is_image {
+    if normalized_asset_media_kind(asset) == "IMAGE" {
         let missing_dims = asset
             .exif_info
             .as_ref()
@@ -860,6 +892,17 @@ pub fn is_broken_asset_candidate(asset: &ImmichDuplicateAssetDto) -> bool {
         }
     }
     false
+}
+
+pub fn is_restorable_trashed_livephoto_mov(asset: &ImmichDuplicateAssetDto) -> bool {
+    asset.is_trashed
+        && !asset.id.trim().is_empty()
+        && normalized_asset_media_kind(asset) == "VIDEO"
+        && asset
+            .original_file_name
+            .trim()
+            .to_ascii_lowercase()
+            .ends_with(".mov")
 }
 
 pub fn normalize_filename_stem(filename: &str) -> String {
@@ -905,9 +948,11 @@ pub fn find_healthy_duplicate<'a>(
     }
     let candidates = healthy_by_stem.get(&stem)?;
     let broken_ts = asset_capture_epoch_secs(broken);
+    let broken_kind = normalized_asset_media_kind(broken);
 
     if let Some(ts_hit) = candidates.iter().find(|h| {
         h.id != broken.id
+            && h.media_kind == broken_kind
             && matches!(
                 (broken_ts, h.capture_ts),
                 (Some(b), Some(ht)) if (b - ht).abs() <= 86_400
@@ -917,7 +962,9 @@ pub fn find_healthy_duplicate<'a>(
     }
 
     if stem.len() >= 16 {
-        return candidates.iter().find(|h| h.id != broken.id);
+        return candidates
+            .iter()
+            .find(|h| h.id != broken.id && h.media_kind == broken_kind);
     }
 
     None
@@ -1515,6 +1562,64 @@ impl ImmichTarget {
         Ok((items, next_page))
     }
 
+    pub async fn search_trashed_videos_page(
+        &self,
+        page: u32,
+        size: u32,
+        visibility: Option<&str>,
+    ) -> Result<(Vec<ImmichDuplicateAssetDto>, Option<u32>)> {
+        let url = self.endpoint(ENDPOINT_SEARCH_METADATA);
+        let mut payload = json!({
+            "withDeleted": true,
+            "trashedAfter": "1970-01-01T00:00:00.000Z",
+            "type": "VIDEO",
+            "size": size,
+            "page": page
+        });
+        if let Some(vis) = visibility {
+            payload["visibility"] = json!(vis);
+        }
+        let resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .header(HEADER_API_KEY, &self.api_key)
+                    .json(&payload)
+            })
+            .await?;
+
+        let status = resp.status();
+        if visibility.is_some()
+            && (status == reqwest::StatusCode::BAD_REQUEST
+                || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY)
+        {
+            return Ok((Vec::new(), None));
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Immich 휴지통 영상 검색 실패 (HTTP {}): {}",
+                status,
+                text
+            ));
+        }
+
+        let dto: ImmichFullSearchMetadataResponse = resp.json().await?;
+        let items = dto.assets.items;
+        let next_page = dto
+            .assets
+            .next_page
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => s.parse::<u32>().ok(),
+                serde_json::Value::Number(n) => n.as_u64().map(|x| x as u32),
+                _ => None,
+            })
+            .filter(|&np| np > page && !items.is_empty());
+
+        Ok((items, next_page))
+    }
+
     pub async fn get_asset_detail(
         &self,
         asset_id: &str,
@@ -1658,6 +1763,37 @@ impl ImmichTarget {
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!(
                 "Immich 자산 휴지통 이동 실패 (HTTP {}): {}",
+                status,
+                text
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn restore_trashed_assets(&self, asset_ids: &[String]) -> Result<()> {
+        if asset_ids.is_empty() {
+            return Ok(());
+        }
+
+        let url = self.endpoint(ENDPOINT_TRASH_RESTORE_ASSETS);
+        let payload = json!({
+            "ids": asset_ids
+        });
+        let resp = self
+            .limiter
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .header(HEADER_API_KEY, &self.api_key)
+                    .json(&payload)
+            })
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Immich 휴지통 자산 복원 실패 (HTTP {}): {}",
                 status,
                 text
             ));
@@ -2435,6 +2571,22 @@ mod tests {
         };
         assert!(!is_broken_asset_candidate(&trashed));
 
+        let hidden_vis = ImmichDuplicateAssetDto {
+            id: "hidden-1".to_string(),
+            visibility: Some("hidden".to_string()),
+            thumbhash: None,
+            ..healthy.clone()
+        };
+        assert!(!is_broken_asset_candidate(&hidden_vis));
+
+        let hidden_flag = ImmichDuplicateAssetDto {
+            id: "hidden-2".to_string(),
+            is_visible: Some(false),
+            thumbhash: None,
+            ..healthy.clone()
+        };
+        assert!(!is_broken_asset_candidate(&hidden_flag));
+
         let healthy_video = ImmichDuplicateAssetDto {
             id: "video-1".to_string(),
             asset_type: Some("VIDEO".to_string()),
@@ -2468,6 +2620,16 @@ mod tests {
                 id: "healthy-short".to_string(),
                 original_file_name: "IMG_9112.heic".to_string(),
                 capture_ts: Some(1_700_000_000),
+                media_kind: "IMAGE",
+            }],
+        );
+        healthy_map.insert(
+            normalize_filename_stem("IMG_0480.HEIC"),
+            vec![HealthyAssetRef {
+                id: "healthy-heic-0480".to_string(),
+                original_file_name: "IMG_0480.HEIC".to_string(),
+                capture_ts: Some(1_700_000_000),
+                media_kind: "IMAGE",
             }],
         );
         healthy_map.insert(
@@ -2476,7 +2638,33 @@ mod tests {
                 id: healthy.id.clone(),
                 original_file_name: healthy.original_file_name.clone(),
                 capture_ts: asset_capture_epoch_secs(&healthy),
+                media_kind: "IMAGE",
             }],
+        );
+
+        let broken_mov_0480 = ImmichDuplicateAssetDto {
+            id: "broken-mov-0480".to_string(),
+            original_file_name: "IMG_0480.MOV".to_string(),
+            file_created_at: Some("2023-11-14T22:13:20Z".to_string()),
+            asset_type: Some("VIDEO".to_string()),
+            thumbhash: None,
+            exif_info: None,
+            ..Default::default()
+        };
+        assert!(find_healthy_duplicate(&broken_mov_0480, &healthy_map).is_none());
+
+        healthy_map
+            .get_mut(&normalize_filename_stem("IMG_0480.HEIC"))
+            .unwrap()
+            .push(HealthyAssetRef {
+                id: "healthy-mov-0480".to_string(),
+                original_file_name: "IMG_0480.MOV".to_string(),
+                capture_ts: Some(1_700_000_000),
+                media_kind: "VIDEO",
+            });
+        assert_eq!(
+            find_healthy_duplicate(&broken_mov_0480, &healthy_map).map(|h| h.id.as_str()),
+            Some("healthy-mov-0480")
         );
 
         let short_broken_same_day = ImmichDuplicateAssetDto {
@@ -2515,5 +2703,51 @@ mod tests {
             find_healthy_duplicate(&long_broken_no_ts, &healthy_map).map(|h| h.id.as_str()),
             Some("healthy-1")
         );
+    }
+
+    #[test]
+    fn test_is_restorable_trashed_livephoto_mov() {
+        let base = ImmichDuplicateAssetDto {
+            id: "mov-1".to_string(),
+            original_file_name: "IMG_0480.MOV".to_string(),
+            is_trashed: true,
+            asset_type: Some("VIDEO".to_string()),
+            ..Default::default()
+        };
+        assert!(is_restorable_trashed_livephoto_mov(&base));
+
+        let lowercase_mov = ImmichDuplicateAssetDto {
+            id: "mov-2".to_string(),
+            original_file_name: "img_0477.mov".to_string(),
+            ..base.clone()
+        };
+        assert!(is_restorable_trashed_livephoto_mov(&lowercase_mov));
+
+        let active_mov = ImmichDuplicateAssetDto {
+            is_trashed: false,
+            ..base.clone()
+        };
+        assert!(!is_restorable_trashed_livephoto_mov(&active_mov));
+
+        let trashed_heic = ImmichDuplicateAssetDto {
+            id: "heic-1".to_string(),
+            original_file_name: "BROKEN.heic".to_string(),
+            asset_type: Some("IMAGE".to_string()),
+            ..base.clone()
+        };
+        assert!(!is_restorable_trashed_livephoto_mov(&trashed_heic));
+
+        let trashed_mp4 = ImmichDuplicateAssetDto {
+            id: "mp4-1".to_string(),
+            original_file_name: "CLIP_0001.mp4".to_string(),
+            ..base.clone()
+        };
+        assert!(!is_restorable_trashed_livephoto_mov(&trashed_mp4));
+
+        let empty_id = ImmichDuplicateAssetDto {
+            id: "   ".to_string(),
+            ..base
+        };
+        assert!(!is_restorable_trashed_livephoto_mov(&empty_id));
     }
 }

@@ -13,9 +13,11 @@ use crate::sources::{try_extract_livephoto_zip, SourceProvider};
 use crate::state::{AppState, JobState};
 use crate::targets::immich::{
     asset_capture_epoch_secs, decode_immich_checksum_to_hex, evaluate_duplicate_group,
-    find_healthy_duplicate, is_broken_asset_candidate, is_valid_immich_asset_id_candidate,
-    normalize_filename_stem, AssetMetadataUpdateRequest, DuplicateGroupEvaluation, HealthyAssetRef,
-    ImmichDuplicateAssetDto, ImmichTarget, ThumbnailHealth,
+    find_healthy_duplicate, is_broken_asset_candidate, is_hidden_asset,
+    is_restorable_trashed_livephoto_mov, is_valid_immich_asset_id_candidate,
+    normalize_filename_stem, normalized_asset_media_kind, AssetMetadataUpdateRequest,
+    DuplicateGroupEvaluation, HealthyAssetRef, ImmichDuplicateAssetDto, ImmichTarget,
+    ThumbnailHealth,
 };
 use crate::targets::nextcloud::NextcloudTarget;
 use crate::targets::{TargetProvider, UploadContext, UploadOutcome, VerifyStatus};
@@ -2895,6 +2897,7 @@ pub async fn run_repair_immich_broken_assets_with_limit(
     let mut scanned_total: u64 = 0;
     let mut suspects: Vec<ImmichDuplicateAssetDto> = Vec::new();
     let mut healthy_by_stem: HashMap<String, Vec<HealthyAssetRef>> = HashMap::new();
+    let mut referenced_live_video_ids: HashSet<String> = HashSet::new();
 
     loop {
         if state.is_stopping() {
@@ -2916,7 +2919,16 @@ pub async fn run_repair_immich_broken_assets_with_limit(
             if asset.is_trashed || asset.id.trim().is_empty() {
                 continue;
             }
-            if !asset.is_offline
+            if let Some(vid_id) = asset
+                .live_photo_video_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                referenced_live_video_ids.insert(vid_id.to_string());
+            }
+            if !is_hidden_asset(&asset)
+                && !asset.is_offline
                 && !asset
                     .thumbhash
                     .as_deref()
@@ -2933,6 +2945,7 @@ pub async fn run_repair_immich_broken_assets_with_limit(
                             id: asset.id.clone(),
                             original_file_name: asset.original_file_name.clone(),
                             capture_ts: asset_capture_epoch_secs(&asset),
+                            media_kind: normalized_asset_media_kind(&asset),
                         });
                 }
             }
@@ -2955,6 +2968,13 @@ pub async fn run_repair_immich_broken_assets_with_limit(
         match next_page {
             Some(np) => page = np,
             None => break,
+        }
+    }
+
+    if !referenced_live_video_ids.is_empty() {
+        suspects.retain(|a| !referenced_live_video_ids.contains(a.id.trim()));
+        for list in healthy_by_stem.values_mut() {
+            list.retain(|h| !referenced_live_video_ids.contains(h.id.trim()));
         }
     }
 
@@ -3016,14 +3036,19 @@ pub async fn run_repair_immich_broken_assets_with_limit(
             match health {
                 ThumbnailHealth::Healthy => {
                     let stem = normalize_filename_stem(&asset.original_file_name);
-                    if stem.len() >= 4 {
+                    if stem.len() >= 4
+                        && !is_hidden_asset(&asset)
+                        && !referenced_live_video_ids.contains(asset.id.trim())
+                    {
                         let capture_ts = asset_capture_epoch_secs(&asset);
+                        let media_kind = normalized_asset_media_kind(&asset);
                         let list = healthy_by_stem.entry(stem).or_default();
                         if !list.iter().any(|h| h.id == asset.id) {
                             list.push(HealthyAssetRef {
                                 id: asset.id,
                                 original_file_name: asset.original_file_name,
                                 capture_ts,
+                                media_kind,
                             });
                         }
                     }
@@ -3895,6 +3920,213 @@ pub async fn run_repair_immich_broken_assets_with_limit(
     Ok(handled_total)
 }
 
+pub async fn run_restore_immich_trashed_movs(
+    state: Arc<AppState>,
+    config: AppConfig,
+    dry_run: bool,
+) -> Result<u64> {
+    run_restore_immich_trashed_movs_with_limit(state, config, dry_run, None).await
+}
+
+pub async fn run_restore_immich_trashed_movs_with_limit(
+    state: Arc<AppState>,
+    config: AppConfig,
+    dry_run: bool,
+    limit: Option<u64>,
+) -> Result<u64> {
+    if config.immich_url.trim().is_empty() || config.immich_api_key.trim().is_empty() {
+        return Err(anyhow!(
+            "Immich 서버 URL 또는 API Key가 설정되지 않았습니다."
+        ));
+    }
+
+    let mode_tag = if dry_run {
+        "휴지통 .MOV 복원 Dry-Run"
+    } else {
+        "휴지통 .MOV 복원"
+    };
+
+    state.begin_phase("repair", JobState::Syncing, 0).await;
+    state
+        .emit_event(
+            "repair",
+            JobState::Syncing,
+            None,
+            format!(
+                "[{}] Immich 휴지통 내 라이브포토 동반 .MOV 영상 검색을 시작합니다...",
+                mode_tag
+            ),
+        )
+        .await;
+
+    let target_limiter =
+        RateLimiter::new((config.rate_limit_rps * 10.0).max(50.0), config.max_retries);
+    let immich_target = ImmichTarget::new(
+        config.immich_url.clone(),
+        config.immich_api_key.clone(),
+        target_limiter,
+    );
+
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut scanned_trashed_videos = 0u64;
+    let mut skipped_non_mov = 0u64;
+    let mut targets: Vec<(String, String)> = Vec::new();
+
+    for visibility in [None, Some("hidden")] {
+        let mut page: u32 = 1;
+        loop {
+            if state.is_stopping() {
+                state
+                    .finish_job(
+                        "repair",
+                        format!(
+                            "[{}] 휴지통 검색 중 안전 일시정지되었습니다 (복원 대상 .MOV {}건 확인됨).",
+                            mode_tag,
+                            targets.len()
+                        ),
+                    )
+                    .await;
+                return Ok(0);
+            }
+
+            let (items, next_page) = immich_target
+                .search_trashed_videos_page(page, 500, visibility)
+                .await?;
+            for asset in items {
+                let trimmed_id = asset.id.trim();
+                if trimmed_id.is_empty() || !seen_ids.insert(trimmed_id.to_string()) {
+                    continue;
+                }
+                if asset.is_trashed {
+                    scanned_trashed_videos += 1;
+                    if is_restorable_trashed_livephoto_mov(&asset) {
+                        targets.push((asset.id, asset.original_file_name));
+                    } else {
+                        skipped_non_mov += 1;
+                    }
+                }
+            }
+
+            state
+                .emit_progress_throttled("repair", JobState::Syncing, None, || {
+                    format!(
+                        "[{}] 휴지통 영상 조회 중... (휴지통 영상 {}건, 복원 대상 .MOV {}건)",
+                        mode_tag,
+                        scanned_trashed_videos,
+                        targets.len()
+                    )
+                })
+                .await;
+
+            match next_page {
+                Some(np) => page = np,
+                None => break,
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        state
+            .finish_job(
+                "repair",
+                format!(
+                    "[{}] 완료 — 휴지통 영상 {}건 조회 결과 복원할 .MOV 파일이 없습니다.",
+                    mode_tag, scanned_trashed_videos
+                ),
+            )
+            .await;
+        return Ok(0);
+    }
+
+    if let Some(n) = limit.filter(|&n| n > 0) {
+        targets.truncate(n as usize);
+    }
+
+    let total_targets = targets.len() as u64;
+    state.processed_files.store(0, Ordering::SeqCst);
+    state.total_files.store(total_targets, Ordering::SeqCst);
+    *state.job_started_at.write().await = Some(tokio::time::Instant::now());
+
+    if dry_run {
+        let immich_web_base = config.immich_url.trim_end_matches('/');
+        for (id, filename) in targets.iter().take(20) {
+            state
+                .emit_event(
+                    "repair",
+                    JobState::Syncing,
+                    Some(filename.clone()),
+                    format!(
+                        "[{}] 복원 예정: {} ({}/photos/{})",
+                        mode_tag, filename, immich_web_base, id
+                    ),
+                )
+                .await;
+        }
+        if targets.len() > 20 {
+            state
+                .emit_event(
+                    "repair",
+                    JobState::Syncing,
+                    None,
+                    format!("[{}] ... 외 {}건", mode_tag, targets.len() - 20),
+                )
+                .await;
+        }
+        state.processed_files.store(total_targets, Ordering::SeqCst);
+        state
+            .finish_job(
+                "repair",
+                format!(
+                    "[{}] 완료 — 휴지통 영상 {}건 조회, 복원 예정 .MOV {}건 (비-.MOV 영상 {}건 휴지통 유지)",
+                    mode_tag, scanned_trashed_videos, targets.len(), skipped_non_mov
+                ),
+            )
+            .await;
+        return Ok(total_targets);
+    }
+
+    let mut restored = 0u64;
+    let mut stopped_early = false;
+    for chunk in targets.chunks(200) {
+        if state.is_stopping() {
+            stopped_early = true;
+            break;
+        }
+        let ids: Vec<String> = chunk.iter().map(|(id, _)| id.clone()).collect();
+        immich_target.restore_trashed_assets(&ids).await?;
+        restored += chunk.len() as u64;
+        state.processed_files.store(restored, Ordering::SeqCst);
+        state
+            .emit_event(
+                "repair",
+                JobState::Syncing,
+                chunk.last().map(|(_, name)| name.clone()),
+                format!(
+                    "[{}] .MOV {} / {}건 복원 완료...",
+                    mode_tag, restored, total_targets
+                ),
+            )
+            .await;
+    }
+
+    let status_label = if stopped_early {
+        "일시정지"
+    } else {
+        "완료"
+    };
+    state
+        .finish_job(
+            "repair",
+            format!(
+                "[{}] {} — 휴지통 영상 {}건 조회, .MOV {} / {}건 복원 완료 (비-.MOV 영상 {}건 휴지통 유지)",
+                mode_tag, status_label, scanned_trashed_videos, restored, total_targets, skipped_non_mov
+            ),
+        )
+        .await;
+
+    Ok(restored)
+}
+
 pub fn spawn_auto_sync_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
@@ -4034,6 +4266,24 @@ mod tests {
         let state = AppState::new(db, cfg.clone());
 
         let res = run_repair_immich_broken_assets(state, cfg, true).await;
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Immich 서버 URL 또는 API Key가 설정되지 않았습니다"));
+    }
+
+    #[tokio::test]
+    async fn test_restore_immich_trashed_movs_requires_configured_immich() {
+        let db = CheckpointDB::connect(":memory:").await.unwrap();
+        let cfg = AppConfig {
+            immich_url: String::new(),
+            immich_api_key: String::new(),
+            ..Default::default()
+        };
+        let state = AppState::new(db, cfg.clone());
+
+        let res = run_restore_immich_trashed_movs(state, cfg, true).await;
         assert!(res.is_err());
         assert!(res
             .unwrap_err()
